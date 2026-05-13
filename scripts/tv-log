@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Dump the running app's in-memory log (most-recent first).
+# Usage:
+#   scripts/tv-log              # 30 most recent entries
+#   scripts/tv-log 100          # 100 most recent
+#   scripts/tv-log fail         # filter by category
+set -euo pipefail
+
+N=30
+FILTER=""
+for arg in "$@"; do
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then N="$arg"
+  else FILTER="$arg"
+  fi
+done
+
+EXPR="JSON.stringify((__app.logs || []).slice(0, $N)"
+if [[ -n "$FILTER" ]]; then
+  EXPR="JSON.stringify((__app.logs || []).filter(e => e.cat === '$FILTER').slice(0, $N)"
+fi
+EXPR="$EXPR, null, 2)"
+
+cd "$(dirname "$0")/.."
+exec scripts/tv-eval "$EXPR"

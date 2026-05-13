@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build IPK, push to TV, install via luna appInstallService, launch.
+set -euo pipefail
+
+: "${TV_HOST:=192.163.2.153}"
+: "${TV_PORT:=9922}"
+: "${TV_USER:=prisoner}"
+: "${TV_KEY:=$HOME/.ssh/lgtv_dev}"
+: "${APP_ID:=com.mgl.xtream}"
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SRC="$REPO_ROOT/app"
+BUILD_DIR="$REPO_ROOT/.build"
+TV_TMP="/media/developer/temp"
+
+if [[ ! -f "$TV_KEY" ]]; then
+  echo "ERROR: TV key not found at $TV_KEY. Run: make setup" >&2
+  exit 1
+fi
+
+export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+SSH_OPTS=(
+  -o HostKeyAlgorithms=+ssh-rsa
+  -o PubkeyAcceptedAlgorithms=+ssh-rsa
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -i "$TV_KEY"
+)
+
+t0=$(date +%s.%N)
+
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+ares-package "$SRC" -o "$BUILD_DIR" >/dev/null
+
+IPK=$(ls "$BUILD_DIR"/*.ipk | head -1)
+IPK_NAME=$(basename "$IPK")
+REMOTE_IPK="$TV_TMP/$IPK_NAME"
+
+scp "${SSH_OPTS[@]}" -P "$TV_PORT" -q "$IPK" "$TV_USER@$TV_HOST:$REMOTE_IPK"
+
+ssh -tt "${SSH_OPTS[@]}" -p "$TV_PORT" "$TV_USER@$TV_HOST" "
+  /usr/bin/luna-send-pub -i -w 30000 \
+    'luna://com.webos.appInstallService/dev/install' \
+    '{\"id\":\"$APP_ID\",\"ipkUrl\":\"$REMOTE_IPK\",\"subscribe\":true}' 2>&1 | \
+  while IFS= read -r line; do
+    case \"\$line\" in
+      *'\"state\":\"installed\"'*) echo INSTALLED; pkill -P \$\$ luna-send-pub 2>/dev/null; break ;;
+      *FAILED*|*failed*) echo \"\$line\" >&2; exit 1 ;;
+    esac
+  done
+  /usr/bin/luna-send-pub -n 1 \
+    'luna://com.webos.applicationManager/launch' \
+    '{\"id\":\"$APP_ID\"}' >/dev/null
+" 2>&1 | tr -d '\r'
+
+rm -f "$IPK"
+t1=$(date +%s.%N)
+elapsed=$(LC_ALL=C awk "BEGIN { printf \"%.2f\", $t1 - $t0 }")
+echo "Deployed $APP_ID in ${elapsed}s"

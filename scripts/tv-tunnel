@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Open or close an SSH tunnel forwarding local 9998 -> TV's Chromium DevTools port.
+# Usage:
+#   scripts/tv-tunnel start   # default
+#   scripts/tv-tunnel stop
+#   scripts/tv-tunnel status
+set -euo pipefail
+
+: "${TV_HOST:=192.163.2.153}"
+: "${TV_PORT:=9922}"
+: "${TV_USER:=prisoner}"
+: "${TV_KEY:=$HOME/.ssh/lgtv_dev}"
+: "${TV_INSPECT_PORT:=9998}"
+
+PID_FILE="/tmp/tv-tunnel.pid"
+ACTION="${1:-start}"
+
+is_alive() {
+  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+case "$ACTION" in
+  start)
+    if is_alive; then
+      echo "tunnel already running (pid $(cat $PID_FILE))"
+      exit 0
+    fi
+    export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+    ssh -fN -L "$TV_INSPECT_PORT:127.0.0.1:$TV_INSPECT_PORT" \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -p "$TV_PORT" \
+      -i "$TV_KEY" \
+      "$TV_USER@$TV_HOST"
+    # Capture the forked ssh pid
+    sleep 0.3
+    pgrep -f "L $TV_INSPECT_PORT:127.0.0.1:$TV_INSPECT_PORT" | head -1 > "$PID_FILE"
+    echo "tunnel up on 127.0.0.1:$TV_INSPECT_PORT (pid $(cat $PID_FILE))"
+    ;;
+  stop)
+    if is_alive; then
+      kill "$(cat $PID_FILE)" 2>/dev/null || true
+      rm -f "$PID_FILE"
+      echo "tunnel stopped"
+    else
+      echo "no tunnel running"
+    fi
+    ;;
+  status)
+    if is_alive; then
+      echo "tunnel up (pid $(cat $PID_FILE))"
+    else
+      echo "tunnel not running"
+    fi
+    ;;
+  *)
+    echo "usage: $0 {start|stop|status}" >&2
+    exit 2
+    ;;
+esac

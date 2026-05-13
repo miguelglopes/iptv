@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# SSH wrapper for the dev TV. All scripts use this.
+set -euo pipefail
+
+: "${TV_HOST:=192.163.2.153}"
+: "${TV_PORT:=9922}"
+: "${TV_USER:=prisoner}"
+: "${TV_KEY:=$HOME/.ssh/lgtv_dev}"
+
+if [[ ! -f "$TV_KEY" ]]; then
+  echo "ERROR: TV key not found at $TV_KEY" >&2
+  echo "Run: make setup" >&2
+  exit 1
+fi
+
+export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+# -tt forces a TTY so luna-send-pub flushes output promptly.
+exec ssh -tt \
+  -o HostKeyAlgorithms=+ssh-rsa \
+  -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
+  -p "$TV_PORT" \
+  -i "$TV_KEY" \
+  "$TV_USER@$TV_HOST" \
+  "$@"

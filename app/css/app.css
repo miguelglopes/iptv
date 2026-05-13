@@ -1,0 +1,650 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  color: #e8e8f0;
+  font-family: -apple-system, "Helvetica Neue", "Segoe UI", sans-serif;
+  font-size: 22px;
+  overflow: hidden;
+}
+/* Hide the cursor on the TV — Magic Remote reports `pointer: fine` so we can't use a
+   media query; main.js sets the `tv` class on <html> based on the webOS UA. Laptops
+   stay cursor-on for dev. */
+html.tv, html.tv body { cursor: none; }
+
+body {
+  background:
+    linear-gradient(90deg, rgba(10, 10, 20, 0.72) 0%, rgba(10, 10, 20, 0.42) 55%, rgba(10, 10, 20, 0.18) 100%),
+    url('../bg.jpg') center/cover no-repeat fixed;
+}
+
+/* The video element. Default = fullscreen overlay (player just created it on body).
+   When body.mini, we re-parent it into .top-slot and let CSS shrink it to fit. */
+#player {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  z-index: 100;
+}
+
+/* While playing fullscreen, between sources the player briefly tears the <video> down
+   (1s gap on switchSource), exposing the list behind. Pin body to black and hide the
+   app shell so the gap is a clean black instead of a flash of the list. */
+body.playing { background: #000; }
+body.playing #app { visibility: hidden; }
+
+/* Mini mode: video lives inside .top-slot. Override the fullscreen defaults so it fills
+   its container rather than the viewport. */
+body.mini #player {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  border-radius: 6px;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  padding: 32px 48px;
+  display: flex;
+  flex-direction: row;
+  gap: 24px;
+}
+
+.left-col {
+  flex: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+  min-height: 0;
+}
+
+header {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 22px;
+  border-radius: 6px;
+  background: rgba(10, 10, 20, 0.72);
+  flex-shrink: 0;
+}
+
+/* Top row of the header: title + channel/host status. */
+.header-top {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+
+/* Bottom row of the header: remote key legend. */
+.keymap-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  color: #aaaabb;
+  letter-spacing: 0.3px;
+}
+.keymap-inline span { display: inline-flex; align-items: center; gap: 4px; }
+.keymap-inline .k { font-size: 10px; }
+
+h1 {
+  font-size: 36px;
+  font-weight: 600;
+  color: #ffcc66;
+}
+
+.hint {
+  font-size: 18px;
+  color: #c8c8d8;
+  font-family: ui-monospace, monospace;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 1; }
+}
+
+.hint .spin {
+  display: inline-block;
+  color: #ffcc66;
+  animation: pulse 0.9s ease-in-out infinite;
+  margin-right: 6px;
+}
+
+.hint .ok {
+  color: #7fdd7f;
+  margin-right: 6px;
+  font-weight: 700;
+}
+
+/* Channel list — fills the left column under the header. */
+.list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 4px;
+  min-height: 0;
+}
+
+/* Slim scrollbar on the channel list and EPG. Webkit-only — the standard
+   `scrollbar-width: thin` reserves a wider gutter (~10 px) on modern Chromium and
+   ignores the webkit width override, so we rely on the webkit pseudo-element exclusively.
+   webOS Chromium honours it; Firefox would fall back to the default style (not a target). */
+.list::-webkit-scrollbar,
+.bottom-slot::-webkit-scrollbar { display: block; width: 4px; }
+.list::-webkit-scrollbar-track,
+.bottom-slot::-webkit-scrollbar-track { background: transparent; }
+.list::-webkit-scrollbar-thumb,
+.bottom-slot::-webkit-scrollbar-thumb {
+  background: rgba(255, 204, 102, 0.4);
+  border-radius: 2px;
+}
+.list::-webkit-scrollbar-thumb:hover,
+.bottom-slot::-webkit-scrollbar-thumb:hover { background: rgba(255, 204, 102, 0.7); }
+
+/* Right column: vertical stack with top slot (settings or mini player) + bottom slot (EPG).
+   Spans full viewport height so playback gets the reclaimed header space. */
+.right-col {
+  flex: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.top-slot,
+.bottom-slot {
+  background: rgba(20, 20, 31, 0.85);
+  border: 2px solid transparent;
+  border-radius: 6px;
+  padding: 16px 14px;
+  overflow-y: auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 150ms;
+}
+
+/* Settings (top-slot) has fixed content — no scrollbar needed. */
+.top-slot { scrollbar-width: none; }
+.top-slot::-webkit-scrollbar { display: none; }
+
+.top-slot    { flex: 3; }
+.bottom-slot { flex: 2; }
+/* Active panel ring */
+body.panel-settings .top-slot,
+body.panel-epg .bottom-slot {
+  border-color: rgba(255, 204, 102, 0.55);
+}
+/* (.top-slot scrollbar is hidden where the .top-slot rule lives, near the panel def.
+   The slim .list / .bottom-slot scrollbars are defined together up by .list.) */
+
+/* When mini, the top slot becomes the player container — kill its padding/bg so the
+   <video> fills it edge-to-edge. */
+body.mini .top-slot {
+  padding: 0;
+  background: #000;
+  border: 2px solid rgba(255, 204, 102, 0.7);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+/* Mini + player panel focused → brighter ring (matches the list-item.focused gold). */
+body.mini.panel-player .top-slot {
+  border-color: #ffcc66;
+  box-shadow: 0 4px 16px rgba(255, 204, 102, 0.45), 0 8px 30px rgba(0, 0, 0, 0.55);
+}
+
+
+.settings-title {
+  font-size: 24px;
+  color: #ffcc66;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.settings-item {
+  padding: 12px 16px;
+  background: rgba(40, 34, 58, 0.55);
+  border: 2px solid transparent;
+  border-radius: 4px;
+  font-size: 18px;
+  color: #d4d4e0;
+}
+
+.settings-item.focused {
+  border-color: #ffcc66;
+  background: rgba(40, 34, 58, 0.95);
+  color: #ffffff;
+}
+
+.settings-item.divider {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+  border-top: 1px dashed rgba(255, 204, 102, 0.3);
+  padding-top: 12px;
+}
+
+.settings-foot {
+  margin-top: auto;
+  font-size: 14px;
+  color: #6a6a8a;
+  font-family: ui-monospace, monospace;
+}
+
+.keymap {
+  font-size: 15px;
+  color: #aaaabb;
+  font-family: ui-monospace, monospace;
+  line-height: 1.7;
+}
+.keymap .k {
+  display: inline-block;
+  width: 14px;
+  font-size: 12px;
+  text-align: center;
+}
+.k-y { color: #ffcc66; }
+.k-b { color: #66b3ff; }
+.k-r { color: #ff6666; }
+
+/* EPG / Guide panel — sits inside the same right aside the settings shares. */
+.epg-channel {
+  font-size: 24px;
+  color: #ffcc66;
+  font-weight: 600;
+  margin-bottom: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.epg-empty {
+  font-size: 18px;
+  color: #6a6a8a;
+  font-family: ui-monospace, monospace;
+  padding: 8px 4px;
+}
+.epg-day {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #6a6a8a;
+  margin: 12px 0 6px;
+  padding: 0 4px;
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+}
+.epg-day:first-child { margin-top: 0; }
+
+.epg-row {
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  background: rgba(40, 34, 58, 0.45);
+  position: relative;
+}
+.epg-row.now {
+  background: rgba(255, 204, 102, 0.22);
+  border-left: 4px solid #ffcc66;
+  padding-left: 12px;
+}
+.epg-now-badge {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-size: 13px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 1px;
+  font-weight: 700;
+  color: #ff5555;
+}
+.epg-now-badge::before {
+  content: '● ';
+  animation: nowPulse 1.4s ease-in-out infinite;
+}
+@keyframes nowPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.epg-time {
+  font-family: ui-monospace, monospace;
+  font-size: 15px;
+  color: #aaaabb;
+  letter-spacing: 0.5px;
+}
+.epg-row.now .epg-time { color: #ffcc66; font-weight: 700; }
+.epg-row.now .epg-prog { color: #ffffff; font-weight: 600; }
+.epg-prog {
+  font-size: 18px;
+  color: #e8e8f0;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Catch-up states. Driven by:
+   - channel.tv_archive / tv_archive_duration → the panel-level pill
+   - program.has_archive → past-replay (1) vs past-pending (0 but channel supports + recent)
+   - past + (channel !supports OR outside window) → past-gone
+   Blue accent matches the Blue-button hint colour so it doesn't fight gold focus / red LIVE. */
+.epg-catchup-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  vertical-align: middle;
+  margin-left: 12px;
+  padding: 2px 10px;
+  border-radius: 10px;
+  background: rgba(102, 179, 255, 0.15);
+  color: #66b3ff;
+  font-size: 13px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+
+/* Catch-up "replay" glyph. webOS Chromium's default fonts don't ship U+21BB so we use
+   an inline SVG instead. The path is the Material Design "replay" icon. `currentColor`
+   means consumers (pill, replay badge, pending badge, top-left CATCH-UP badge) just
+   colour the surrounding text and the glyph follows. */
+.replay-icon {
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.epg-row.past-replay {
+  background: rgba(102, 179, 255, 0.10);
+  border-left: 3px solid rgba(102, 179, 255, 0.55);
+  padding-left: 13px;
+}
+.epg-row.past-replay .epg-time { color: #cfe4f7; }
+.epg-row.past-replay .epg-prog { color: #e6f1fc; }
+.epg-replay-badge {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-size: 17px;
+  color: #66b3ff;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.epg-replay-badge .lbl {
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 1px;
+  color: rgba(102, 179, 255, 0.75);
+  margin-left: 4px;
+}
+
+.epg-row.past-pending {
+  background: rgba(40, 34, 58, 0.45);
+  opacity: 0.78;
+}
+.epg-row.past-pending .epg-time { color: #9aa0b4; }
+.epg-row.past-pending .epg-prog { color: #cdcdd8; }
+.epg-pending-badge {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 1px;
+  color: #8b8ba0;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.epg-row.past-gone { opacity: 0.45; }
+.epg-row.past-gone .epg-prog {
+  text-decoration: line-through;
+  text-decoration-color: rgba(255, 255, 255, 0.25);
+}
+
+/* EPG row focus ring. Outline (not border) so it overlays cleanly on top of the existing
+   per-state backgrounds and left-borders without shifting layout. */
+.epg-row.focused {
+  outline: 2px solid #ffcc66;
+  outline-offset: -2px;
+  z-index: 1;
+}
+.epg-row.focused-dim {
+  outline: 2px solid rgba(255, 204, 102, 0.3);
+  outline-offset: -2px;
+}
+
+/* Top-left CATCH-UP badge. Visible only while playing back a VOD chunk
+   (body.catchup-mode), and only transiently — fades 5 s after the last user interaction
+   so it doesn't sit on the same pixels for an entire programme (OLED burn-in). Re-fires
+   from the `any` remote handler so users can always re-summon it. */
+#catchup-badge {
+  display: none;
+  position: fixed;
+  top: 48px;
+  left: 48px;
+  z-index: 250;
+  padding: 10px 18px;
+  background: rgba(10, 10, 20, 0.82);
+  border-left: 4px solid #66b3ff;
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, monospace;
+  pointer-events: none;
+  letter-spacing: 0.5px;
+  opacity: 0;
+  transition: opacity 250ms;
+}
+body.catchup-mode #catchup-badge { display: block; }
+#catchup-badge.visible { opacity: 1; }
+body.mini #catchup-badge { display: none; }  /* mini player has no room — overlay still fires */
+
+#catchup-badge .cu {
+  color: #66b3ff;
+  font-size: 15px;
+  font-weight: 700;
+  margin-right: 14px;
+  letter-spacing: 1px;
+}
+#catchup-badge .when { font-size: 16px; color: #e8e8f0; }
+#catchup-badge .ttl { font-size: 16px; color: #cfe4f7; margin-left: 14px; }
+
+/* Fullscreen-playback key legend. Hidden when not playing fullscreen, fades in on any
+   key press, auto-fades 3 s after the last key. Contents context-aware (live vs catchup;
+   tv_archive vs not) — see legendContent() in main.js. */
+#legend {
+  display: none;
+  position: fixed;
+  right: 48px;
+  bottom: 48px;
+  z-index: 250;
+  padding: 14px 22px;
+  background: rgba(10, 10, 20, 0.82);
+  border-radius: 6px;
+  color: #fff;
+  font-family: ui-monospace, monospace;
+  font-size: 15px;
+  opacity: 0;
+  transition: opacity 250ms;
+  pointer-events: none;
+  max-width: 60%;
+}
+body.playing #legend { display: block; }
+#legend.visible { opacity: 1; }
+#legend .lbl {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: #6a6a8a;
+  margin-bottom: 8px;
+}
+#legend .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  line-height: 1.6;
+}
+#legend .k {
+  display: inline-block;
+  min-width: 18px;
+  text-align: center;
+  color: #cfe4f7;
+  font-weight: 700;
+  margin-right: 6px;
+}
+#legend .k-y { color: #ffcc66; }
+#legend .k-r { color: #ff6666; }
+#legend .k-g { color: #7fdd7f; }
+#legend .k-b { color: #66b3ff; }
+#legend .dim { opacity: 0.45; }
+
+.list-item.recent {
+  color: #aaaabb;
+  font-style: italic;
+}
+.list-item.recent .ret {
+  color: #ffcc66;
+  font-style: normal;
+  margin-right: 8px;
+}
+
+.search.exiled {
+  border-color: rgba(255, 204, 102, 0.3);
+  color: #888;
+}
+
+.list-item {
+  padding: 14px 22px;
+  background: rgba(20, 20, 31, 0.72);
+  backdrop-filter: blur(6px);
+  border: 2px solid transparent;
+  border-radius: 4px;
+  font-size: 22px;
+  color: #d4d4e0;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.list-item.played {
+  background: rgba(48, 40, 22, 0.78);
+}
+
+.badge {
+  font-size: 14px;
+  font-weight: 600;
+  background: rgba(255, 204, 102, 0.18);
+  color: #ffcc66;
+  padding: 2px 10px;
+  border-radius: 10px;
+  margin-left: 12px;
+  font-family: ui-monospace, monospace;
+}
+
+.search {
+  font-size: 30px;
+  padding: 14px 22px;
+  background: rgba(20, 20, 31, 0.92);
+  color: #ffffff;
+  border: 2px solid #ffcc66;
+  border-radius: 6px;
+  outline: none;
+  width: 100%;
+  margin-top: 4px;
+  flex-shrink: 0;
+  font-family: inherit;
+  caret-color: #ffcc66;
+}
+
+.list-item.focused {
+  border-color: #ffcc66;
+  background: rgba(40, 34, 58, 0.92);
+  color: #ffffff;
+  transform: scale(1.01);
+  transform-origin: left center;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* Position is remembered while another panel is active, but visual cue is dimmed. */
+.list-item.focused-dim {
+  border-color: rgba(255, 204, 102, 0.3);
+  background: rgba(30, 26, 42, 0.85);
+}
+
+.error {
+  font-family: ui-monospace, monospace;
+  color: #ff8888;
+  background: #1f1414;
+  padding: 16px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+}
+
+#overlay {
+  position: fixed;
+  left: 48px;
+  bottom: 48px;
+  padding: 16px 28px;
+  background: rgba(10, 10, 20, 0.78);
+  color: #ffffff;
+  border-left: 4px solid #ffcc66;
+  border-radius: 4px;
+  z-index: 200;
+  opacity: 0;
+  transition: opacity 250ms;
+  pointer-events: none;
+  max-width: 80%;
+}
+
+#overlay .ov-title {
+  font-size: 30px;
+  font-weight: 600;
+}
+
+#overlay .ov-sub {
+  font-size: 18px;
+  color: #ccccdd;
+  margin-top: 4px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 0.3px;
+}
+
+#overlay .ov-status {
+  font-size: 14px;
+  color: #6a6a8a;
+  margin-top: 6px;
+  font-family: ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+#player {
+  background: #000;
+}

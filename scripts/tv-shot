@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Capture a PNG of the TV app via CDP.
+
+Usage:
+  scripts/tv-shot                       # save to /tmp/tv-shot.png
+  scripts/tv-shot screenshot.png        # save to specific path
+"""
+import base64
+import json
+import os
+import sys
+import urllib.request
+
+from websocket import create_connection
+
+PORT = int(os.environ.get('TV_INSPECT_PORT', 9998))
+TARGET = os.environ.get('TV_INSPECT_TARGET', 'Xtream')
+OUT = sys.argv[1] if len(sys.argv) > 1 else '/tmp/tv-shot.png'
+
+
+def pick_target():
+    targets = json.load(urllib.request.urlopen(f'http://127.0.0.1:{PORT}/json'))
+    for t in targets:
+        if t.get('type') != 'page':
+            continue
+        if TARGET.lower() in (t.get('title') or '').lower() or TARGET.lower() in (t.get('url') or '').lower():
+            return t
+    sys.exit(f'no target matching "{TARGET}"')
+
+
+def main():
+    target = pick_target()
+    ws = create_connection(target['webSocketDebuggerUrl'], timeout=15)
+    try:
+        ws.send(json.dumps({
+            'id': 1,
+            'method': 'Page.captureScreenshot',
+            'params': {'format': 'png'},
+        }))
+        msg = json.loads(ws.recv())
+        data = msg.get('result', {}).get('data')
+        if not data:
+            sys.exit(f'no screenshot data: {msg}')
+        with open(OUT, 'wb') as f:
+            f.write(base64.b64decode(data))
+        print(f'wrote {OUT} ({os.path.getsize(OUT)} bytes)')
+    finally:
+        ws.close()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Evaluate JS in the TV's running app via Chrome DevTools Protocol.
+
+Requires the SSH tunnel `scripts/tv-tunnel` to be running (forwards local 9998 -> TV 9998).
+
+Usage:
+  scripts/tv-eval 'state.categories.length'
+  echo 'JSON.stringify(state, null, 2)' | scripts/tv-eval
+  scripts/tv-eval --target YouTube 'document.title'
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+
+from websocket import create_connection
+
+
+def get_targets(port: int):
+    return json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/json'))
+
+
+def pick_target(targets, match: str):
+    for t in targets:
+        if t.get('type') != 'page':
+            continue
+        if match.lower() in (t.get('title') or '').lower() or match.lower() in (t.get('url') or '').lower():
+            return t
+    return None
+
+
+def evaluate(ws_url: str, expr: str, await_promise: bool):
+    ws = create_connection(ws_url, timeout=15)
+    try:
+        ws.send(json.dumps({
+            'id': 1,
+            'method': 'Runtime.evaluate',
+            'params': {
+                'expression': expr,
+                'returnByValue': True,
+                'awaitPromise': await_promise,
+            },
+        }))
+        return json.loads(ws.recv())
+    finally:
+        ws.close()
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--port', type=int, default=int(os.environ.get('TV_INSPECT_PORT', 9998)))
+    p.add_argument('--target', default='Xtream')
+    p.add_argument('--await', dest='await_promise', action='store_true')
+    p.add_argument('--list', action='store_true', help='List debug targets and exit')
+    p.add_argument('expr', nargs='?', default=None)
+    args = p.parse_args()
+
+    try:
+        targets = get_targets(args.port)
+    except Exception as e:
+        sys.exit(f'cannot reach inspector at 127.0.0.1:{args.port} ({e}). Run scripts/tv-tunnel first.')
+
+    if args.list:
+        for t in targets:
+            print(f"[{t.get('type')}] {t.get('title')} :: {t.get('url')}")
+        return
+
+    target = pick_target(targets, args.target)
+    if not target:
+        sys.exit(f'no target matching "{args.target}". Use --list to see options.')
+
+    expr = args.expr if args.expr is not None else sys.stdin.read()
+    if not expr.strip():
+        sys.exit('empty expression')
+
+    result = evaluate(target['webSocketDebuggerUrl'], expr, args.await_promise)
+    r = result.get('result', {})
+    if 'exceptionDetails' in r:
+        sys.stderr.write(json.dumps(r['exceptionDetails'], indent=2) + '\n')
+        sys.exit(1)
+    val = r.get('result', {}).get('value', r.get('result'))
+    if isinstance(val, (dict, list)):
+        print(json.dumps(val, indent=2))
+    else:
+        print(val)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Inject a keystroke into the running app via CDP.
+
+Usage:
+  scripts/tv-key down
+  scripts/tv-key ok
+  scripts/tv-key 5         # digit
+  scripts/tv-key 461       # raw keyCode
+  scripts/tv-key channelup
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+
+from websocket import create_connection
+
+KEYS = {
+    'left': 37, 'up': 38, 'right': 39, 'down': 40,
+    'ok': 13, 'enter': 13,
+    'back': 461,
+    'red': 403, 'green': 404, 'yellow': 405, 'blue': 406,
+    'play': 415, 'pause': 19, 'stop': 413,
+    'ff': 417, 'rewind': 412,
+    'channelup': 427, 'channeldown': 428,
+    'mute': 449, 'volup': 447, 'voldown': 448,
+}
+
+
+def keycode(name: str) -> int:
+    name = name.strip().lower()
+    if name in KEYS:
+        return KEYS[name]
+    if len(name) == 1 and name.isdigit():
+        return ord(name)
+    if name.isdigit():
+        return int(name)
+    sys.exit(f'unknown key "{name}". Known: {", ".join(sorted(KEYS))}, 0-9, or numeric keyCode')
+
+
+def pick_target(port: int, match: str):
+    targets = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/json'))
+    for t in targets:
+        if t.get('type') != 'page':
+            continue
+        if match.lower() in (t.get('title') or '').lower() or match.lower() in (t.get('url') or '').lower():
+            return t
+    sys.exit(f'no target matching "{match}"')
+
+
+def send_key(ws_url: str, code: int):
+    ws = create_connection(ws_url, timeout=10)
+    try:
+        for i, ev in enumerate(['keyDown', 'keyUp']):
+            ws.send(json.dumps({
+                'id': i + 1,
+                'method': 'Input.dispatchKeyEvent',
+                'params': {
+                    'type': ev,
+                    'windowsVirtualKeyCode': code,
+                    'nativeVirtualKeyCode': code,
+                },
+            }))
+            ws.recv()
+    finally:
+        ws.close()
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--port', type=int, default=int(os.environ.get('TV_INSPECT_PORT', 9998)))
+    p.add_argument('--target', default='Xtream')
+    p.add_argument('key', help='key name or keyCode')
+    args = p.parse_args()
+    target = pick_target(args.port, args.target)
+    code = keycode(args.key)
+    send_key(target['webSocketDebuggerUrl'], code)
+    print(f'sent keyCode {code} ({args.key})')
+
+
+if __name__ == '__main__':
+    main()

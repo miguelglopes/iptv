@@ -1,0 +1,11 @@
+app/js/config.js
+.env
+.build/
+*.log
+.DS_Store
+.idea/
+.vscode/
+server/config.toml
+server/target/
+.claude/
+.playwright-mcp/

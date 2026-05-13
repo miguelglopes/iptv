@@ -1,0 +1,55 @@
+listen_addr = "0.0.0.0:8080"
+public_base_url = "http://localhost:8080"
+# Static UI assets served as fallback. Defaults to "../app" — resolves to the
+# repo's app/ both for `cargo run` from server/ and inside the Docker container
+# (WORKDIR /srv/iptv-proxy, app/ mounted at /srv/app).
+# ui_dir = "../app"
+
+[xtream]
+username = "REPLACE_ME"
+password = "REPLACE_ME"
+hosts = [
+    "http://cf.8kgaminghub.shop",
+    "http://cf.gaminhub.sbs",
+    "http://cf.business-cloud-8k.com",
+    "http://pro.292910.xyz",
+    "http://cf.humari.xyz",
+    "http://pro.003391.xyz",
+    "http://cf.0006652.xyz",
+    "http://cf.4kdream.cloud",
+    "http://cf.gocdn8k.me",
+    "http://cf.super-gaminhub.xyz",
+    "http://cf.vip8kgaming.xyz",
+    "http://cf.supergaminghub.xyz",
+    "http://cf.business-cdn-8k.su",
+    "http://smarter8k.su",
+    "http://cf.business-cdn.me",
+    "http://rss14079.cdn-mx.me",
+    "http://cf.hi-ott.me",
+]
+
+[probe]
+interval_secs = 60
+timeout_ms = 1500
+parallelism = 8
+
+[catalog]
+refresh_interval_secs = 3600
+
+[epg]
+ttl_secs = 1800
+fetch_timeout_secs = 10
+
+[blacklist]
+host_fail_threshold = 4
+url_ttl_secs = 3600
+host_ttl_secs = 3600
+demote_ttl_secs = 10800
+
+[proxy]
+upstream_timeout_secs = 15
+segment_buffer_bytes = 65536
+play_budget_secs = 10
+per_attempt_timeout_secs = 5
+opportunistic_validate_count = 2
+opportunistic_validate_timeout_secs = 4
