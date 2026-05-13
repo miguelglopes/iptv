@@ -4,7 +4,8 @@ import {
   loadSearchHistory, pushSearchHistory, clearSearchHistory,
   loadRecentChannels, pushRecentChannel, removeRecentChannel, clearRecentChannels,
   loadChannelsCache, saveChannelsCache, clearChannelsCache,
-  loadEpg, saveEpg
+  loadEpg, saveEpg,
+  loadLastPlayTimestamp
 } from './cache.js';
 import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, adminClearBlacklist, adminClearDemoted, adminClearAllSources } from './api.js';
 
@@ -800,6 +801,35 @@ function play(channel) {
   player.play(channel.play_url);
 }
 
+// Auto-resume the most recently played channel on app boot. Skipped if recents is empty,
+// the last play was longer than AUTO_RESUME_MAX_AGE_MS ago, the channel no longer exists
+// in the catalog, or the user has already touched the remote (they're signalling intent
+// to browse rather than resume). Idempotent — first call wins; later boot stages that
+// also call this just fall through.
+var AUTO_RESUME_MAX_AGE_MS = 24 * 3600 * 1000;
+var userInteracted = false;
+var autoResumeTried = false;
+function tryAutoResume() {
+  if (autoResumeTried || userInteracted || state.playing || state.error) return;
+  if (!state.channels.length) return;
+  var recents = loadRecentChannels();
+  if (!recents.length) return;
+  var lastTs = loadLastPlayTimestamp();
+  if (!lastTs || (Date.now() - lastTs) > AUTO_RESUME_MAX_AGE_MS) return;
+  var targetKey = recents[0];
+  var ch = null;
+  for (var i = 0; i < state.channels.length; i++) {
+    if (state.channels[i].key === targetKey) { ch = state.channels[i]; break; }
+  }
+  if (!ch) return;
+  autoResumeTried = true;
+  logEvent('auto-resume', ch.name, { key: ch.key });
+  // Land focus on the resumed channel so Back → mini → list lands on it,
+  // and so the underlying list is in a sensible state when the user exits.
+  state.focusIdx = 0;
+  play(ch);
+}
+
 // Build the catch-up URL for a channel. Server contract:
 //   GET /play/<key>.m3u8?at=<rfc3339-utc>&duration=<minutes>
 //     → VOD playlist starting at `at`, covering `duration` minutes.
@@ -1213,7 +1243,7 @@ setRemoteHandlers({
   channelDown: function () { (state.playing && !state.mini) ? zap(1) : moveFocus(1); },
   home: function () { jumpToEdge(false); },
   end: function () { jumpToEdge(true); },
-  any: function () { showLegend(); showCatchupBadge(); }
+  any: function () { userInteracted = true; showLegend(); showCatchupBadge(); }
 });
 
 // === BOOT ===
@@ -1225,6 +1255,7 @@ if (cachedChannels && cachedChannels.length) {
   mark('cachedRender');
 }
 render();
+tryAutoResume();
 
 // Step 2: fetch the fresh catalog, save it, re-render.
 catalogLoading = true;
@@ -1236,6 +1267,7 @@ listChannels().then(function (channels) {
   saveChannelsCache(channels);
   state.zapList = null;
   render();
+  tryAutoResume();
 }).catch(function (err) {
   catalogLoading = false;
   if (!state.channels.length) {

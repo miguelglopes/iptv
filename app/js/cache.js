@@ -33,6 +33,10 @@ export function clearSearchHistory() {
 
 var RECENT_KEY = 'xtream.recent.channels.v1';
 var RECENT_MAX = 100;
+// Timestamp of the most recent play. Auto-resume on boot uses this to decide whether
+// the previously-watched channel is still a relevant default — a recent on the same
+// day says "resume", a recent from last month does not.
+var LAST_PLAY_TS_KEY = 'xtream.recent.last_play_ts.v1';
 
 export function loadRecentChannels() {
   try {
@@ -47,6 +51,7 @@ export function pushRecentChannel(channelKey) {
   r.unshift(channelKey);
   if (r.length > RECENT_MAX) r.length = RECENT_MAX;
   try { localStorage.setItem(RECENT_KEY, JSON.stringify(r)); } catch (e) {}
+  try { localStorage.setItem(LAST_PLAY_TS_KEY, String(Date.now())); } catch (e) {}
 }
 
 export function removeRecentChannel(channelKey) {
@@ -60,6 +65,16 @@ export function removeRecentChannel(channelKey) {
 
 export function clearRecentChannels() {
   try { localStorage.removeItem(RECENT_KEY); } catch (e) {}
+  try { localStorage.removeItem(LAST_PLAY_TS_KEY); } catch (e) {}
+}
+
+export function loadLastPlayTimestamp() {
+  try {
+    var raw = localStorage.getItem(LAST_PLAY_TS_KEY);
+    if (!raw) return 0;
+    var n = parseInt(raw, 10);
+    return isFinite(n) ? n : 0;
+  } catch (e) { return 0; }
 }
 
 var CHANNELS_KEY = 'iptv.channels.v1';
