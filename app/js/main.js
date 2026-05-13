@@ -13,15 +13,13 @@ import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminRepr
 // gate on the real TV vs. laptop dev. webOS UA contains "Web0S" (yes, zero, not O).
 if (/Web0S/i.test(navigator.userAgent)) document.documentElement.classList.add('tv');
 
-var $app = document.getElementById('app');
 var player = new Player();
 
 // SVG "replay" glyph. webOS Chromium's default fonts ship without U+21BB, so the
 // literal ↻ character renders as a tofu square on the TV. Inline SVG dodges that
-// entirely — uses currentColor so callers (pill, REPLAY badge, soon badge, catch-up
-// top badge) just inherit text colour.
-var REPLAY_SVG_14 = '<svg class="replay-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>';
-var REPLAY_SVG_18 = '<svg class="replay-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>';
+// entirely — uses currentColor so callers inherit text colour. Size set in CSS
+// per consumer (.replay-icon defaults; specific contexts override width/height).
+var REPLAY_SVG = '<svg class="replay-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>';
 
 var state = {
   view: 'channels',       // 'channels' | 'playing'
@@ -55,38 +53,31 @@ function updateBodyClass() {
   c.toggle('panel-epg', state.panel === 'epg');
   c.toggle('panel-player', state.panel === 'player');
   c.toggle('catchup-mode', !!(state.playing && state.playing.mode === 'catchup'));
+  c.toggle('searching', state.search != null);
+  c.toggle('error', !!state.error);
   updateCatchupBadge();
 }
 
-// Top-left "you're not live" reminder while in catch-up. Mirrors scene 3 of the mockup:
-//   ↻ CATCH-UP   Tue 12 · 21:30 — Linha da Frente
-// Content depends on whether we got here via an EPG row (state.playing.catchup.program set)
-// or via a "rewind from live" trigger (only atIso set). Hidden via CSS when not in
-// catch-up — JS just keeps the text current.
-// Make the catch-up badge briefly visible. Same 5 s auto-hide pattern as #legend so the
-// two surfaces fade together. Re-fires on any remote key (see `any` handler) so the user
-// can always confirm what mode they're in by touching the remote.
+// Make the catch-up badge briefly visible. 5 s auto-hide; re-fires on any remote key
+// (see `any` handler) so the user can always confirm what mode they're in by touching
+// the remote.
 var catchupBadgeTimer = null;
 function showCatchupBadge() {
   if (!state.playing || state.playing.mode !== 'catchup' || state.mini) return;
   var el = document.getElementById('catchup-badge');
   if (!el) return;
   el.classList.add('visible');
-  if (catchupBadgeTimer) clearTimeout(catchupBadgeTimer);
+  clearTimeout(catchupBadgeTimer);
   catchupBadgeTimer = setTimeout(function () { el.classList.remove('visible'); }, 5000);
 }
 
 function updateCatchupBadge() {
   var el = document.getElementById('catchup-badge');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'catchup-badge';
-    document.body.appendChild(el);
-  }
+  if (!el) return;
   if (!state.playing || state.playing.mode !== 'catchup') {
     el.innerHTML = '';
     el.classList.remove('visible');
-    if (catchupBadgeTimer) { clearTimeout(catchupBadgeTimer); catchupBadgeTimer = null; }
+    clearTimeout(catchupBadgeTimer);
     return;
   }
   var cu = state.playing.catchup || {};
@@ -98,23 +89,14 @@ function updateCatchupBadge() {
   }
   var title = (cu.program && cu.program.title) || '';
   el.innerHTML =
-    '<span class="cu">' + REPLAY_SVG_14 + ' CATCH-UP</span>' +
+    '<span class="cu">' + REPLAY_SVG + ' CATCH-UP</span>' +
     '<span class="when">' + esc(when) + '</span>' +
     (title ? '<span class="ttl">— ' + esc(title) + '</span>' : '');
-  // Content update only. Visibility is driven by explicit showCatchupBadge() calls
-  // (entry to catch-up + any remote key) — not by every render(), or the periodic
-  // /api/status poll's render call would keep resetting the 5 s fade timer.
-}
-
-// The top-right panel is settings when idle, the mini player when minimized — settings
-// has no place there while watching, and the player slot has no place there when idle.
-function topRightPanel() {
-  return state.mini ? 'player' : 'settings';
 }
 
 // Fast path for panel changes: only touch the body class, the focused list item, and
-// the settings-item focus class. A full render() would rebuild the entire DOM (414
-// list items + EPG rows) which makes panel-cycling feel sluggish on the TV.
+// the settings-item focus class. A full list rebuild would re-create 400+ DOM nodes
+// which makes panel-cycling feel sluggish on the TV.
 function setPanel(newPanel) {
   if (state.panel === newPanel) return;
   state.panel = newPanel;
@@ -212,13 +194,13 @@ function reprobeAction() {
 function clearSearchHistoryAction() {
   clearSearchHistory();
   notifyCleared('Search history');
-  if (state.search != null) render();
+  if (state.search != null) renderList();
 }
 
 function clearRecentChannelsAction() {
   clearRecentChannels();
   notifyCleared('Recent channels');
-  render();
+  renderList();
 }
 
 function clearChannelsCacheAction() {
@@ -231,16 +213,19 @@ function clearAllAction() {
   location.reload();
 }
 
-var SETTINGS = [
-  { label: 'Reset blocked sources',    action: resetBlockedSourcesAction },
-  { label: 'Reset source preferences', action: resetSourcePreferencesAction },
-  { label: 'Reset all source state',   action: resetAllSourceStateAction },
-  { label: 'Reprobe hosts',            action: reprobeAction },
-  { label: 'Clear search history',     action: clearSearchHistoryAction },
-  { label: 'Clear recent channels',    action: clearRecentChannelsAction },
-  { label: 'Clear cached channels',    action: clearChannelsCacheAction },
-  { label: 'Clear all (reload)',       action: clearAllAction }
+// Action lookup keyed by the `data-i` index in the static settings grid (index.html).
+// Order must match the markup; if you change one, change the other.
+var SETTINGS_ACTIONS = [
+  resetBlockedSourcesAction,
+  resetSourcePreferencesAction,
+  resetAllSourceStateAction,
+  reprobeAction,
+  clearSearchHistoryAction,
+  clearRecentChannelsAction,
+  clearChannelsCacheAction,
+  clearAllAction
 ];
+var SETTINGS_COUNT = SETTINGS_ACTIONS.length;
 
 var timings = { boot: performance.now() };
 function mark(name) {
@@ -298,9 +283,8 @@ var PROVIDER_LAG_MS = 3 * 3600 * 1000;
 // Programs currently visible in the EPG panel for `ch`. Returns null if no data yet.
 // The window is 1 h on regular channels (just anchor on "right now") and
 // tv_archive_duration days on catch-up channels (so users can scroll into history).
-// Cache the filtered "visible" list per channel. The cutoff drifts at most a few
-// seconds between presses, so we keep the cache for a minute and skip the O(n) filter
-// on hot-path navigation.
+// Cache the filtered list per channel for a minute; the cutoff drifts at most a few
+// seconds between presses and the O(n) filter is wasted on hot-path navigation.
 var visibleEpgCache = { key: null, computedAt: 0, list: null };
 function visibleEpgPrograms(ch) {
   if (!ch) return null;
@@ -321,8 +305,6 @@ function visibleEpgPrograms(ch) {
   return result;
 }
 
-// Index of the program that's airing right now within `visible`. -1 if none (e.g.,
-// rare EPG gap or transient mid-render moment).
 function nowEpgIndex(visible) {
   if (!visible) return -1;
   var now = Date.now();
@@ -337,11 +319,9 @@ function epgPanelHtml() {
   var ch = focusedChannel();
   if (!ch) return '<div class="epg-empty">no channel focused</div>';
 
-  // Channel header — channel name + optional catch-up pill. Always rendered so the
-  // panel is self-describing.
   var head = '<div class="epg-channel">' + esc(ch.name);
   if (ch.tv_archive && ch.tv_archive_duration > 0) {
-    head += '<span class="epg-catchup-pill">' + REPLAY_SVG_14 + 'CATCH-UP · ' + ch.tv_archive_duration + 'd</span>';
+    head += '<span class="epg-catchup-pill">' + REPLAY_SVG + 'CATCH-UP · ' + ch.tv_archive_duration + 'd</span>';
   }
   head += '</div>';
 
@@ -352,9 +332,6 @@ function epgPanelHtml() {
   var visible = visibleEpgPrograms(ch);
   if (!visible) return head + '<div class="epg-empty">no upcoming programs</div>';
 
-  // Default the row focus to the "now" row on first render of this channel, or after
-  // the user explicitly asked for a reset (rowIdx === -1). Otherwise clamp the existing
-  // index in case `visible` shifted as time passed.
   if (state.epg.rowIdx < 0) {
     var nowIdx = nowEpgIndex(visible);
     state.epg.rowIdx = nowIdx >= 0 ? nowIdx : 0;
@@ -386,14 +363,11 @@ function epgPanelHtml() {
     } else if (isPast) {
       if (ch.tv_archive && p.has_archive) {
         rowCls += ' past-replay';
-        badge = '<div class="epg-replay-badge">' + REPLAY_SVG_18 + '<span class="lbl">REPLAY</span></div>';
+        badge = '<div class="epg-replay-badge">' + REPLAY_SVG + '<span class="lbl">REPLAY</span></div>';
       } else if (ch.tv_archive && (now - p.end.getTime()) < PROVIDER_LAG_MS) {
-        // Channel supports catch-up + just-ended + not yet archived → "soon" state.
         rowCls += ' past-pending';
-        badge = '<div class="epg-pending-badge">' + REPLAY_SVG_14 + 'soon</div>';
+        badge = '<div class="epg-pending-badge">' + REPLAY_SVG + 'soon</div>';
       } else {
-        // Either channel doesn't support catch-up at all, or program is past
-        // the archive window — aired and gone.
         rowCls += ' past-gone';
       }
     }
@@ -411,17 +385,16 @@ function epgPanelHtml() {
 var epgFetchTimer = null;
 function scheduleEpgFetch() {
   // Cheap synchronous swap: show "loading…" the moment focus changes so the user
-  // never sees the previous channel's schedule. The full EPG render (which can be
-  // ~200 DOM nodes for a multi-day schedule) is deferred to after the debounce,
-  // so rapid scrolling stays snappy.
+  // never sees the previous channel's schedule. The full EPG render is deferred to
+  // after the debounce, so rapid scrolling stays snappy.
   var ch = focusedChannel();
   if (ch && state.epg.focusKey !== ch.key) {
     state.epg.focusKey = ch.key;
-    state.epg.rowIdx = -1;  // auto-pick "now" on next render of this channel
+    state.epg.rowIdx = -1;
     var panel = document.getElementById('bottom-slot');
     if (panel) panel.innerHTML = '<div class="epg-empty">loading…</div>';
   }
-  if (epgFetchTimer) clearTimeout(epgFetchTimer);
+  clearTimeout(epgFetchTimer);
   epgFetchTimer = setTimeout(fetchEpgForFocused, 80);
 }
 
@@ -429,46 +402,40 @@ function fetchEpgForFocused() {
   var ch = focusedChannel();
   if (!ch) return;
 
-  // Cache hit — render and skip the network.
   var cached = loadEpg(ch.key);
   if (cached && cached.length) {
     state.epg.byKey[ch.key] = { programs: cached, fetching: false };
-    renderEpgPanel();
+    renderEpg();
     return;
   }
 
-  // Already fetched (possibly returned []) — re-render whatever we have.
   var entry = state.epg.byKey[ch.key];
   if (entry && entry.programs != null) {
-    renderEpgPanel();
+    renderEpg();
     return;
   }
 
   state.epg.byKey[ch.key] = { programs: null, fetching: true };
-  // Server walks all sources in parallel and returns the best EPG it could find,
-  // already deduped — no client-side fallback walk needed.
   epgFor(ch.key).then(function (programs) {
     if (state.epg.focusKey !== ch.key) return;
     state.epg.byKey[ch.key] = { programs: programs, fetching: false };
     saveEpg(ch.key, programs);
-    renderEpgPanel();
+    renderEpg();
   }).catch(function () {
     if (state.epg.focusKey !== ch.key) return;
     state.epg.byKey[ch.key] = { programs: [], fetching: false };
     saveEpg(ch.key, []);
-    renderEpgPanel();
+    renderEpg();
   });
 }
 
-function renderEpgPanel() {
+function renderEpg() {
   var panel = document.getElementById('bottom-slot');
   if (!panel) return;
   panel.innerHTML = epgPanelHtml();
-  // Center the focused row (which defaults to "now" on a fresh channel) so the user
-  // sees what they have selected without scrolling.
   var focused = panel.querySelector('.epg-row.focused, .epg-row.focused-dim');
   var target = focused || panel.querySelector('.epg-row.now');
-  if (target && target.scrollIntoView) target.scrollIntoView({ block: 'center' });
+  if (target) scrollIntoCenter(target, panel);
 }
 
 function listHtml(items) {
@@ -513,7 +480,6 @@ function visibleChannels() {
   return ranked.filter(function (c) { return c.name.toLowerCase().indexOf(s) >= 0; });
 }
 
-// What the list renders: recent searches (when search is open & empty), else channels.
 function visibleItems() {
   if (state.search === '') {
     var h = loadSearchHistory();
@@ -543,112 +509,76 @@ function hostStatusLabel() {
   return '<span class="ok">✓</span> ' + alive + ' hosts' + (disabled ? ' (' + disabled + ' disabled)' : '');
 }
 
-function render() {
-  if (state.error) {
-    $app.innerHTML = '<header><h1>Error</h1></header><pre class="error">' + esc(state.error) + '</pre>';
-    return;
-  }
-  var visible = visibleItems();
-  var searchBar = '';
-  if (state.search != null) {
-    searchBar = '<input id="search" class="search" placeholder="search…" value="' + esc(state.search) + '" autocomplete="off">';
-  }
-  // Top-slot contents: settings (2-column grid) when idle/fullscreen; empty when in mini
-  // (we re-parent the <video> element here in attachVideoForMode after render).
-  var topSlotHtml;
-  if (state.mini) {
-    topSlotHtml = '';
-  } else {
-    var settingsHtml = '';
-    for (var si = 0; si < SETTINGS.length; si++) {
-      var s = SETTINGS[si];
-      var focused = state.panel === 'settings' && si === state.settingsIdx ? ' focused' : '';
-      var div = s.divider ? ' divider' : '';
-      settingsHtml += '<div class="settings-item' + focused + div + '" data-i="' + si + '">' + esc(s.label) + '</div>';
-    }
-    topSlotHtml =
-      '<div class="settings-title">Settings</div>' +
-      '<div class="settings-grid">' + settingsHtml + '</div>';
-  }
-  // Keys legend lives in the header now — frees the right column for settings + guide.
-  var keymapInline =
-    '<div class="keymap-inline">' +
-      '<span><span class="k k-y">●</span> Y Search</span>' +
-      '<span><span class="k k-r">●</span> R Unpin</span>' +
-      '<span>OK Play</span>' +
-      '<span>◁▷ Panel</span>' +
-      '<span>△▽ Channel</span>' +
-    '</div>';
-  $app.innerHTML =
-    '<section class="left-col">' +
-      '<header>' +
-        '<div class="header-top">' +
-          '<h1>Channels</h1>' +
-          '<div class="hint">' + visible.length + (state.search ? ' / ' + state.channels.length : '') + ' · ' + hostStatusLabel() + '</div>' +
-        '</div>' +
-        keymapInline +
-      '</header>' +
-      searchBar +
-      '<section id="list" class="list">' + listHtml(visible) + '</section>' +
-    '</section>' +
-    '<aside class="right-col">' +
-      '<div id="top-slot" class="top-slot">' + topSlotHtml + '</div>' +
-      '<div id="bottom-slot" class="bottom-slot">' + epgPanelHtml() + '</div>' +
-    '</aside>';
-  attachVideoForMode();
-  updateBodyClass();
-  scrollToFocus();
-  if (state.panel === 'list') scheduleEpgFetch();
-  if (state.search != null) {
-    var inp = document.getElementById('search');
-    if (inp) {
-      if (focusSearchOnNextRender) {
-        inp.focus();
-        try { inp.setSelectionRange(inp.value.length, inp.value.length); } catch (e) {}
-        focusSearchOnNextRender = false;
-      }
-      inp.oninput = function () {
-        state.search = inp.value;
-        state.focusIdx = 0;
-        var list = document.getElementById('list');
-        if (list) list.innerHTML = listHtml(visibleItems());
-        scheduleEpgFetch();
-      };
-    }
-  }
+function hintText(visibleCount) {
+  return visibleCount + (state.search ? ' / ' + state.channels.length : '') + ' · ' + hostStatusLabel();
 }
 
-var focusSearchOnNextRender = false;
+function setHint(text) {
+  var el = document.querySelector('.hint');
+  if (el) el.innerHTML = text;
+}
+
+function renderList() {
+  var listEl = document.getElementById('list');
+  if (!listEl) return;
+  var items = visibleItems();
+  listEl.innerHTML = listHtml(items);
+  setHint(hintText(items.length));
+  scrollToFocus();
+  // The static settings panel isn't rebuilt by renderList, so its .focused class
+  // can otherwise leak across panel changes that bypass setPanel() (back / toggleSearch).
+  // Re-sync each call: it's 8 toggles, cheap.
+  var settingsItems = document.querySelectorAll('.settings-grid .settings-item');
+  for (var si = 0; si < settingsItems.length; si++) {
+    settingsItems[si].classList.toggle('focused', state.panel === 'settings' && si === state.settingsIdx);
+  }
+  if (state.panel === 'list') scheduleEpgFetch();
+}
+
+function setError(msg) {
+  state.error = msg || '';
+  var pre = document.querySelector('#error .error-msg');
+  if (pre) pre.textContent = state.error;
+  updateBodyClass();
+}
+
+// Manually scroll the immediate container to put `el` in the middle. Native
+// element.scrollIntoView walks up to every scrollable ancestor (incl. body/html),
+// which silently shifts the page even on overflow:hidden/clip parents in some
+// engines. Manual scrollTop touches only the panel we mean to move.
+function scrollIntoCenter(el, container) {
+  if (!el || !container) return;
+  var cr = container.getBoundingClientRect();
+  var er = el.getBoundingClientRect();
+  var offset = (er.top - cr.top) - (cr.height - er.height) / 2;
+  container.scrollTop += offset;
+}
+
+function scrollIntoNearest(el, container) {
+  if (!el || !container) return;
+  var cr = container.getBoundingClientRect();
+  var er = el.getBoundingClientRect();
+  if (er.top < cr.top) container.scrollTop -= (cr.top - er.top);
+  else if (er.bottom > cr.bottom) container.scrollTop += (er.bottom - cr.bottom);
+}
 
 function scrollToFocus() {
-  var el = $app.querySelector('.list-item.focused');
-  if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
-}
-
-// Hold-to-fast-scroll: when arrow events come in faster than 80 ms apart, ramp up the
-// step size so a sustained hold flies through the list (or the EPG) instead of crawling
-// one item at a time. Resets to 1 after any pause.
-var lastMoveTs = 0;
-var moveBoost = 1;
-function focusStep(delta, max) {
-  var now = performance.now();
-  if (now - lastMoveTs < 80) moveBoost = Math.min(moveBoost + 0.18, max);
-  else moveBoost = 1;
-  lastMoveTs = now;
-  var step = Math.max(1, Math.round(Math.abs(delta) * moveBoost));
-  return delta < 0 ? -step : step;
+  var list = document.getElementById('list');
+  if (!list) return;
+  var el = list.querySelector('.list-item.focused');
+  scrollIntoCenter(el, list);
 }
 
 function moveFocus(delta) {
   if (state.playing && !state.mini) return zap(delta);
   if (state.panel === 'settings') {
     var next = state.settingsIdx + delta;
-    if (next >= SETTINGS.length) {
+    if (next >= SETTINGS_COUNT) {
       // Past the last item → drop into the EPG panel below.
       setPanel('epg');
       return;
     }
-    if (next < 0) next = SETTINGS.length - 1;
+    if (next < 0) next = SETTINGS_COUNT - 1;
     setSettingsIdx(next);
     return;
   }
@@ -661,31 +591,24 @@ function moveFocus(delta) {
     var ch = focusedChannel();
     var visible = visibleEpgPrograms(ch);
     if (!visible || !visible.length) {
-      // No EPG data yet (loading / empty). Going up still escapes to the top-right slot.
       if (delta < 0) {
-        var topEmpty = topRightPanel();
-        if (topEmpty === 'settings') state.settingsIdx = SETTINGS.length - 1;
+        var topEmpty = state.mini ? 'player' : 'settings';
+        if (topEmpty === 'settings') state.settingsIdx = SETTINGS_COUNT - 1;
         setPanel(topEmpty);
       }
       return;
     }
     var prevIdx = state.epg.rowIdx;
     if (prevIdx < 0) prevIdx = 0;
-    // Higher acceleration cap than the channel list (8) because the EPG can have
-    // 200+ rows and a sustained hold should fly through.
-    var step = focusStep(delta, 12);
-    var nextIdx = prevIdx + step;
+    var nextIdx = prevIdx + delta;
     if (nextIdx < 0) {
-      // Past the top → escape up to the top-right slot.
-      var top = topRightPanel();
-      if (top === 'settings') state.settingsIdx = SETTINGS.length - 1;
+      var top = state.mini ? 'player' : 'settings';
+      if (top === 'settings') state.settingsIdx = SETTINGS_COUNT - 1;
       setPanel(top);
       return;
     }
     if (nextIdx >= visible.length) nextIdx = visible.length - 1;
     state.epg.rowIdx = nextIdx;
-    // Only retag the two affected rows. The EPG can be ~90 nodes; iterating every
-    // arrow press would re-render the whole DOM tree and feel sluggish on the TV.
     var panel = document.getElementById('bottom-slot');
     if (panel) {
       var prevEl = panel.querySelector('.epg-row[data-i="' + prevIdx + '"]');
@@ -693,32 +616,27 @@ function moveFocus(delta) {
       if (prevEl) prevEl.classList.remove('focused');
       if (nextEl) {
         nextEl.classList.add('focused');
-        nextEl.scrollIntoView({ block: 'nearest' });
+        scrollIntoNearest(nextEl, panel);
       }
     }
     return;
   }
   var list = visibleItems();
   if (!list.length) return;
-  var step = focusStep(delta, 8);
   // Clamp instead of wrapping — wrapping a 400-item list disorients the user.
-  var next = state.focusIdx + step;
-  if (next < 0) next = 0;
-  if (next >= list.length) next = list.length - 1;
-  var prevIdx = state.focusIdx;
-  state.focusIdx = next;
-  // Only touch the two list items that actually changed — iterating all ~400 every
-  // arrow press is what was making fast scrolling feel sluggish on the TV.
+  var nextL = state.focusIdx + delta;
+  if (nextL < 0) nextL = 0;
+  if (nextL >= list.length) nextL = list.length - 1;
+  var prevL = state.focusIdx;
+  state.focusIdx = nextL;
   var listEl = document.getElementById('list');
   if (listEl) {
-    var prevEl = listEl.children[prevIdx];
-    var nextEl = listEl.children[next];
-    if (prevEl && prevEl !== nextEl) prevEl.classList.remove('focused');
-    if (nextEl) {
-      nextEl.classList.add('focused');
-      // block:'nearest' is a no-op while the item is fully visible — we only pay
-      // the scroll cost when the focus is about to leave the viewport.
-      nextEl.scrollIntoView({ block: 'nearest' });
+    var prevElL = listEl.children[prevL];
+    var nextElL = listEl.children[nextL];
+    if (prevElL && prevElL !== nextElL) prevElL.classList.remove('focused');
+    if (nextElL) {
+      nextElL.classList.add('focused');
+      scrollIntoNearest(nextElL, listEl);
     }
   }
   scheduleEpgFetch();
@@ -731,20 +649,13 @@ function jumpToEdge(end) {
   var list = visibleItems();
   if (!list.length) return;
   state.focusIdx = end ? list.length - 1 : 0;
-  render();
-  scheduleEpgFetch();
+  renderList();
 }
 
-// Arrow left/right: timeline navigation. Consistent meaning regardless of playback mode:
-//   - catchup → native HTML5 seek ±30 s on the VOD chunk, no reload
-//   - live    → ◁ enters catch-up at "now − 30 s" (or toast if no catch-up), ▷ toast
-//                "already at live"
-// Source-switching moved off ◁▷ to a dedicated Green key — see `green:` handler.
-// Outside playback, ◁▷ are panel switchers (list ↔ right-column).
+// Arrow left/right: timeline navigation while playing; panel switcher when idle.
 function moveHorizontal(delta) {
   if (state.playing && !state.mini) {
     if (state.playing.mode === 'catchup') return seekCatchup(delta * 30);
-    // Live playback.
     if (delta > 0) {
       setOverlay(state.playing.channel.name, '', 'already at live');
       return;
@@ -761,7 +672,7 @@ function moveHorizontal(delta) {
   // falling off the left edge into the list. Even index = left col, odd = right col.
   if (state.panel === 'settings') {
     if (delta > 0) {
-      if (state.settingsIdx % 2 === 0 && state.settingsIdx + 1 < SETTINGS.length) setSettingsIdx(state.settingsIdx + 1);
+      if (state.settingsIdx % 2 === 0 && state.settingsIdx + 1 < SETTINGS_COUNT) setSettingsIdx(state.settingsIdx + 1);
     } else if (state.settingsIdx % 2 === 1) {
       setSettingsIdx(state.settingsIdx - 1);
     } else {
@@ -801,11 +712,7 @@ function play(channel) {
   player.play(channel.play_url);
 }
 
-// Auto-resume the most recently played channel on app boot. Skipped if recents is empty,
-// the last play was longer than AUTO_RESUME_MAX_AGE_MS ago, the channel no longer exists
-// in the catalog, or the user has already touched the remote (they're signalling intent
-// to browse rather than resume). Idempotent — first call wins; later boot stages that
-// also call this just fall through.
+// Auto-resume the most recently played channel on app boot.
 var AUTO_RESUME_MAX_AGE_MS = 24 * 3600 * 1000;
 var userInteracted = false;
 var autoResumeTried = false;
@@ -824,17 +731,10 @@ function tryAutoResume() {
   if (!ch) return;
   autoResumeTried = true;
   logEvent('auto-resume', ch.name, { key: ch.key });
-  // Land focus on the resumed channel so Back → mini → list lands on it,
-  // and so the underlying list is in a sensible state when the user exits.
   state.focusIdx = 0;
   play(ch);
 }
 
-// Build the catch-up URL for a channel. Server contract:
-//   GET /play/<key>.m3u8?at=<rfc3339-utc>&duration=<minutes>
-//     → VOD playlist starting at `at`, covering `duration` minutes.
-// `at` and `from` are mutually exclusive on the server; we always use `at` because the
-// client always has the EPG row's start time (UTC ISO via Date.toISOString()).
 function catchupUrl(channel, atIso, durationMin) {
   var sep = channel.play_url.indexOf('?') >= 0 ? '&' : '?';
   return channel.play_url + sep +
@@ -842,9 +742,6 @@ function catchupUrl(channel, atIso, durationMin) {
     '&duration=' + Math.max(1, Math.round(durationMin));
 }
 
-// Catch-up playback for a specific past program. State transitions to mode='catchup'
-// so the rest of the app (key handlers, OSD, source-failure path) knows we're inside
-// a VOD chunk rather than the live sliding window.
 function playCatchup(channel, program) {
   if (!program || !program.start || !program.end) return;
   if (!channel.tv_archive) {
@@ -854,8 +751,6 @@ function playCatchup(channel, program) {
   captureZapList();
   pushRecentChannel(channel.key);
   var atIso = program.start.toISOString();
-  // Request the full program length plus a 5-minute buffer so seeking near the boundaries
-  // doesn't immediately need a chunk reload.
   var durationMin = Math.ceil((program.end.getTime() - program.start.getTime()) / 60000) + 5;
   var url = catchupUrl(channel, atIso, durationMin);
   state.playing = {
@@ -883,13 +778,10 @@ function zap(delta) {
   if (curIdx < 0) curIdx = state.focusIdx;
   state.focusIdx = (curIdx + delta + list.length) % list.length;
   var ch = list[state.focusIdx];
-  // Zapping always lands on live for the new channel — even if we were watching the
-  // previous channel's catch-up. Setting mode explicitly so updateBodyClass clears the
-  // CATCH-UP badge and the rest of the app sees a coherent state.
   state.playing = { channel: ch, mode: 'live' };
   updateBodyClass();
   setOverlay(ch.name, '', '…', true);
-  if (zapTimer) clearTimeout(zapTimer);
+  clearTimeout(zapTimer);
   zapTimer = setTimeout(function () {
     zapTimer = null;
     if (state.playing) {
@@ -899,16 +791,6 @@ function zap(delta) {
   }, 250);
 }
 
-// Left/right while playing — demote the current upstream so the proxy picks a
-// different one on the next playlist hit. Debounced 250 ms so holding the key
-// doesn't tear down and recreate the <video> element repeatedly (webOS allows
-// only max-activated-media-players=1, and rapid churn leaves it in a bad state).
-// Demote (not fail) so an exhausted candidate pool cycles back to it instead of
-// returning 503.
-// Native seek within the current catch-up VOD chunk. Updates video.currentTime directly
-// — no re-fetch, no re-load. If the user seeks past the chunk end (beyond `duration`)
-// the upstream playlist runs out and the video naturally pauses; that case is rare on
-// a 60-min default chunk and we'll surface it as a "load more" affordance later.
 function seekCatchup(seconds) {
   if (!player.video) return;
   var v = player.video;
@@ -917,7 +799,6 @@ function seekCatchup(seconds) {
   if (v.duration && isFinite(v.duration) && target > v.duration) target = v.duration;
   v.currentTime = target;
   logEvent('seek', String(seconds), { ct: v.currentTime, dur: v.duration });
-  // Refresh the OSD time/scrubber if we have one (Phase 3d wires this up).
   if (state.playing && state.playing.mode === 'catchup') {
     var ch = state.playing.channel;
     setOverlay(ch.name, '', 'CATCH-UP · ' + Math.round(v.currentTime) + ' / ' + (isFinite(v.duration) ? Math.round(v.duration) : '?') + 's', true);
@@ -929,7 +810,7 @@ function switchSource() {
   if (!state.playing) return;
   setOverlay(state.playing.channel.name, '', 'switching source…', true);
   logEvent('switch', state.playing.channel.name);
-  if (switchTimer) clearTimeout(switchTimer);
+  clearTimeout(switchTimer);
   switchTimer = setTimeout(function () {
     switchTimer = null;
     if (!state.playing) return;
@@ -944,18 +825,17 @@ function switchSource() {
 function activate() {
   if (state.playing && !state.mini) return;
   if (state.panel === 'settings') {
-    var setting = SETTINGS[state.settingsIdx];
-    if (setting && setting.action) setting.action();
+    var act = SETTINGS_ACTIONS[state.settingsIdx];
+    if (act) act();
     return;
   }
   if (state.panel === 'player') {
-    // Highlighted mini player → maximize back to fullscreen.
     if (!state.playing) return;
     captureZapList();
     state.mini = false;
     state.panel = 'list';
-    attachVideoForMode();
     updateBodyClass();
+    attachVideoForMode();
     setOverlay(state.playing.channel.name, '', 'fullscreen');
     return;
   }
@@ -969,12 +849,10 @@ function activate() {
     var isNow = p.start && p.end && p.start.getTime() <= now && now < p.end.getTime();
     var isPast = p.end && p.end.getTime() <= now;
     if (isNow) {
-      // OK on the LIVE row → play the channel live, same as activating it from the list.
       play(ch);
       return;
     }
     if (isPast && ch.tv_archive && p.has_archive) {
-      // Phase 3 will swap in real catch-up playback. For now: stub that says we got here.
       playCatchup(ch, p);
       return;
     }
@@ -986,7 +864,6 @@ function activate() {
       setOverlay(ch.name, p.title || '', 'not available');
       return;
     }
-    // Future program.
     setOverlay(ch.name, p.title || '', 'not aired yet');
     return;
   }
@@ -996,16 +873,17 @@ function activate() {
   if (it.kind === 'recent') {
     state.search = it.text;
     state.focusIdx = 0;
-    render();
+    var inp = document.getElementById('search');
+    if (inp) inp.value = it.text;
+    renderList();
     return;
   }
-  // In mini mode, OK on the currently-playing channel goes back to fullscreen without
-  // restarting playback. OK on a different channel switches and goes fullscreen.
+  // In mini mode, OK on the currently-playing channel goes back to fullscreen.
   if (state.mini && state.playing && state.playing.channel.key === it.channel.key) {
     captureZapList();
     state.mini = false;
-    attachVideoForMode();
     updateBodyClass();
+    attachVideoForMode();
     setOverlay(it.channel.name, '', 'fullscreen');
     return;
   }
@@ -1014,40 +892,43 @@ function activate() {
 
 function back() {
   if (state.playing) {
-    // First back: shrink fullscreen → corner mini so the user can keep watching
-    // while browsing. Second back: stop entirely.
     if (!state.mini) {
       state.mini = true;
-      if (zapTimer) { clearTimeout(zapTimer); zapTimer = null; }
-      // Settings isn't reachable while mini — if that's where the right-col was
-      // parked, retire to the list so OK doesn't accidentally fire a setting.
+      clearTimeout(zapTimer); zapTimer = null;
       if (state.panel === 'settings') state.panel = 'list';
       updateBodyClass();
+      attachVideoForMode();
       hideOverlay();
-      render();
+      // Recents shifted when we entered fullscreen via play() — refresh the list so
+      // returning to mini shows the new ordering / played state.
+      renderList();
       return;
     }
-    // In mini, peel off the open search first so the user can exit search without
-    // killing the corner playback. Another back then stops playback.
     if (state.search != null) {
       state.search = null;
       state.focusIdx = 0;
-      render();
+      updateBodyClass();
+      renderList();
       return;
     }
     player.stop();
     state.playing = null;
     state.mini = false;
     state.zapList = null;
+    // 'player' / 'epg' are mini-only or playback-only contexts; once we've stopped,
+    // they no longer make sense as the active panel and would lock the user out of
+    // normal list navigation. Always land back on the list.
+    if (state.panel !== 'list' && state.panel !== 'settings') state.panel = 'list';
     updateBodyClass();
     hideOverlay();
-    render();
+    renderList();
     return;
   }
   if (state.search != null) {
     state.search = null;
     state.focusIdx = 0;
-    render();
+    updateBodyClass();
+    renderList();
   }
 }
 
@@ -1055,21 +936,25 @@ function toggleSearch() {
   if (state.playing && !state.mini) return;
   state.search = (state.search == null) ? '' : null;
   state.focusIdx = 0;
-  // Snap navigation back to the list — otherwise arrows/OK keep operating on the
-  // settings or EPG panel while the user is typing into the search box.
   if (state.search != null) {
     state.panel = 'list';
-    focusSearchOnNextRender = true;
   }
-  render();
+  updateBodyClass();
+  renderList();
+  var inp = document.getElementById('search');
+  if (inp) {
+    if (state.search != null) {
+      inp.value = '';
+      inp.removeAttribute('readonly');
+      inp.removeAttribute('tabindex');
+      inp.classList.remove('exiled');
+      inp.focus();
+    } else {
+      inp.value = '';
+    }
+  }
 }
 
-// Rewind from live into a fresh catch-up VOD chunk. Anchor is "now + offsetSec" (passed
-// as a small negative number, typically −30 s for ◁ and −60 s for Blue). 60-min default
-// chunk so subsequent seeks stay native within the playlist.
-//
-// Caveat: the provider's encoder lag (~2.7h on RTP 1) means very-recent anchors will
-// 404 in practice until the slot is archived. Phase 3e surfaces that as a toast.
 function enterCatchupAtNow(offsetSec) {
   if (!state.playing) return;
   var ch = state.playing.channel;
@@ -1091,11 +976,6 @@ function enterCatchupAtNow(offsetSec) {
   player.play(url);
 }
 
-// Blue key while playing: toggle between live and catch-up for the current channel.
-//   - catchup → swap src back to the live URL ("back to LIVE")
-//   - live    → rewind 60 s into the catch-up window (same semantics as ◁, with a
-//                slightly longer offset since Blue is the "deliberate jump" key)
-// Outside playback, Blue is a no-op; the EPG panel has its own OK-on-replay-row entry.
 function toggleCatchupMode() {
   if (!state.playing) return;
   var ch = state.playing.channel;
@@ -1110,9 +990,6 @@ function toggleCatchupMode() {
   enterCatchupAtNow(-60);
 }
 
-// Red key: drop the focused channel from the recents list. After removal it falls back
-// to its default-order position. Focus stays at the same index so repeated red presses
-// peel recents off one by one from the top.
 function unrecent() {
   if ((state.playing && !state.mini) || state.panel === 'settings') return;
   var items = visibleItems();
@@ -1120,25 +997,18 @@ function unrecent() {
   if (!it || it.kind !== 'channel' || !it.played) return;
   if (!removeRecentChannel(it.channel.key)) return;
   setOverlay(it.channel.name, '', 'removed from recents');
-  render();
+  renderList();
 }
 
-// Fullscreen key-hint legend. The channel-list view shows a static legend in the header,
-// but during fullscreen playback the app shell is hidden — users can't see it. Solution:
-// flash a context-aware legend (live vs catch-up; tv_archive vs not) on any key press
-// and auto-hide 3 s after the last key.
+// Fullscreen key-hint legend. Auto-hides 3 s after the last key.
 var legendTimer = null;
 function showLegend() {
   if (!state.playing || state.mini) return;
   var el = document.getElementById('legend');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'legend';
-    document.body.appendChild(el);
-  }
+  if (!el) return;
   el.innerHTML = legendContent();
   el.classList.add('visible');
-  if (legendTimer) clearTimeout(legendTimer);
+  clearTimeout(legendTimer);
   legendTimer = setTimeout(function () { el.classList.remove('visible'); }, 3000);
 }
 
@@ -1171,23 +1041,19 @@ function legendContent() {
 var overlayTimer = null;
 function setOverlay(title, subtitle, status, persist) {
   var ov = document.getElementById('overlay');
-  if (!ov) {
-    ov = document.createElement('div');
-    ov.id = 'overlay';
-    document.body.appendChild(ov);
-  }
+  if (!ov) return;
   ov.innerHTML =
     '<div class="ov-title">' + esc(title) + '</div>' +
     (subtitle ? '<div class="ov-sub">' + esc(subtitle) + '</div>' : '') +
     (status ? '<div class="ov-status">' + esc(status) + '</div>' : '');
   ov.style.opacity = '1';
-  if (overlayTimer) clearTimeout(overlayTimer);
+  clearTimeout(overlayTimer);
   if (!persist) overlayTimer = setTimeout(function () { ov.style.opacity = '0'; }, 2500);
 }
 function hideOverlay() {
   var ov = document.getElementById('overlay');
   if (ov) ov.style.opacity = '0';
-  if (overlayTimer) clearTimeout(overlayTimer);
+  clearTimeout(overlayTimer);
 }
 
 player.onPlaying = function (url) {
@@ -1196,17 +1062,14 @@ player.onPlaying = function (url) {
     setOverlay(state.playing.channel.name, '', 'live');
     logEvent('canplay', state.playing.channel.name, { url: url });
   }
-  // The player just appended a fresh <video> to document.body. If we're in mini mode
-  // we must re-parent it into #top-slot in the same synchronous tick — otherwise the
-  // body.mini #player CSS (position:absolute; inset:0) paints it fullscreen for a frame.
+  // The player just appended a fresh <video> to document.body. If we're in mini we
+  // must re-parent it to track #top-slot in the same synchronous tick — otherwise the
+  // default fullscreen CSS paints it edge-to-edge for a frame.
   attachVideoForMode();
 };
 player.onSourceFailed = function (url, reason) {
   if (!state.playing) return;
   if (state.playing.mode === 'catchup') {
-    // Catch-up has one upstream per channel (the tv_archive=1 source). The proxy bypasses
-    // the live blacklist for catch-up requests, so a failure here means the catch-up
-    // source itself is genuinely down — nothing to fail over to. Surface and stop.
     var ch = state.playing.channel;
     logEvent('catchup-fail', ch.name, { url: url, reason: reason });
     setOverlay(ch.name, '', 'catch-up unavailable — try again later');
@@ -1214,13 +1077,12 @@ player.onSourceFailed = function (url, reason) {
     state.playing = null;
     state.mini = false;
     state.zapList = null;
+    if (state.panel !== 'list' && state.panel !== 'settings') state.panel = 'list';
     updateBodyClass();
-    render();
+    renderList();
     return;
   }
   logEvent('fail', state.playing.channel.name, { url: url, reason: reason });
-  // Await the POST before refreshing — otherwise the refresh can race the
-  // blacklist update and the server may serve the same broken URL again.
   setOverlay(state.playing.channel.name, '', 'retrying…', true);
   reportFailure(state.playing.channel.key, reason).then(function () {
     player.refresh();
@@ -1246,43 +1108,113 @@ setRemoteHandlers({
   any: function () { userInteracted = true; showLegend(); showCatchupBadge(); }
 });
 
+// Wire the search input once. The element is always in the DOM (hidden via
+// body:not(.searching)) — only the value and visibility change.
+(function () {
+  var inp = document.getElementById('search');
+  if (!inp) return;
+  inp.addEventListener('input', function () {
+    state.search = inp.value;
+    state.focusIdx = 0;
+    renderList();
+  });
+})();
+
+// Touch / pointer support. The TV remote dispatches keydown events; this dispatches
+// click events, so they don't collide. Mobile users tap; webOS Magic Remote pointer
+// users get the same affordances on TV. Every path goes through the same activate()
+// pipeline the keyboard uses.
+document.addEventListener('click', function (e) {
+  // Fullscreen playback: nothing in the shell is interactive; tap on the video
+  // shrinks to mini (mobile equivalent of the remote's Back).
+  if (state.playing && !state.mini) {
+    if (e.target.id === 'player') back();
+    return;
+  }
+  // Channel tap: focus that row and play.
+  var li = e.target.closest('#list .list-item');
+  if (li) {
+    var i = parseInt(li.getAttribute('data-i'), 10);
+    if (!isFinite(i)) return;
+    if (state.panel !== 'list') setPanel('list');
+    var listEl = document.getElementById('list');
+    var prev = listEl.children[state.focusIdx];
+    if (prev) { prev.classList.remove('focused'); prev.classList.remove('focused-dim'); }
+    li.classList.add('focused');
+    state.focusIdx = i;
+    activate();
+    return;
+  }
+  // Settings tap.
+  var si = e.target.closest('.settings-grid .settings-item');
+  if (si) {
+    var idx = parseInt(si.getAttribute('data-i'), 10);
+    if (!isFinite(idx)) return;
+    if (state.panel !== 'settings') setPanel('settings');
+    setSettingsIdx(idx);
+    activate();
+    return;
+  }
+  // EPG row tap.
+  var epgEl = e.target.closest('.epg-row');
+  if (epgEl) {
+    var ei = parseInt(epgEl.getAttribute('data-i'), 10);
+    if (!isFinite(ei)) return;
+    if (state.panel !== 'epg') setPanel('epg');
+    var panel = document.getElementById('bottom-slot');
+    var prevRow = panel.querySelector('.epg-row.focused');
+    if (prevRow) prevRow.classList.remove('focused');
+    epgEl.classList.add('focused');
+    state.epg.rowIdx = ei;
+    activate();
+    return;
+  }
+  // Mini: tap the player slot (or the <video> reparented over it) → maximize.
+  if (state.mini && state.playing && (e.target.id === 'player' || e.target.closest('#top-slot'))) {
+    state.panel = 'player';
+    updateBodyClass();
+    activate();
+  }
+});
+
 // === BOOT ===
 
-// Step 1: instant paint from the cached /api/channels response (no spinner).
+// Step 1: instant paint from the cached /api/channels response.
 var cachedChannels = loadChannelsCache();
 if (cachedChannels && cachedChannels.length) {
   state.channels = cachedChannels;
   mark('cachedRender');
 }
-render();
+updateBodyClass();
+renderList();
 tryAutoResume();
 
 // Step 2: fetch the fresh catalog, save it, re-render.
 catalogLoading = true;
 mark('channelsFetchStart');
+setHint(hintText(visibleItems().length));
 listChannels().then(function (channels) {
   mark('channelsFetchEnd');
   catalogLoading = false;
   state.channels = channels;
   saveChannelsCache(channels);
   state.zapList = null;
-  render();
+  renderList();
   tryAutoResume();
 }).catch(function (err) {
   catalogLoading = false;
   if (!state.channels.length) {
-    state.error = 'proxy fetch failed: ' + (err && err.message || err);
-    render();
+    setError('proxy fetch failed: ' + (err && err.message || err));
   }
 });
 
-// Step 3: poll /api/status for the header host count. Same cadence as the old probe
-// loop's settle time — fast first poll, then steady.
+// Step 3: poll /api/status for the header host count. Just updates the .hint text —
+// no list rebuild.
 function pollStatus() {
   return getStatus().then(function (s) {
     serverStatus = s;
     window.__app.status = s;
-    render();
+    setHint(hintText(visibleItems().length));
   }).catch(function () { /* ignore — keep stale value */ });
 }
 pollStatus();

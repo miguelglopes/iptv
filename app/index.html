@@ -2,12 +2,50 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=1920">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Xtream</title>
   <link rel="stylesheet" href="css/app.css">
 </head>
-<body>
-  <main id="app"></main>
+<body class="panel-list">
+  <main id="app">
+    <section class="left-col">
+      <header>
+        <div class="header-top">
+          <h1>Channels</h1>
+          <div class="hint"></div>
+        </div>
+        <div class="keymap-inline">
+          <span><span class="k k-y">●</span> Y Search</span>
+          <span><span class="k k-r">●</span> R Unpin</span>
+          <span>OK Play</span>
+          <span>◁▷ Panel</span>
+          <span>△▽ Channel</span>
+        </div>
+      </header>
+      <input id="search" class="search" placeholder="search…" autocomplete="off">
+      <section id="list" class="list"></section>
+    </section>
+    <aside class="right-col">
+      <div id="top-slot" class="top-slot">
+        <div class="settings-title">Settings</div>
+        <div class="settings-grid">
+          <div class="settings-item" data-i="0">Reset blocked sources</div>
+          <div class="settings-item" data-i="1">Reset source preferences</div>
+          <div class="settings-item" data-i="2">Reset all source state</div>
+          <div class="settings-item" data-i="3">Reprobe hosts</div>
+          <div class="settings-item" data-i="4">Clear search history</div>
+          <div class="settings-item" data-i="5">Clear recent channels</div>
+          <div class="settings-item" data-i="6">Clear cached channels</div>
+          <div class="settings-item" data-i="7">Clear all (reload)</div>
+        </div>
+      </div>
+      <div id="bottom-slot" class="bottom-slot"></div>
+    </aside>
+  </main>
+  <div id="error"><header><h1>Error</h1></header><pre class="error-msg"></pre></div>
+  <div id="overlay"></div>
+  <div id="legend"></div>
+  <div id="catchup-badge"></div>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

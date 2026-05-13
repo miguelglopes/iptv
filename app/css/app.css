@@ -6,7 +6,11 @@ html, body {
   color: #e8e8f0;
   font-family: -apple-system, "Helvetica Neue", "Segoe UI", sans-serif;
   font-size: 22px;
-  overflow: hidden;
+  /* overflow:clip (not :hidden) so the document doesn't act as a scroll container.
+     With :hidden, scrollIntoView calls from inner panels bubble up and silently
+     scroll body.scrollTop even though no scrollbar is visible — content gets
+     pushed off the viewport. :clip prevents that entirely. */
+  overflow: clip;
 }
 /* Hide the cursor on the TV — Magic Remote reports `pointer: fine` so we can't use a
    media query; main.js sets the `tv` class on <html> based on the webOS UA. Laptops
@@ -32,9 +36,18 @@ body {
 
 /* While playing fullscreen, between sources the player briefly tears the <video> down
    (1s gap on switchSource), exposing the list behind. Pin body to black and hide the
-   app shell so the gap is a clean black instead of a flash of the list. */
+   app shell so the gap is a clean black instead of a flash of the list.
+   display:none (not visibility:hidden) skips layout for the hidden subtree entirely. */
 body.playing { background: #000; }
-body.playing #app { visibility: hidden; }
+body.playing #app { display: none; }
+
+/* Search input is always in the DOM (static shell). Reveal it only when active. */
+body:not(.searching) #search { display: none; }
+
+/* Error view replaces the app shell when proxy fetch fails and no cached catalog. */
+body:not(.error) #error { display: none; }
+body.error #app { display: none; }
+#error { padding: 32px 48px; }
 
 /* Mini mode: video lives inside .top-slot. Override the fullscreen defaults so it fills
    its container rather than the viewport. */
@@ -244,25 +257,6 @@ body.mini.panel-player .top-slot {
   padding-top: 12px;
 }
 
-.settings-foot {
-  margin-top: auto;
-  font-size: 14px;
-  color: #6a6a8a;
-  font-family: ui-monospace, monospace;
-}
-
-.keymap {
-  font-size: 15px;
-  color: #aaaabb;
-  font-family: ui-monospace, monospace;
-  line-height: 1.7;
-}
-.keymap .k {
-  display: inline-block;
-  width: 14px;
-  font-size: 12px;
-  text-align: center;
-}
 .k-y { color: #ffcc66; }
 .k-b { color: #66b3ff; }
 .k-r { color: #ff6666; }
@@ -371,7 +365,10 @@ body.mini.panel-player .top-slot {
   display: inline-block;
   vertical-align: middle;
   flex-shrink: 0;
+  width: 14px;
+  height: 14px;
 }
+.epg-replay-badge .replay-icon { width: 18px; height: 18px; }
 
 .epg-row.past-replay {
   background: rgba(102, 179, 255, 0.10);
@@ -539,7 +536,6 @@ body.playing #legend { display: block; }
 .list-item {
   padding: 14px 22px;
   background: rgba(20, 20, 31, 0.72);
-  backdrop-filter: blur(6px);
   border: 2px solid transparent;
   border-radius: 4px;
   font-size: 22px;
@@ -555,17 +551,6 @@ body.playing #legend { display: block; }
 
 .list-item.played {
   background: rgba(48, 40, 22, 0.78);
-}
-
-.badge {
-  font-size: 14px;
-  font-weight: 600;
-  background: rgba(255, 204, 102, 0.18);
-  color: #ffcc66;
-  padding: 2px 10px;
-  border-radius: 10px;
-  margin-left: 12px;
-  font-family: ui-monospace, monospace;
 }
 
 .search {
@@ -598,7 +583,7 @@ body.playing #legend { display: block; }
   background: rgba(30, 26, 42, 0.85);
 }
 
-.error {
+.error-msg {
   font-family: ui-monospace, monospace;
   color: #ff8888;
   background: #1f1414;
@@ -647,4 +632,68 @@ body.playing #legend { display: block; }
 
 #player {
   background: #000;
+}
+
+/* === Mobile-friendly layout ===
+   Triggers at narrow viewports (phones in portrait/landscape, small windows).
+   The TV is fixed at 1920×1080 so this never matches there — TV layout untouched.
+   On mobile the side-by-side columns become a vertical stack, fonts/padding shrink,
+   the TV-remote key legend hides, and a tap delegate (in main.js) drives the same
+   activate() pipeline keys do. */
+@media (max-width: 900px) {
+  /* Mobile: let the document scroll naturally. The TV's overflow:clip makes the
+     body non-scrollable (it's never bigger than the viewport), but the mobile
+     stack is taller than any phone — natural page scroll is the expected UX. */
+  html, body { font-size: 16px; overflow: auto; height: auto; min-height: 100%; }
+
+  #app {
+    flex-direction: column;
+    padding: 12px;
+    gap: 12px;
+    height: auto;
+    min-height: 100%;
+  }
+
+  .left-col, .right-col {
+    flex: none;
+    width: 100%;
+    min-height: 0;
+  }
+
+  header { padding: 10px 14px; gap: 6px; }
+  .header-top { gap: 12px; }
+  h1 { font-size: 22px; }
+  .hint { font-size: 13px; }
+
+  /* TV-remote legend has no meaning on a touch screen. */
+  .keymap-inline { display: none; }
+
+  .list { max-height: 50vh; gap: 4px; padding: 4px 2px; }
+  .list-item { padding: 12px 14px; font-size: 16px; }
+  /* Drop the scale on focus so tap feedback doesn't push neighbours around. */
+  .list-item.focused { transform: none; }
+
+  .search { font-size: 18px; padding: 12px 14px; }
+
+  .top-slot, .bottom-slot { padding: 12px; }
+  .bottom-slot { max-height: 55vh; }
+
+  .settings-title { font-size: 18px; margin-bottom: 4px; }
+  .settings-item { padding: 12px; font-size: 14px; }
+
+  .epg-channel { font-size: 18px; }
+  .epg-prog { font-size: 14px; }
+  .epg-time { font-size: 13px; }
+  .epg-row { padding: 10px 12px; }
+
+  /* Mini player: hold a 16/9 banner at the top of the right-column stack. */
+  body.mini .top-slot { aspect-ratio: 16/9; min-height: 0; }
+
+  #overlay, #legend {
+    left: 16px; right: 16px; bottom: 16px;
+    max-width: calc(100% - 32px);
+  }
+  #overlay .ov-title { font-size: 22px; }
+  #overlay .ov-sub { font-size: 14px; }
+  #catchup-badge { top: 16px; left: 16px; right: 16px; }
 }

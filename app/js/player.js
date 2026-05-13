@@ -32,17 +32,15 @@ Player.prototype._makeVideo = function () {
     self._clearWatchdog();
     if (self.onSourceFailed) self.onSourceFailed(self.url, reason);
   });
-  v.addEventListener('playing', function () {
-    self._clearWatchdog();
-    if (self.onPlaying) self.onPlaying(self.url);
-  });
+  // canplay is the single "we're ready to play" signal: fires once the demuxer has
+  // buffered enough to start. (Previously both `playing` and `canplay` were wired,
+  // which double-fired onPlaying — extra setOverlay/log calls per play.)
   v.addEventListener('canplay', function () {
     self._clearWatchdog();
     if (self.onPlaying) self.onPlaying(self.url);
   });
-  // loadeddata = readyState reached 2 = demuxer accepted at least one frame.
-  // Once we're past that the stream is decodable; any later stall is normal
-  // re-buffering territory, not the codec-mismatch case the watchdog catches.
+  // loadeddata = readyState reached 2 = demuxer accepted at least one frame. Earlier
+  // than canplay; clears the watchdog as soon as we know the stream is decodable.
   v.addEventListener('loadeddata', function () {
     self._clearWatchdog();
   });

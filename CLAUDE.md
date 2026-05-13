@@ -66,7 +66,7 @@ make serve          # → http://localhost:8000 ; runs scripts/dev-serve
 1. **`Cache-Control: no-store`** on every response.
 2. **Rewrites every `import './foo.js'` to `import './foo.js?v=<startup-stamp>'`** before serving the JS. ES modules are cached *by URL* in Chromium across navigations and even across Playwright sessions — without this rewrite, edited modules silently keep using the old version. The stamp is fixed per process, so all modules in one page load resolve to a consistent graph; restart the server to bust.
 
-Once it's up, drive Chromium via the Playwright MCP (`mcp__playwright__browser_*`). Real Xtream API works from `localhost` (provider allows CORS), so all 412 channels actually load — the only thing that *doesn't* work is HLS playback (Chromium has no native HLS).
+Once it's up, drive Chromium via the Playwright MCP (`mcp__playwright__browser_*`). Real Xtream API works from `localhost` (provider allows CORS), so all 412 channels actually load. Fedora's Chromium **does** decode `application/vnd.apple.mpegurl` natively (ffmpeg-backed), so real playback works on the laptop — `__app.player.play(ch.play_url)` paints pixels, and mini ↔ fullscreen layouts are testable end-to-end without poking state.
 
 ### Laptop keys
 
@@ -84,21 +84,17 @@ Once it's up, drive Chromium via the Playwright MCP (`mcp__playwright__browser_*
 
 These laptop aliases live in `remote.js` alongside the real LG keycodes. The letter aliases are suppressed while an `<input>` is focused so they don't hijack search typing.
 
-### Testing the mini ↔ fullscreen flow without real playback
+### Testing the mini ↔ fullscreen flow
 
-HLS won't decode in Chromium, so the player can't show pixels. Test the *state machine + layout* by injecting a placeholder `<video>` and toggling body classes:
+Just play a channel for real — Chromium decodes HLS natively here, so no fake video / state poking is needed:
 
 ```js
-// Stop the source-fail churn, plant a bright-coloured fake video, simulate fullscreen.
-window.__app.player.stop();
-const v = document.createElement('video');
-v.id = 'player';
-v.style.background = '#06f';
-document.body.appendChild(v);
-window.__app.state.playing = { channel: { name: 'X', key: 'x' }, sources: ['fake'] };
-window.__app.state.mini = false;
+// Drive the actual pipeline: app's player.play() builds the <video>, sets src, lets
+// state.playing follow naturally. Then dispatch Backspace to shrink to mini, etc.
+const ch = window.__app.state.channels[0];
+window.__app.state.playing = { channel: ch, mode: 'live' };
 document.body.classList.add('playing');
-// Then dispatch keyCode 461 to flip into mini, etc.
+window.__app.player.play(ch.play_url);
 ```
 
 For event dispatching from `browser_evaluate`, always send `keydown` *and* `keyup` — keydown alone leaves the hold-to-repeat timer running and the focus index will overshoot.
@@ -111,9 +107,9 @@ For event dispatching from `browser_evaluate`, always send `keydown` *and* `keyu
 | Recents pinning + Red unpin | ✓ | ✓ |
 | EPG fetch (`get_short_epg`, `get_simple_data_table`) | ✓ | ✓ |
 | Panel navigation (list / settings / EPG) | ✓ | ✓ |
-| Mini ↔ fullscreen layout transitions | ✓ (via state poke) | ✓ |
-| Source-switch flicker, video sizing | ✓ (layout only) | ✓ (pixels) |
-| HLS / TS playback | ✗ (no decoder) | ✓ |
+| Mini ↔ fullscreen layout transitions | ✓ | ✓ |
+| Source-switch flicker, video sizing | ✓ | ✓ |
+| HLS / TS playback | ✓ (Fedora Chromium has native HLS) | ✓ |
 | `max-activated-media-players=1` quirks | ✗ | ✓ |
 
 So: do UI/state work locally, deploy to the TV only when actually verifying playback or webOS-specific behaviour.

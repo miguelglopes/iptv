@@ -4,11 +4,31 @@
 import { PROXY_BASE_URL } from './config.js';
 
 var BASE = String(PROXY_BASE_URL || '').replace(/\/$/, '');
+var TIMEOUT_MS = 8000;
+
+// Every fetch gets an AbortController with a hard timeout. The proxy is on-LAN so
+// the timeout is generous, but a single hung TCP can otherwise stall boot indefinitely
+// (e.g. flaky Wi-Fi between TV and laptop).
+function http(path, opts) {
+  var ctrl = new AbortController();
+  var t = setTimeout(function () { ctrl.abort(); }, TIMEOUT_MS);
+  opts = opts || {};
+  opts.signal = ctrl.signal;
+  return fetch(BASE + path, opts).finally(function () { clearTimeout(t); });
+}
 
 function json(path) {
-  return fetch(BASE + path).then(function (r) {
+  return http(path).then(function (r) {
     if (!r.ok) throw new Error('HTTP ' + r.status + ' on ' + path);
     return r.json();
+  });
+}
+
+function post(path, body) {
+  return http(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
 }
 
@@ -26,7 +46,6 @@ function intOr(v, fallback) {
 }
 
 export function listChannels() {
-  // [{ key, name, logo?, default_rank?, source_count, play_url, tv_archive?, tv_archive_duration? }, ...]
   return json('/api/channels').then(function (rows) {
     return rows.map(function (c) {
       c.tv_archive = truthy(c.tv_archive);
@@ -37,7 +56,6 @@ export function listChannels() {
 }
 
 export function epgFor(key) {
-  // [{ title, description, start (ISO), end (ISO), has_archive? }, ...] — server walks all sources.
   return json('/api/epg/' + encodeURIComponent(key)).then(function (rows) {
     return rows.map(function (p) {
       return {
@@ -57,19 +75,11 @@ export function epgFor(key) {
 //   fail   → hard blacklist (URL won't be served again until TTL expires)
 //   demote → soft demote (URL goes to the back; cycled back once fresh ones are exhausted)
 export function reportFailure(key, error) {
-  return fetch(BASE + '/api/feedback/' + encodeURIComponent(key), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind: 'fail', error: error || null })
-  }).catch(function () {});
+  return post('/api/feedback/' + encodeURIComponent(key), { kind: 'fail', error: error || null }).catch(function () {});
 }
 
 export function demoteSource(key, error) {
-  return fetch(BASE + '/api/feedback/' + encodeURIComponent(key), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind: 'demote', error: error || null })
-  }).catch(function () {});
+  return post('/api/feedback/' + encodeURIComponent(key), { kind: 'demote', error: error || null }).catch(function () {});
 }
 
 export function getStatus() {
@@ -77,17 +87,17 @@ export function getStatus() {
 }
 
 export function adminReprobe() {
-  return fetch(BASE + '/admin/reprobe', { method: 'POST' });
+  return http('/admin/reprobe', { method: 'POST' });
 }
 
 export function adminClearBlacklist() {
-  return fetch(BASE + '/admin/clear-blacklist', { method: 'POST' });
+  return http('/admin/clear-blacklist', { method: 'POST' });
 }
 
 export function adminClearDemoted() {
-  return fetch(BASE + '/admin/clear-demoted', { method: 'POST' });
+  return http('/admin/clear-demoted', { method: 'POST' });
 }
 
 export function adminClearAllSources() {
-  return fetch(BASE + '/admin/clear-all', { method: 'POST' });
+  return http('/admin/clear-all', { method: 'POST' });
 }

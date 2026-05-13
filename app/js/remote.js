@@ -1,5 +1,5 @@
 // LG webOS / Magic Remote key bindings.
-// Use: initRemote(); setRemoteHandlers({ ok: () => {}, channelUp: () => {}, digit: (n) => {} });
+// Use: initRemote(); setRemoteHandlers({ ok: () => {}, channelUp: () => {}, ... });
 //
 // Arrow / channel keys auto-repeat with acceleration on hold (slow → fast, capped).
 
@@ -10,17 +10,15 @@ var NAMES = {
   403: 'red', 404: 'green', 405: 'yellow', 406: 'blue',
   // Laptop dev aliases for the colour buttons — F1=red, F2=green, F3=yellow, F4=blue.
   112: 'red', 113: 'green', 114: 'yellow', 115: 'blue',
-  415: 'play', 19: 'pause', 413: 'stop', 417: 'ff', 412: 'rewind',
   427: 'channelUp', 428: 'channelDown',
   // PageUp/PageDown as channelUp/Down on laptop.
   33: 'channelUp', 34: 'channelDown',
   // Home / End → jump to top / bottom of list.
-  36: 'home', 35: 'end',
-  449: 'mute', 447: 'volUp', 448: 'volDown'
+  36: 'home', 35: 'end'
 };
 
-// Letter aliases for the colour buttons (laptop only). Suppressed while
-// typing into an input so they don't hijack search.
+// Letter aliases for the colour buttons (laptop only). Suppressed while typing into
+// an input so they don't hijack search.
 var LETTER_NAMES = { 82: 'red', 71: 'green', 89: 'yellow', 66: 'blue' };
 
 var REPEATABLE = {
@@ -96,19 +94,7 @@ function onKeyDown(e) {
     e.preventDefault();
     call(name);
     if (REPEATABLE[name]) startHold(name);
-    return;
   }
-  if (e.keyCode >= 48 && e.keyCode <= 57) {
-    // Digit. If the user is typing into a search box, let the input have it.
-    if (isInputFocused()) return;
-    e.preventDefault();
-    var digit = e.keyCode - 48;
-    if (handlers.digit) handlers.digit(digit, e);
-    if (handlers.any) handlers.any('digit' + digit, e);
-    return;
-  }
-  if (isInputFocused()) return;
-  if (handlers.unknown) handlers.unknown(e.keyCode, e);
 }
 
 function onKeyUp(e) {
@@ -118,11 +104,6 @@ function onKeyUp(e) {
 
 export function setRemoteHandlers(map) {
   for (var k in map) handlers[k] = map[k];
-}
-
-export function clearRemoteHandlers() {
-  handlers = {};
-  stopHold();
 }
 
 export function initRemote() {

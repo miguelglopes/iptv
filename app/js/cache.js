@@ -38,11 +38,20 @@ var RECENT_MAX = 100;
 // day says "resume", a recent from last month does not.
 var LAST_PLAY_TS_KEY = 'xtream.recent.last_play_ts.v1';
 
+// In-memory cache of the parsed recents list. visibleItems / sortByRecency call
+// loadRecentChannels several times per render — without this, every call re-parsed
+// the JSON. Invalidated whenever we write through (push / remove / clear).
+var recentCache = null;
+
 export function loadRecentChannels() {
+  if (recentCache) return recentCache;
   try {
     var v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
-    return Array.isArray(v) ? v : [];
-  } catch (e) { return []; }
+    recentCache = Array.isArray(v) ? v : [];
+  } catch (e) {
+    recentCache = [];
+  }
+  return recentCache;
 }
 
 export function pushRecentChannel(channelKey) {
@@ -50,6 +59,7 @@ export function pushRecentChannel(channelKey) {
   var r = loadRecentChannels().filter(function (k) { return k !== channelKey; });
   r.unshift(channelKey);
   if (r.length > RECENT_MAX) r.length = RECENT_MAX;
+  recentCache = r;
   try { localStorage.setItem(RECENT_KEY, JSON.stringify(r)); } catch (e) {}
   try { localStorage.setItem(LAST_PLAY_TS_KEY, String(Date.now())); } catch (e) {}
 }
@@ -59,11 +69,13 @@ export function removeRecentChannel(channelKey) {
   var cur = loadRecentChannels();
   var r = cur.filter(function (k) { return k !== channelKey; });
   if (r.length === cur.length) return false;
+  recentCache = r;
   try { localStorage.setItem(RECENT_KEY, JSON.stringify(r)); } catch (e) {}
   return true;
 }
 
 export function clearRecentChannels() {
+  recentCache = [];
   try { localStorage.removeItem(RECENT_KEY); } catch (e) {}
   try { localStorage.removeItem(LAST_PLAY_TS_KEY); } catch (e) {}
 }
