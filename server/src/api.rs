@@ -267,5 +267,11 @@ pub async fn admin_clear_demoted(State(state): State<Arc<AppState>>) -> StatusCo
 
 pub async fn admin_clear_all(State(state): State<Arc<AppState>>) -> StatusCode {
     state.blacklist.clear_all();
+    state.classifier.clear();
+    StatusCode::NO_CONTENT
+}
+
+pub async fn admin_clear_classifier(State(state): State<Arc<AppState>>) -> StatusCode {
+    state.classifier.clear();
     StatusCode::NO_CONTENT
 }

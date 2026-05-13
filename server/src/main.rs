@@ -88,6 +88,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/admin/reprobe", post(api::admin_reprobe))
         .route("/admin/clear-blacklist", post(api::admin_clear_blacklist))
         .route("/admin/clear-demoted", post(api::admin_clear_demoted))
+        .route("/admin/clear-classifier", post(api::admin_clear_classifier))
         .route("/admin/clear-all", post(api::admin_clear_all))
         .route("/play/:name", get(proxy::play_playlist))
         .route("/seg/:token", get(proxy::proxy_segment))
