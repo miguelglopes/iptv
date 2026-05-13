@@ -42,10 +42,10 @@ The server owns everything stateful and operational. Clients (browser or TV) jus
 | Channel list with EPG | Search filter |
 | :---: | :---: |
 | ![Channel list](docs/screenshots/channels.png) | ![Search](docs/screenshots/search.png) |
+| **Mini overlay while browsing** | **Fullscreen playback** |
+| ![Mini overlay](docs/screenshots/mini-overlay.png) | ![Fullscreen](docs/screenshots/fullscreen.png) |
 
-The UI is designed for a 1080p TV but renders fine in any browser window.
-
-![EPG panel focused](docs/screenshots/epg.png)
+The UI is designed for a 1080p TV but renders fine in any browser window. (Playback shots are showing a sample MP4 so the screenshots have actual pixels — Chromium has no native HLS decoder.)
 
 ## Quickstart — server (and browser UI)
 
