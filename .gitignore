@@ -9,3 +9,5 @@ server/config.toml
 server/target/
 .claude/
 .playwright-mcp/
+CLAUDE.md
+AGENTS.md
