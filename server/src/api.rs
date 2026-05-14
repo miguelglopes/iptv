@@ -201,7 +201,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusDto> {
         .collect();
     let hevc = classifier_entries
         .iter()
-        .filter(|e| e.classification.unplayable_on_webos_b4())
+        .filter(|e| matches!(e.classification.video_codec, Some(crate::codec::VideoCodec::Hevc)))
         .count();
     let with_subs = classifier_entries
         .iter()

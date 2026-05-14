@@ -213,14 +213,6 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
     let mut demoted: Vec<Candidate> = Vec::new();
 
     for src in &channel.sources {
-        // Skip sources known to be undecodable on this client (webOS B4: HEVC).
-        // Stream-id-level classification: one bad PMT classification skips the
-        // source across all hosts.
-        if let Some(c) = state.classifier.get(src.stream_id) {
-            if c.unplayable_on_webos_b4() {
-                continue;
-            }
-        }
         for host in &alive {
             if state.blacklist.is_host_bad(host) {
                 continue;
@@ -898,9 +890,15 @@ fn pick_archive_host(
     _source: &CanonicalSource,
 ) -> Option<String> {
     let alive = state.hosts.alive_hosts_ranked();
+    // Mirror build_candidates: if every alive host is blacklisted, probe one
+    // anyway. The blacklist is a hint — failing without trying anything is
+    // worse than retrying a possibly-stale entry. The downstream fetch will
+    // return 502 within its budget if the host really is dead.
     alive
-        .into_iter()
+        .iter()
         .find(|h| !state.blacklist.is_host_bad(h))
+        .cloned()
+        .or_else(|| alive.into_iter().next())
 }
 
 #[cfg(test)]

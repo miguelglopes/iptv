@@ -21,11 +21,6 @@ pub struct Classification {
 }
 
 impl Classification {
-    /// LG webOS 9.x B4 chipset can't decode HEVC (h.265). Skip these sources entirely.
-    pub fn unplayable_on_webos_b4(&self) -> bool {
-        matches!(self.video_codec, Some(VideoCodec::Hevc))
-    }
-
     /// DVB subtitle PIDs stall the webOS demuxer. Strip them in-flight, but only
     /// if the PCR PID isn't one of them (in which case stripping would break
     /// timing — leave the stream alone and let it be demoted instead).
@@ -226,8 +221,10 @@ fn has_subtitling_descriptor(descriptors: &[u8]) -> bool {
         if i + 2 + len > descriptors.len() {
             return false;
         }
-        // subtitling_descriptor = 0x59, teletext_descriptor = 0x56
-        if tag == 0x59 || tag == 0x56 {
+        // subtitling_descriptor = 0x59. Teletext (0x56) was previously stripped too,
+        // but live testing showed webOS B4 plays teletext-bearing streams cleanly,
+        // so it stays in the mux.
+        if tag == 0x59 {
             return true;
         }
         i += 2 + len;
@@ -579,7 +576,6 @@ mod tests {
         assert_eq!(c.pmt_pid, Some(0x0020));
         assert_eq!(c.pcr_pid, Some(0x0021));
         assert_eq!(c.subtitle_pids, vec![0x0023]);
-        assert!(!c.unplayable_on_webos_b4());
         assert_eq!(c.strippable_subtitle_pids(), vec![0x0023]);
     }
 
@@ -591,8 +587,27 @@ mod tests {
         bytes.extend(pmt);
         let c = classify_ts_chunk(&bytes).expect("classify");
         assert_eq!(c.video_codec, Some(VideoCodec::Hevc));
-        assert!(c.unplayable_on_webos_b4());
         assert!(c.subtitle_pids.is_empty());
+    }
+
+    #[test]
+    fn classify_teletext_is_not_flagged() {
+        let pat = build_pat(0x0020);
+        let teletext_desc = vec![0x56, 0x05, b'p', b'o', b'r', 0x09, 0x00];
+        let pmt = build_pmt(
+            0x0020,
+            0x0021,
+            &[
+                (0x1B, 0x0021, vec![]),
+                (0x0F, 0x0022, vec![]),
+                (0x06, 0x0023, teletext_desc),
+            ],
+        );
+        let mut bytes = pat;
+        bytes.extend(pmt);
+        let c = classify_ts_chunk(&bytes).expect("classify");
+        assert_eq!(c.video_codec, Some(VideoCodec::H264));
+        assert!(c.subtitle_pids.is_empty(), "teletext PIDs must not be flagged for stripping");
     }
 
     #[test]
@@ -731,7 +746,7 @@ mod tests {
                 subtitle_pids: vec![],
             },
         );
-        assert!(c.get(42).unwrap().unplayable_on_webos_b4());
+        assert_eq!(c.get(42).unwrap().video_codec, Some(VideoCodec::Hevc));
         assert_eq!(c.snapshot().len(), 1);
         c.clear();
         assert!(c.get(42).is_none());
