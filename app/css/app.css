@@ -501,10 +501,10 @@ body.mini #catchup-badge { display: none; }  /* mini player has no room — over
 body.playing #legend { display: block; }
 #legend.visible { opacity: 1; }
 
-/* Channel zap preview. Appears only during fullscreen playback while the user is
-   holding (or tapping) △▽. Shows a 5-row strip with the preview target highlighted,
-   so users can see what they're about to switch to without the video tearing down
-   on every keystroke. Fades 200ms after the commit (release or idle). */
+/* Channel zap preview — right-side strip. Appears only during fullscreen playback while
+   the user is holding (or tapping) △▽. Shows a list of neighbouring channels with the
+   focused one highlighted in gold. Programme info for the focus lives in the separate
+   bottom banner (#zap-banner). Fades 200ms after the commit (release or idle). */
 #zap-preview {
   display: none;
   position: fixed;
@@ -512,36 +512,44 @@ body.playing #legend { display: block; }
   top: 50%;
   transform: translateY(-50%);
   z-index: 260;
-  padding: 14px 18px;
+  padding: 10px 14px;
   background: rgba(10, 10, 20, 0.86);
   border-radius: 8px;
   color: #fff;
   font-family: -apple-system, "Helvetica Neue", "Segoe UI", sans-serif;
   pointer-events: none;
-  min-width: 280px;
-  max-width: 440px;
+  min-width: 260px;
+  max-width: 360px;
   opacity: 0;
   transition: opacity 200ms;
   box-shadow: 0 10px 36px rgba(0, 0, 0, 0.6);
+  flex-direction: column;
+  gap: 2px;
 }
-body.playing #zap-preview { display: block; }
+body.playing #zap-preview { display: flex; }
 #zap-preview.visible { opacity: 1; }
+
 .zap-row {
   padding: 8px 12px;
-  font-size: 20px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   border-radius: 4px;
   color: #aaaabb;
 }
-.zap-row.dim { opacity: 0.62; }
+.zap-row .zap-name {
+  font-size: 19px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.zap-row.dim { opacity: 0.55; }
 .zap-row.current {
   color: #ffffff;
-  font-weight: 600;
   background: rgba(255, 204, 102, 0.22);
   border-left: 4px solid #ffcc66;
   padding-left: 10px;
+}
+.zap-row.current .zap-name {
+  font-size: 21px;
+  font-weight: 600;
 }
 .zap-row .zap-live {
   display: inline-block;
@@ -555,6 +563,118 @@ body.playing #zap-preview { display: block; }
   border-radius: 3px;
   font-weight: 700;
   vertical-align: middle;
+}
+
+/* Bottom-centre channel-info banner. Shown alongside the right-side strip during △▽
+   zap; displays PREV / NOW / NEXT programme info for the focused channel. Single-line
+   per row (label · time · title), with a thin progress bar between NOW and NEXT.
+   Data is fetched lazily (state.epg.byKey cache); banner re-renders when fresh
+   programme data arrives. Fades together with the strip after POST_COMMIT_LINGER_MS. */
+#zap-banner {
+  display: none;
+  position: fixed;
+  left: 50%;
+  bottom: 60px;
+  transform: translateX(-50%);
+  z-index: 260;
+  width: min(820px, 70vw);
+  padding: 14px 24px 12px;
+  background: rgba(10, 10, 20, 0.88);
+  border-radius: 12px;
+  color: #fff;
+  font-family: -apple-system, "Helvetica Neue", "Segoe UI", sans-serif;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+body.playing #zap-banner { display: block; }
+#zap-banner.visible { opacity: 1; }
+
+.zb-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+.zb-name {
+  font-size: 28px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.zb-live {
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 2px;
+  font-weight: 700;
+  color: #ff5555;
+  flex-shrink: 0;
+}
+.zb-live::before {
+  content: '● ';
+  animation: nowPulse 1.4s ease-in-out infinite;
+}
+.zb-catchup {
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 1.5px;
+  font-weight: 700;
+  color: #66b3ff;
+  flex-shrink: 0;
+}
+.zb-line {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 0;
+  font-size: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.zb-label {
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 1.5px;
+  font-weight: 700;
+  min-width: 46px;
+}
+.zb-line.prev .zb-label,
+.zb-line.next .zb-label { color: #8b95a8; }
+.zb-line.now  .zb-label { color: #ffcc66; }
+.zb-time {
+  font-size: 13px;
+  color: #9aa0b4;
+  font-family: ui-monospace, monospace;
+  min-width: 110px;
+}
+.zb-title {
+  color: #fff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+.zb-line.prev .zb-title,
+.zb-line.next .zb-title { color: #d4d4e0; font-weight: 400; }
+.zb-line.prev .zb-title { color: #8b95a8; text-decoration: line-through; text-decoration-color: rgba(255,255,255,.18); }
+.zb-bar {
+  margin: 4px 0 8px 60px;
+  height: 2px;
+  background: rgba(255, 204, 102, 0.18);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.zb-bar-fill { height: 100%; background: #ffcc66; }
+.zb-msg {
+  font-size: 13px;
+  color: #6a6a8a;
+  font-family: ui-monospace, monospace;
+  font-style: italic;
+  padding: 4px 0;
 }
 #legend .lbl {
   font-size: 11px;
@@ -797,9 +917,23 @@ body.playing #zap-preview { display: block; }
   #zap-preview {
     right: 12px;
     min-width: 0;
-    max-width: 70%;
-    padding: 10px 14px;
+    max-width: 50%;
+    padding: 8px 12px;
   }
-  .zap-row { font-size: 14px; padding: 6px 10px; }
+  .zap-row { padding: 6px 10px; }
+  .zap-row .zap-name { font-size: 14px; }
+  .zap-row.current .zap-name { font-size: 15px; }
   .zap-row .zap-live { font-size: 9px; padding: 1px 4px; margin-right: 6px; }
+
+  #zap-banner {
+    width: calc(100% - 24px);
+    bottom: 16px;
+    padding: 10px 16px;
+    border-radius: 8px;
+  }
+  .zb-name { font-size: 20px; }
+  .zb-line { font-size: 13px; gap: 10px; padding: 2px 0; }
+  .zb-label { font-size: 10px; letter-spacing: 1px; min-width: 38px; }
+  .zb-time { font-size: 11px; min-width: 96px; }
+  .zb-bar { margin-left: 48px; }
 }

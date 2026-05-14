@@ -318,6 +318,33 @@ function nowEpgIndex(visible) {
   return -1;
 }
 
+// Pick the programme airing at `now`, plus the one just before and the one just after.
+// Used by the zap banner to surface PREV / NOW / NEXT on the focused channel.
+function prevNowNextPrograms(programs) {
+  if (!programs || !programs.length) return { prev: null, now: null, next: null };
+  var n = Date.now();
+  var prev = null, now = null, next = null;
+  for (var i = 0; i < programs.length; i++) {
+    var p = programs[i];
+    if (!p.start || !p.end) continue;
+    var s = p.start.getTime(), e = p.end.getTime();
+    if (s <= n && n < e) {
+      now = p;
+      for (var k = i - 1; k >= 0; k--) {
+        var pp = programs[k];
+        if (pp.end && pp.end.getTime() <= n) { prev = pp; break; }
+      }
+      for (var j = i + 1; j < programs.length; j++) {
+        if (programs[j].start) { next = programs[j]; break; }
+      }
+      return { prev: prev, now: now, next: next };
+    }
+    if (p.end && p.end.getTime() <= n) prev = p;
+    if (!next && s > n) next = p;
+  }
+  return { prev: prev, now: now, next: next };
+}
+
 function epgPanelHtml() {
   var ch = focusedChannel();
   if (!ch) return '<div class="epg-empty">no channel focused</div>';
@@ -887,6 +914,8 @@ function zap(delta) {
   var nextIdx = (curIdx + delta + list.length) % list.length;
   zapState = { idx: nextIdx, channel: list[nextIdx], list: list };
   showZapPreview(list, nextIdx);
+  showZapBanner(list[nextIdx]);
+  scheduleZapEpgFetch(list[nextIdx]);
   hideOverlay();
   clearTimeout(zapTimer);
   zapTimer = setTimeout(commitZap, ZAP_COMMIT_MS);
@@ -895,8 +924,8 @@ function zap(delta) {
 function commitZap() {
   clearTimeout(zapTimer);
   zapTimer = null;
-  if (!zapState) { hideZapPreview(); return; }
-  if (!state.playing) { zapState = null; hideZapPreview(); return; }
+  if (!zapState) { hideZapPreview(); hideZapBanner(); return; }
+  if (!state.playing) { zapState = null; hideZapPreview(); hideZapBanner(); return; }
   var ch = zapState.channel;
   var list = zapState.list;
   var idx = zapState.idx;
@@ -908,18 +937,21 @@ function commitZap() {
   pushRecentChannel(ch.key);
   state.focusIdx = focusIdxForChannel(ch.key);
   updateBodyClass();
-  setOverlay(ch.name, '', 'live', true);
+  // No setOverlay here — the bottom-centre banner already carries channel name + LIVE,
+  // and the post-commit linger keeps it visible. player.onPlaying is also suppressed
+  // for the same reason while the banner is up.
   logEvent('zap-commit', ch.name, { url: ch.play_url });
   player.play(ch.play_url);
-  // Linger: keep the preview strip visible for POST_COMMIT_LINGER_MS so the user has
-  // a confirmation of what they landed on. Re-render first — state.playing is now
-  // the committed channel, which clears the LIVE pill from the row we just left
-  // (the gold highlight on `current` already signals "this is now live").
+  // Linger: keep both the strip and the banner visible for POST_COMMIT_LINGER_MS so
+  // the user has a confirmation of what they landed on. Re-render first — state.playing
+  // is now the committed channel, which clears the LIVE pill from the row we just left.
   showZapPreview(list, idx);
+  showZapBanner(ch);
   clearTimeout(commitHideTimer);
   commitHideTimer = setTimeout(function () {
     commitHideTimer = null;
     hideZapPreview();
+    hideZapBanner();
   }, POST_COMMIT_LINGER_MS);
 }
 
@@ -928,16 +960,17 @@ function cancelZap() {
   zapTimer = null;
   clearTimeout(commitHideTimer);
   commitHideTimer = null;
+  clearTimeout(zapEpgFetchTimer);
+  zapEpgFetchTimer = null;
   zapState = null;
   hideZapPreview();
+  hideZapBanner();
 }
 
-var ZAP_PREVIEW_WINDOW = 11;
+var ZAP_PREVIEW_WINDOW = 9;
 function showZapPreview(list, idx) {
   var el = document.getElementById('zap-preview');
   if (!el) return;
-  // 5-row strip centred on the preview channel. Slide the window at list edges so the
-  // strip is always 5 lines (stable visual frame while scrolling).
   var half = Math.floor(ZAP_PREVIEW_WINDOW / 2);
   var start = idx - half;
   var end = idx + half;
@@ -947,18 +980,133 @@ function showZapPreview(list, idx) {
   if (end >= list.length) end = list.length - 1;
   var html = '';
   for (var i = start; i <= end; i++) {
-    var cls = (i === idx) ? 'zap-row current' : 'zap-row dim';
+    var isCurrent = i === idx;
+    var cls = isCurrent ? 'zap-row current' : 'zap-row dim';
     var isLive = state.playing && list[i].key === state.playing.channel.key;
-    var tag = isLive && i !== idx ? '<span class="zap-live">LIVE</span>' : '';
-    html += '<div class="' + cls + '">' + tag + esc(list[i].name) + '</div>';
+    var tag = isLive && !isCurrent ? '<span class="zap-live">LIVE</span>' : '';
+    html += '<div class="' + cls + '">' +
+              '<div class="zap-name">' + tag + esc(list[i].name) + '</div>' +
+            '</div>';
   }
   el.innerHTML = html;
   el.classList.add('visible');
 }
 
+
 function hideZapPreview() {
   var el = document.getElementById('zap-preview');
   if (el) el.classList.remove('visible');
+}
+
+// Bottom-centre channel-info banner shown alongside the right-side strip during
+// fullscreen zap. Surfaces PREV / NOW / NEXT programmes for the focused channel,
+// with a thin progress bar under NOW. Programme data comes from state.epg.byKey;
+// the banner re-renders when fresh data arrives (refreshZapForChannel).
+function showZapBanner(channel) {
+  var el = document.getElementById('zap-banner');
+  if (!el || !channel) return;
+  var modeLabel = (state.playing && state.playing.mode === 'catchup')
+    ? '<div class="zb-catchup">CATCH-UP</div>'
+    : '<div class="zb-live">LIVE</div>';
+  el.innerHTML =
+    '<div class="zb-head">' +
+      '<div class="zb-name">' + esc(channel.name) + '</div>' +
+      modeLabel +
+    '</div>' +
+    zapBannerBodyHtml(channel);
+  el.classList.add('visible');
+}
+
+function zapBannerBodyHtml(channel) {
+  var entry = state.epg.byKey[channel.key];
+  if (!entry || (entry.programs == null && entry.fetching)) {
+    return '<div class="zb-msg">fetching schedule…</div>';
+  }
+  if (!entry.programs || !entry.programs.length) {
+    return '<div class="zb-msg">no schedule info</div>';
+  }
+  var pnn = prevNowNextPrograms(entry.programs);
+  if (!pnn.prev && !pnn.now && !pnn.next) {
+    return '<div class="zb-msg">off air</div>';
+  }
+  var html = '';
+  if (pnn.prev) html += zapBannerLine('prev', 'PREV', pnn.prev);
+  if (pnn.now)  html += zapBannerLine('now', 'NOW', pnn.now) + zapBannerProgressBar(pnn.now);
+  if (pnn.next) html += zapBannerLine('next', 'NEXT', pnn.next);
+  return html;
+}
+
+function zapBannerLine(cls, label, p) {
+  return '<div class="zb-line ' + cls + '">' +
+           '<div class="zb-label">' + esc(label) + '</div>' +
+           '<div class="zb-time">' + esc(fmtTime(p.start)) + ' – ' + esc(fmtTime(p.end)) + '</div>' +
+           '<div class="zb-title">' + esc(p.title || '—') + '</div>' +
+         '</div>';
+}
+
+function zapBannerProgressBar(p) {
+  if (!p.start || !p.end) return '';
+  var s = p.start.getTime(), e = p.end.getTime(), now = Date.now();
+  var pct = (e > s) ? Math.max(0, Math.min(100, ((now - s) / (e - s)) * 100)) : 0;
+  return '<div class="zb-bar"><div class="zb-bar-fill" style="width:' + pct.toFixed(1) + '%"></div></div>';
+}
+
+function hideZapBanner() {
+  var el = document.getElementById('zap-banner');
+  if (el) el.classList.remove('visible');
+}
+
+// On-demand EPG fetch for the zap target. Debounced so holding △▽ doesn't fire one
+// request per row; only the channel the user lands on (180 ms idle) gets fetched.
+// Results flow into the same state.epg.byKey cache used by the panel view, so subsequent
+// zaps to that channel paint program info immediately. Cancelled by cancelZap().
+var zapEpgFetchTimer = null;
+function scheduleZapEpgFetch(channel) {
+  if (!channel) return;
+  clearTimeout(zapEpgFetchTimer);
+  zapEpgFetchTimer = setTimeout(function () { fetchZapEpg(channel); }, 180);
+}
+
+function fetchZapEpg(channel) {
+  if (!channel) return;
+  var entry = state.epg.byKey[channel.key];
+  if (entry && (entry.programs != null || entry.fetching)) {
+    if (entry.programs != null) refreshZapForChannel(channel);
+    return;
+  }
+  var cached = loadEpg(channel.key);
+  if (cached && cached.length) {
+    state.epg.byKey[channel.key] = { programs: cached, fetching: false };
+    refreshZapForChannel(channel);
+    return;
+  }
+  state.epg.byKey[channel.key] = { programs: null, fetching: true };
+  refreshZapForChannel(channel);
+  epgFor(channel.key).then(function (programs) {
+    state.epg.byKey[channel.key] = { programs: programs, fetching: false };
+    saveEpg(channel.key, programs);
+    refreshZapForChannel(channel);
+  }).catch(function () {
+    state.epg.byKey[channel.key] = { programs: [], fetching: false };
+    saveEpg(channel.key, []);
+    refreshZapForChannel(channel);
+  });
+}
+
+// Re-render the banner only if it's still showing this channel as the focus —
+// a slow EPG response for a channel we've already zapped past would otherwise
+// overwrite the correct preview. Works for both the live preview (zapState) and
+// the post-commit linger (after commit, zapState is null but the banner is still up).
+// The strip is channel-name-only and doesn't need re-rendering on EPG arrival.
+function refreshZapForChannel(channel) {
+  var el = document.getElementById('zap-banner');
+  if (!el || !el.classList.contains('visible')) return;
+  var targetKey;
+  if (zapState) targetKey = zapState.channel.key;
+  else if (state.playing) targetKey = state.playing.channel.key;
+  else return;
+  if (targetKey !== channel.key) return;
+  showZapBanner(channel);
 }
 
 function seekCatchup(seconds) {
@@ -1192,6 +1340,12 @@ function showLegend() {
   legendTimer = setTimeout(function () { el.classList.remove('visible'); }, 3000);
 }
 
+function hideLegend() {
+  var el = document.getElementById('legend');
+  if (el) el.classList.remove('visible');
+  clearTimeout(legendTimer);
+}
+
 function legendContent() {
   var mode = state.playing && state.playing.mode;
   var ch = state.playing && state.playing.channel;
@@ -1239,7 +1393,13 @@ function hideOverlay() {
 player.onPlaying = function (url) {
   mark('firstPlaying');
   if (state.playing) {
-    setOverlay(state.playing.channel.name, '', 'live');
+    // Suppress the "live" overlay while the zap banner is up — the banner already
+    // shows the channel name + LIVE pill. Avoids double-banner visual noise during
+    // the post-commit linger.
+    var banner = document.getElementById('zap-banner');
+    if (!banner || !banner.classList.contains('visible')) {
+      setOverlay(state.playing.channel.name, '', 'live');
+    }
     logEvent('canplay', state.playing.channel.name, { url: url });
   }
   // The player just appended a fresh <video> to document.body. If we're in mini we
@@ -1287,7 +1447,13 @@ setRemoteHandlers({
   end: function () { jumpToEdge(true); },
   any: function () {
     userInteracted = true;
-    showLegend();
+    // Suppress the bottom-right key legend while the zap banner is visible — they
+    // share the bottom edge and would overlap. The user has the banner as their
+    // focal point during zap; the legend reappears on the next key after the
+    // banner fades.
+    var banner = document.getElementById('zap-banner');
+    if (!banner || !banner.classList.contains('visible')) showLegend();
+    else hideLegend();
     showCatchupBadge();
     // Cursor hide-on-key: keyboard activity hides the cursor; mousemove restores it.
     // Mutually exclusive with .pointer-active so the two handlers don't fight.
