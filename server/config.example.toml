@@ -1,5 +1,12 @@
 listen_addr = "0.0.0.0:8080"
-public_base_url = "http://localhost:8080"
+# `public_base_url` is OPTIONAL. The server normally derives the URL prefix it
+# advertises (play_url, segment links) from each request's
+# X-Forwarded-Proto / X-Forwarded-Host / Host headers, so the same instance
+# serves correct URLs over LAN, public IP, or a reverse-proxy hostname without
+# per-deploy tuning. Set this only if you want to override that — or as a
+# fallback for clients that don't send a Host header.
+# public_base_url = "http://example.com"
+
 # Static UI assets served as fallback. Defaults to "../app" — resolves to the
 # repo's app/ both for `cargo run` from server/ and inside the Docker container
 # (WORKDIR /srv/iptv-proxy, app/ mounted at /srv/app).

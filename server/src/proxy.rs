@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+use crate::api::request_base_url;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use bytes::Bytes;
@@ -47,9 +49,11 @@ pub async fn play_playlist(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(params): Query<PlayParams>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let key = name.trim_end_matches(".m3u8").trim_end_matches(".ts");
     let catchup_request = parse_catchup_params(&params)?;
+    let public_base = request_base_url(&headers, state.config.public_base_url.as_deref());
 
     let snap = state.catalog.snapshot();
     let channel = snap
@@ -58,7 +62,7 @@ pub async fn play_playlist(
         .ok_or((StatusCode::NOT_FOUND, format!("unknown channel: {key}")))?;
 
     if let Some(req) = catchup_request {
-        return catchup_play(state, channel, req).await;
+        return catchup_play(state, channel, req, &public_base).await;
     }
 
     let candidates = build_candidates(&state, &channel);
@@ -84,7 +88,7 @@ pub async fn play_playlist(
         tried += 1;
         match tokio::time::timeout(
             attempt_timeout,
-            fetch_and_rewrite_playlist(&state, &channel, cand),
+            fetch_and_rewrite_playlist(&state, &channel, cand, &public_base),
         )
         .await
         {
@@ -192,6 +196,7 @@ async fn fetch_and_rewrite_playlist(
     state: &AppState,
     channel: &CanonicalChannel,
     cand: &Candidate,
+    public_base: &str,
 ) -> anyhow::Result<Response> {
     debug!("playlist fetch: {} ({})", channel.key, cand.url);
     let resp = state
@@ -220,7 +225,7 @@ async fn fetch_and_rewrite_playlist(
         let rewritten = rewrite_playlist(
             body,
             &final_url,
-            &state.config.public_base_url,
+            public_base,
             &channel.key,
             &cand.url,
         )?;
@@ -697,6 +702,7 @@ async fn catchup_play(
     state: Arc<AppState>,
     channel: CanonicalChannel,
     req: CatchupRequest,
+    public_base: &str,
 ) -> Result<Response, (StatusCode, String)> {
     let source = channel.pick_archive_source().ok_or((
         StatusCode::NOT_FOUND,
@@ -748,7 +754,7 @@ async fn catchup_play(
     // Catch-up has a single source; the per-attempt timeout used for live
     // failover doesn't apply. Lean on the upstream_http client's own timeout.
     let cand = Candidate { url: upstream.clone(), host };
-    match fetch_and_rewrite_playlist(&state, &channel, &cand).await {
+    match fetch_and_rewrite_playlist(&state, &channel, &cand, public_base).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             warn!(channel = %channel.key, url = %cand.url, error = %e, "catch-up upstream failed");

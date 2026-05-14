@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
@@ -12,6 +12,37 @@ use crate::codec::Classification;
 use crate::epg::{fetch_epg_for_channel, EpgCandidate};
 use crate::state::AppState;
 use crate::xtream::EpgProgram;
+
+/// Derive `scheme://host[:port]` from the incoming request so URLs we emit
+/// (play_url, segment URLs) resolve back to whichever address the client used
+/// to reach us — LAN IP, public IP, reverse-proxy hostname, …. Prefers
+/// `X-Forwarded-Host`/`X-Forwarded-Proto` so deployments behind a reverse
+/// proxy advertise the public URL rather than the internal one. Falls back
+/// to `Config::public_base_url` (and ultimately to `http://localhost:8080`)
+/// only when no `Host` header is available.
+pub fn request_base_url(headers: &HeaderMap, fallback: Option<&str>) -> String {
+    let pick = |name: &str| -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let host = pick("x-forwarded-host").or_else(|| {
+        headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let proto = pick("x-forwarded-proto").unwrap_or_else(|| "http".to_string());
+    match host {
+        Some(h) => format!("{proto}://{h}"),
+        None => fallback
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| "http://localhost:8080".to_string()),
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChannelDto {
@@ -83,9 +114,12 @@ pub struct BlacklistStatusDto {
     pub demoted_urls: usize,
 }
 
-pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_channels(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let snap = state.catalog.snapshot();
-    let base = &state.config.public_base_url;
+    let base = request_base_url(&headers, state.config.public_base_url.as_deref());
     type SortKey = (u8, usize, String, usize);
     let mut out: Vec<(SortKey, ChannelDto)> = snap
         .channels
@@ -273,4 +307,75 @@ pub async fn admin_clear_all(State(state): State<Arc<AppState>>) -> StatusCode {
 pub async fn admin_clear_classifier(State(state): State<Arc<AppState>>) -> StatusCode {
     state.classifier.clear();
     StatusCode::NO_CONTENT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn base_url_uses_host_header_with_default_scheme() {
+        assert_eq!(
+            request_base_url(&hm(&[("host", "192.163.2.90:8080")]), None),
+            "http://192.163.2.90:8080"
+        );
+    }
+
+    #[test]
+    fn base_url_prefers_x_forwarded_host_and_proto() {
+        // Behind a reverse proxy: Host is the internal name, X-Forwarded-* carry
+        // the public URL the client actually used.
+        let headers = hm(&[
+            ("host", "iptv-proxy.internal:8080"),
+            ("x-forwarded-host", "iptv.example.com"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(request_base_url(&headers, None), "https://iptv.example.com");
+    }
+
+    #[test]
+    fn base_url_picks_first_value_in_xff_list() {
+        // Proxies may chain "client, proxy1, proxy2" — first entry is closest
+        // to the actual client.
+        let headers = hm(&[
+            ("x-forwarded-host", "iptv.example.com, internal-lb:8080"),
+            ("x-forwarded-proto", "https, http"),
+        ]);
+        assert_eq!(request_base_url(&headers, None), "https://iptv.example.com");
+    }
+
+    #[test]
+    fn base_url_falls_back_to_config_when_host_missing() {
+        // HTTP/1.0 clients or programmatic callers may omit Host. Fallback only
+        // kicks in then.
+        assert_eq!(
+            request_base_url(&hm(&[]), Some("http://192.163.2.90:8080")),
+            "http://192.163.2.90:8080"
+        );
+        // Trailing slash trimmed for consistency with the format!() callsites
+        // that already append "/play/...".
+        assert_eq!(
+            request_base_url(&hm(&[]), Some("http://192.163.2.90:8080/")),
+            "http://192.163.2.90:8080"
+        );
+    }
+
+    #[test]
+    fn base_url_final_fallback_to_localhost() {
+        // No Host, no config — only happens with a non-conformant client and a
+        // bare config; we still return *something* usable for local debugging.
+        assert_eq!(request_base_url(&hm(&[]), None), "http://localhost:8080");
+    }
 }

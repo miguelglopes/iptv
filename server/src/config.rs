@@ -7,7 +7,14 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub listen_addr: String,
-    pub public_base_url: String,
+    // Optional fallback URL prefix for absolute links the server emits (play_url,
+    // segment proxies). Normally the server derives this from each request's
+    // X-Forwarded-Proto / X-Forwarded-Host / Host headers so the same instance
+    // works on LAN IP, public IP, and reverse-proxy hostnames without per-host
+    // tuning. The fallback is only used when no Host header is available (e.g.,
+    // HTTP/1.0 clients).
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     #[serde(default = "default_ui_dir")]
     pub ui_dir: PathBuf,
     pub xtream: XtreamConfig,
