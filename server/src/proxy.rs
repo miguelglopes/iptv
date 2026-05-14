@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::canonical::{CanonicalChannel, CanonicalSource};
 use crate::codec::{classify_ts_chunk, strip_subtitle_pids};
+use crate::play_log::{AttemptOutcome, PlayAttempt, PlayEvent};
 use crate::state::AppState;
 
 const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
@@ -54,6 +55,7 @@ pub async fn play_playlist(
     let key = name.trim_end_matches(".m3u8").trim_end_matches(".ts");
     let catchup_request = parse_catchup_params(&params)?;
     let public_base = request_base_url(&headers, state.config.public_base_url.as_deref());
+    let play_id = state.play_log.next_id();
 
     let snap = state.catalog.snapshot();
     let channel = snap
@@ -62,30 +64,41 @@ pub async fn play_playlist(
         .ok_or((StatusCode::NOT_FOUND, format!("unknown channel: {key}")))?;
 
     if let Some(req) = catchup_request {
-        return catchup_play(state, channel, req, &public_base).await;
+        return catchup_play(state, channel, req, &public_base, &play_id).await;
     }
 
     let candidates = build_candidates(&state, &channel);
     if candidates.is_empty() {
+        warn!(play = %play_id, channel = %channel.key, "no candidate sources for channel");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
     }
 
     let budget = Duration::from_secs(state.config.proxy.play_budget_secs);
     let per_attempt = Duration::from_secs(state.config.proxy.per_attempt_timeout_secs);
     let started = Instant::now();
+    let started_wall = time::OffsetDateTime::now_utc();
 
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
+    let mut attempts: Vec<PlayAttempt> = Vec::new();
+
+    info!(
+        play = %play_id,
+        channel = %channel.key,
+        candidates = candidates.len(),
+        "play start",
+    );
 
     for (idx, cand) in candidates.iter().enumerate() {
         let elapsed = started.elapsed();
         if elapsed >= budget {
-            warn!("play budget exhausted for {} after {} attempts", channel.key, idx);
+            warn!(play = %play_id, channel = %channel.key, after_attempts = idx, "play budget exhausted");
             break;
         }
         let remaining = budget.saturating_sub(elapsed);
         let attempt_timeout = per_attempt.min(remaining);
         tried += 1;
+        let attempt_start = Instant::now();
         match tokio::time::timeout(
             attempt_timeout,
             fetch_and_rewrite_playlist(&state, &channel, cand, &public_base),
@@ -93,6 +106,7 @@ pub async fn play_playlist(
         .await
         {
             Ok(Ok(resp)) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
                 state.blacklist.note_url_succeeded(&channel.key, &cand.url);
                 schedule_opportunistic_validation(
                     Arc::clone(&state),
@@ -100,35 +114,97 @@ pub async fn play_playlist(
                     &candidates,
                     idx,
                 );
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Ok,
+                });
+                info!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    attempt = tried,
+                    elapsed_ms,
+                    "play ok"
+                );
+                state.play_log.record(PlayEvent {
+                    id: play_id.clone(),
+                    started: started_wall,
+                    channel: channel.key.clone(),
+                    catchup: false,
+                    total_ms: started.elapsed().as_millis() as u64,
+                    candidates_total: candidates.len(),
+                    succeeded: true,
+                    error: None,
+                    attempts,
+                });
                 return Ok(resp);
             }
             Ok(Err(e)) => {
-                warn!("playlist fetch failed for {}: {} → {}", channel.key, cand.url, e);
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                let reason = e.to_string();
+                warn!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    url = %cand.url,
+                    elapsed_ms,
+                    error = %reason,
+                    "playlist fetch failed",
+                );
                 state.blacklist.note_url_failed(&cand.url);
-                last_err = Some(e.to_string());
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Err { reason: reason.clone() },
+                });
+                last_err = Some(reason);
                 continue;
             }
             Err(_) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
                 warn!(
-                    "playlist fetch timed out for {} on {} after {:?}",
-                    channel.key, cand.url, attempt_timeout
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    url = %cand.url,
+                    elapsed_ms,
+                    "playlist fetch timed out",
                 );
                 state.blacklist.note_url_failed(&cand.url);
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Timeout,
+                });
                 last_err = Some(format!("timeout after {attempt_timeout:?}"));
                 continue;
             }
         }
     }
 
-    Err((
-        StatusCode::BAD_GATEWAY,
-        format!(
-            "all {tried}/{total} candidates failed for {channel} (last: {err})",
-            total = candidates.len(),
-            channel = channel.key,
-            err = last_err.as_deref().unwrap_or("budget exhausted"),
-        ),
-    ))
+    let err_text = format!(
+        "all {tried}/{total} candidates failed for {channel} (last: {err})",
+        total = candidates.len(),
+        channel = channel.key,
+        err = last_err.as_deref().unwrap_or("budget exhausted"),
+    );
+    warn!(play = %play_id, channel = %channel.key, attempts = tried, "play failed: all candidates exhausted");
+    state.play_log.record(PlayEvent {
+        id: play_id.clone(),
+        started: started_wall,
+        channel: channel.key.clone(),
+        catchup: false,
+        total_ms: started.elapsed().as_millis() as u64,
+        candidates_total: candidates.len(),
+        succeeded: false,
+        error: Some(last_err.unwrap_or_else(|| "budget exhausted".into())),
+        attempts,
+    });
+    Err((StatusCode::BAD_GATEWAY, err_text))
 }
 
 fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candidate> {
@@ -703,7 +779,10 @@ async fn catchup_play(
     channel: CanonicalChannel,
     req: CatchupRequest,
     public_base: &str,
+    play_id: &str,
 ) -> Result<Response, (StatusCode, String)> {
+    let started = Instant::now();
+    let started_wall = time::OffsetDateTime::now_utc();
     let source = channel.pick_archive_source().ok_or((
         StatusCode::NOT_FOUND,
         "channel does not support catch-up".to_string(),
@@ -754,10 +833,57 @@ async fn catchup_play(
     // Catch-up has a single source; the per-attempt timeout used for live
     // failover doesn't apply. Lean on the upstream_http client's own timeout.
     let cand = Candidate { url: upstream.clone(), host };
+    let attempt_start = Instant::now();
+    info!(play = %play_id, channel = %channel.key, "catchup play start");
     match fetch_and_rewrite_playlist(&state, &channel, &cand, public_base).await {
-        Ok(resp) => Ok(resp),
+        Ok(resp) => {
+            let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+            info!(play = %play_id, channel = %channel.key, host = %cand.host, elapsed_ms, "catchup play ok");
+            state.play_log.record(PlayEvent {
+                id: play_id.to_string(),
+                started: started_wall,
+                channel: channel.key.clone(),
+                catchup: true,
+                total_ms: started.elapsed().as_millis() as u64,
+                candidates_total: 1,
+                succeeded: true,
+                error: None,
+                attempts: vec![PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Ok,
+                }],
+            });
+            Ok(resp)
+        }
         Err(e) => {
-            warn!(channel = %channel.key, url = %cand.url, error = %e, "catch-up upstream failed");
+            let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+            let reason = e.to_string();
+            warn!(
+                play = %play_id,
+                channel = %channel.key,
+                url = %cand.url,
+                elapsed_ms,
+                error = %reason,
+                "catch-up upstream failed",
+            );
+            state.play_log.record(PlayEvent {
+                id: play_id.to_string(),
+                started: started_wall,
+                channel: channel.key.clone(),
+                catchup: true,
+                total_ms: started.elapsed().as_millis() as u64,
+                candidates_total: 1,
+                succeeded: false,
+                error: Some(reason.clone()),
+                attempts: vec![PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Err { reason },
+                }],
+            });
             Err((
                 StatusCode::BAD_GATEWAY,
                 format!("catch-up upstream failed: {e}"),

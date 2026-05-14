@@ -21,6 +21,7 @@ mod config;
 mod default_order;
 mod epg;
 mod hosts;
+mod play_log;
 mod proxy;
 mod state;
 mod xtream;
@@ -91,6 +92,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/admin/clear-demoted", post(api::admin_clear_demoted))
         .route("/admin/clear-classifier", post(api::admin_clear_classifier))
         .route("/admin/clear-all", post(api::admin_clear_all))
+        .route("/admin/recent-plays", get(api::admin_recent_plays))
         .route("/play/:name", get(proxy::play_playlist))
         .route("/seg/:token", get(proxy::proxy_segment))
         .fallback_service(ServeDir::new(ui_dir))

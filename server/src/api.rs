@@ -309,6 +309,10 @@ pub async fn admin_clear_classifier(State(state): State<Arc<AppState>>) -> Statu
     StatusCode::NO_CONTENT
 }
 
+pub async fn admin_recent_plays(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.play_log.snapshot())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

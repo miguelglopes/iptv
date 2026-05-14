@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::default_order::Curation;
 use crate::epg::EpgState;
 use crate::hosts::HostState;
+use crate::play_log::PlayLog;
 use crate::xtream::XtreamClient;
 
 pub struct AppState {
@@ -22,6 +23,7 @@ pub struct AppState {
     pub blacklist: Arc<Blacklist>,
     pub classifier: Arc<StreamClassifier>,
     pub upstream_http: Client,
+    pub play_log: Arc<PlayLog>,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             blacklist,
             classifier,
             upstream_http,
+            play_log: Arc::new(PlayLog::new()),
         }))
     }
 }
