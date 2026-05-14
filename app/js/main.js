@@ -1105,7 +1105,16 @@ setRemoteHandlers({
   channelDown: function () { (state.playing && !state.mini) ? zap(1) : moveFocus(1); },
   home: function () { jumpToEdge(false); },
   end: function () { jumpToEdge(true); },
-  any: function () { userInteracted = true; showLegend(); showCatchupBadge(); }
+  any: function () {
+    userInteracted = true;
+    showLegend();
+    showCatchupBadge();
+    // Cursor hide-on-key: keyboard activity hides the cursor; mousemove restores it.
+    // Mutually exclusive with .pointer-active so the two handlers don't fight.
+    var c = document.body.classList;
+    c.add('no-cursor');
+    c.remove('pointer-active');
+  }
 });
 
 // Wire the search input once. The element is always in the DOM (hidden via
@@ -1129,6 +1138,15 @@ document.addEventListener('click', function (e) {
   // shrinks to mini (mobile equivalent of the remote's Back).
   if (state.playing && !state.mini) {
     if (e.target.id === 'player') back();
+    return;
+  }
+  // Header key-hint chips → same actions the colored remote keys trigger.
+  var chip = e.target.closest('.keymap-inline .chip[data-action]');
+  if (chip) {
+    var action = chip.getAttribute('data-action');
+    if (action === 'search') toggleSearch();
+    else if (action === 'unrecent') unrecent();
+    else if (action === 'ok') activate();
     return;
   }
   // Channel tap: focus that row and play.
@@ -1176,6 +1194,75 @@ document.addEventListener('click', function (e) {
     activate();
   }
 });
+
+// Pointer hover → focus. Mirrors arrow-key navigation: hovering a row sets the focus
+// index, so OK (keyboard) and click (pointer) target the same item. Hover never
+// activates — that's still a click. The hit-test caches the last target so we don't
+// churn on every pixel of mouse movement.
+var lastHoverTarget = null;
+document.addEventListener('mousemove', function (e) {
+  // Cursor reveal: pointer activity shows the cursor (overrides .no-cursor + TV default).
+  var c = document.body.classList;
+  c.remove('no-cursor');
+  c.add('pointer-active');
+  // Fullscreen playback: shell is hidden, nothing to hover.
+  if (state.playing && !state.mini) return;
+  var t = e.target.closest('#list .list-item, .settings-grid .settings-item, .epg-row');
+  if (t === lastHoverTarget) return;
+  lastHoverTarget = t;
+  if (!t) return;
+  if (t.classList.contains('list-item')) {
+    var i = parseInt(t.getAttribute('data-i'), 10);
+    if (!isFinite(i) || i === state.focusIdx) {
+      if (state.panel !== 'list') setPanel('list');
+      return;
+    }
+    if (state.panel !== 'list') setPanel('list');
+    var listEl = document.getElementById('list');
+    if (listEl) {
+      var prev = listEl.children[state.focusIdx];
+      if (prev && prev !== t) prev.classList.remove('focused');
+      t.classList.add('focused');
+    }
+    state.focusIdx = i;
+    scheduleEpgFetch();
+    return;
+  }
+  if (t.classList.contains('settings-item')) {
+    var si = parseInt(t.getAttribute('data-i'), 10);
+    if (!isFinite(si)) return;
+    if (state.panel !== 'settings') setPanel('settings');
+    setSettingsIdx(si);
+    return;
+  }
+  if (t.classList.contains('epg-row')) {
+    var ei = parseInt(t.getAttribute('data-i'), 10);
+    if (!isFinite(ei)) return;
+    if (state.panel !== 'epg') setPanel('epg');
+    if (ei === state.epg.rowIdx) return;
+    var panel = document.getElementById('bottom-slot');
+    if (panel) {
+      var prevRow = panel.querySelector('.epg-row.focused');
+      if (prevRow && prevRow !== t) prevRow.classList.remove('focused');
+      t.classList.add('focused');
+    }
+    state.epg.rowIdx = ei;
+  }
+});
+
+// Wheel on the channel list: desktop uses native scroll. The TV's Magic Remote wheel
+// has momentum and emits big deltaY values that overshoot a 412-item list; clamp the
+// per-event step so it feels like a list, not a fling.
+(function () {
+  var listEl = document.getElementById('list');
+  if (!listEl) return;
+  listEl.addEventListener('wheel', function (e) {
+    if (!document.documentElement.classList.contains('tv')) return;
+    e.preventDefault();
+    var step = Math.sign(e.deltaY) * Math.min(Math.abs(e.deltaY), 80);
+    listEl.scrollBy({ top: step, behavior: 'auto' });
+  }, { passive: false });
+})();
 
 // === BOOT ===
 

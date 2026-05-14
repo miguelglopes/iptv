@@ -16,6 +16,13 @@ html, body {
    media query; main.js sets the `tv` class on <html> based on the webOS UA. Laptops
    stay cursor-on for dev. */
 html.tv, html.tv body { cursor: none; }
+/* Dynamic cursor: main.js toggles .no-cursor on every keydown and .pointer-active on
+   mousemove (mutually exclusive). .pointer-active overrides the TV default so the Magic
+   Remote pointer shows; .no-cursor hides the cursor on desktop during keyboard nav.
+   .no-cursor uses the *-selector + !important to override UA cursors on inputs/links.
+   .pointer-active deliberately doesn't, so chip/link/input cursors render normally. */
+body.no-cursor, body.no-cursor * { cursor: none !important; }
+body.pointer-active { cursor: auto !important; }
 
 body {
   background:
@@ -107,6 +114,8 @@ header {
 }
 .keymap-inline span { display: inline-flex; align-items: center; gap: 4px; }
 .keymap-inline .k { font-size: 10px; }
+.keymap-inline .chip { cursor: pointer; padding: 2px 6px; border-radius: 3px; }
+.keymap-inline .chip:hover { background: rgba(255, 255, 255, 0.08); color: #e0e0f0; }
 
 h1 {
   font-size: 36px;
