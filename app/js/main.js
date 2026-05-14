@@ -1137,10 +1137,14 @@ setRemoteHandlers({
 // users get the same affordances on TV. Every path goes through the same activate()
 // pipeline the keyboard uses.
 document.addEventListener('click', function (e) {
-  // Fullscreen playback: nothing in the shell is interactive; tap on the video
-  // shrinks to mini (mobile equivalent of the remote's Back).
+  // Fullscreen playback: shell is hidden; clicking the video reveals the on-screen
+  // legend (channel name, key hints, catch-up badge) — same overlay the keyboard
+  // `any:` handler shows on a remote key. Back-out from fullscreen is keyboard-only.
   if (state.playing && !state.mini) {
-    if (e.target.id === 'player') back();
+    if (e.target.id === 'player') {
+      showLegend();
+      showCatchupBadge();
+    }
     return;
   }
   // Header key-hint chips → same actions the colored remote keys trigger.
@@ -1228,7 +1232,9 @@ document.addEventListener('mousemove', function (e) {
       t.classList.add('focused');
     }
     state.focusIdx = i;
-    scheduleEpgFetch();
+    // Don't scheduleEpgFetch() on hover — moving the cursor across the list would
+    // flash the EPG panel "loading…" on every row crossed. EPG updates on keyboard
+    // navigation (moveFocus) and on actual selection (click → play).
     return;
   }
   if (t.classList.contains('settings-item')) {
