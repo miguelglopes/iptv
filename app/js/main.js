@@ -8,6 +8,9 @@ import {
   loadLastPlayTimestamp
 } from './cache.js';
 import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, adminClearBlacklist, adminClearDemoted, adminClearAllSources } from './api.js';
+// Namespace import so the field stays optional — older config.js files that pre-date
+// PROVIDER_LAG_MS won't crash with a named-import SyntaxError; we just fall back to 0.
+import * as cfg from './config.js';
 
 // Tag the root element so TV-specific CSS (cursor: none, anything else added later) can
 // gate on the real TV vs. laptop dev. webOS UA contains "Web0S" (yes, zero, not O).
@@ -277,8 +280,8 @@ function focusedChannel() {
 
 // Provider's archive encoder lag: programs that ended within this window on a
 // catch-up channel often have has_archive=0 because the upstream hasn't finished
-// encoding them yet. Empirically ~2.7h on RTP 1.
-var PROVIDER_LAG_MS = 3 * 3600 * 1000;
+// encoding them yet. Operator-specific — calibrate per provider via config.js.
+var PROVIDER_LAG_MS = cfg.PROVIDER_LAG_MS || 0;
 
 // Programs currently visible in the EPG panel for `ch`. Returns null if no data yet.
 // The window is 1 h on regular channels (just anchor on "right now") and

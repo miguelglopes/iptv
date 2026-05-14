@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -15,6 +16,26 @@ pub struct Config {
     pub epg: EpgConfig,
     pub blacklist: BlacklistConfig,
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub curation: CurationConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CurationConfig {
+    #[serde(default)]
+    pub order: Vec<String>,
+    #[serde(default)]
+    pub aliases: HashMap<String, String>,
+    #[serde(default)]
+    pub display_overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub provider_boosts: Vec<ProviderBoost>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderBoost {
+    pub pattern: String,
+    pub score: i32,
 }
 
 fn default_ui_dir() -> PathBuf { PathBuf::from("../app") }

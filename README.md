@@ -6,11 +6,13 @@ Self-hosted IPTV server with a browser UI. Aggregates Xtream Codes providers acr
 
 ## What is this
 
-A standalone IPTV server I built for myself. Personal-scale, no ads, no telemetry, no analytics.
+A self-hosted IPTV server with a browser UI. No ads, no telemetry, no analytics.
 
 - **The server** (`server/`, Rust) does all the work: probes Xtream hosts in parallel, builds a canonical channel catalog (dedupes across providers, ranks by quality), aggregates EPG, proxies live segments with retries, tracks per-URL / per-host health, and serves the UI as static files. Run it on any Linux box on your LAN.
 - **The browser UI** (`app/`, vanilla JS — no framework, no build step) is served directly by the Rust process. Open `http://your-server:8080/` from any device that has a browser and you have a working IPTV client.
 - **The webOS app** (same `app/`, packaged as an IPK) is a bonus: the exact same UI, wrapped for LG TVs in Developer Mode so the TV remote drives the experience natively.
+
+Defaults out of the box are deliberately neutral — channels appear in alphabetical order with universal quality scoring (RAW > 4K > FHD > HD > SD). Local taste (preferred channel ordering, ISP variant preferences, name aliases) lives in a `[curation]` block in your own `server/config.toml` and is documented in `server/config.example.toml`.
 
 ## How it works
 
@@ -81,7 +83,15 @@ Keyboard:
 | Next / previous channel | PageUp / PageDown |
 | Jump to top / bottom | Home / End |
 
-Configuration lives in `server/config.toml` (gitignored). The example file documents every section: which Xtream hosts to probe, how often, EPG TTL, blacklist thresholds, segment buffer sizes, etc.
+Configuration lives in `server/config.toml` (gitignored). The example file documents every section: which Xtream hosts to probe, how often, EPG TTL, blacklist thresholds, segment buffer sizes, plus an optional `[curation]` block for taste-driven knobs (preferred channel order, name aliases, display overrides, ISP-variant score bonuses). With `[curation]` omitted, the catalog is alphabetical and the only scoring applied is universal quality tiering.
+
+### Bring your own background
+
+`app/bg.jpg` ships as a neutral dark gradient. Drop in your own 1920×1080 JPEG with the same filename to replace it. The CSS overlays a left-side darkening gradient on top so any image works as long as it isn't blindingly bright.
+
+### Catch-up lag
+
+Some providers' catch-up encoders run minutes-to-hours behind the live edge, so programs that have just ended come back as "not yet available". `PROVIDER_LAG_MS` in `app/js/config.js` masks that gap on the client side — defaults to 0 (trust EPG timestamps), raise it to your provider's empirical lag (e.g. `10800000` for 3 h) if you see false negatives.
 
 ## Optional — LG webOS deployment
 
@@ -146,7 +156,7 @@ server/               Rust proxy (axum + tokio + reqwest) — the brain
     blacklist.rs      URL / host failure tracking
     proxy.rs          playlist + segment proxy with retries
     codec.rs          codec / container classification
-    default_order.rs  curated default channel ordering
+    default_order.rs  Curation struct: rank / aliases / display overrides / boosts
     config.rs state.rs
   Cargo.toml Dockerfile
   config.example.toml example proxy config

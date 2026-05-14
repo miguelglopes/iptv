@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::canonical::{build_canonical, CanonicalChannel};
 use crate::config::CatalogConfig;
+use crate::default_order::Curation;
 use crate::hosts::HostState;
 use crate::xtream::{LiveStream, XtreamClient};
 
@@ -68,6 +69,7 @@ pub fn spawn_catalog_loop(
     hosts_state: Arc<HostState>,
     client: XtreamClient,
     config: CatalogConfig,
+    curation: Arc<Curation>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -78,7 +80,7 @@ pub fn spawn_catalog_loop(
             } else {
                 match refresh_once(&client, &alive).await {
                     Ok((streams, host)) => {
-                        let channels = build_canonical(&streams);
+                        let channels = build_canonical(&streams, &curation);
                         let mut by_key = HashMap::with_capacity(channels.len());
                         for (i, c) in channels.iter().enumerate() {
                             by_key.insert(c.key.clone(), i);

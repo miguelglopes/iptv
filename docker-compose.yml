@@ -13,9 +13,6 @@ services:
       - ./app:/srv/app:ro
     environment:
       RUST_LOG: ${RUST_LOG:-info,iptv_proxy=info}
-    dns:
-      - 192.163.2.103
-      - 1.1.1.1
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/status"]
       interval: 30s

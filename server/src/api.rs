@@ -9,7 +9,6 @@ use time::OffsetDateTime;
 
 use crate::canonical::quality_tier;
 use crate::codec::Classification;
-use crate::default_order;
 use crate::epg::{fetch_epg_for_channel, EpgCandidate};
 use crate::state::AppState;
 use crate::xtream::EpgProgram;
@@ -94,7 +93,7 @@ pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .enumerate()
         .map(|(orig_i, ch)| {
             let logo = ch.sources.iter().find_map(|s| s.logo.clone());
-            let d = default_order::rank(&ch.key);
+            let d = state.curation.rank_of(&ch.key);
             let bucket: u8 = if d.is_some() { 0 } else { 1 };
             let sub = d.unwrap_or(usize::MAX);
             let archive_src = ch.pick_archive_source();

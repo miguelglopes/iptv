@@ -53,3 +53,39 @@ play_budget_secs = 10
 per_attempt_timeout_secs = 5
 opportunistic_validate_count = 2
 opportunistic_validate_timeout_secs = 4
+
+# Optional taste / locale knobs. Omit the whole section to get a neutral catalog:
+# channels appear in alphabetical-by-display-name order, with only universal
+# quality-tier scoring (RAW > 4K > FHD > HD > SD) and no name aliasing.
+[curation]
+# Channels pinned to the top of the list, in this order. Names are matched
+# case-insensitively after canonicalization (strip prefix / quality / accents /
+# punctuation, lowercase, ASCII alphanumeric only). Channels not listed appear
+# after, sorted alphabetically by display name.
+order = [
+    # "newschannelhd",
+    # "sportshd",
+]
+
+# Score bonuses applied to channel-variant names matching a regex. Useful to prefer
+# your ISP's branded streams over generic ones when several feeds carry the same
+# channel. Score is added to the variant's quality-tier score.
+provider_boosts = [
+    # { pattern = "(?i)VODAFONE", score = 3 },
+    # { pattern = "(?i)MEO", score = 2 },
+]
+
+# Maps an alias canonical key → its target canonical key, so different name
+# spellings collapse into the same channel. Keys are post-canonicalization (lower,
+# ASCII alphanumeric). Use the [curation.aliases] sub-table form — TOML inline
+# tables can't span lines with comments.
+#
+# Sub-tables MUST appear after the inline-style fields above: in TOML a
+# [parent.child] header ends the parent table's scope.
+[curation.aliases]
+# btv = "benfica"            # example: host shortens "Benfica TV" to "BTV"
+
+# Pretty display name override, keyed by canonical key. Without this, the longer /
+# more accented variant name wins.
+[curation.display_overrides]
+# benfica = "Benfica TV"

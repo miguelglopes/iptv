@@ -7,12 +7,14 @@ use crate::blacklist::Blacklist;
 use crate::catalog::CatalogState;
 use crate::codec::StreamClassifier;
 use crate::config::Config;
+use crate::default_order::Curation;
 use crate::epg::EpgState;
 use crate::hosts::HostState;
 use crate::xtream::XtreamClient;
 
 pub struct AppState {
     pub config: Arc<Config>,
+    pub curation: Arc<Curation>,
     pub xtream: XtreamClient,
     pub hosts: Arc<HostState>,
     pub catalog: Arc<CatalogState>,
@@ -29,6 +31,7 @@ impl AppState {
             config.xtream.password.clone(),
             Duration::from_secs(8),
         )?;
+        let curation = Arc::new(Curation::from_config(&config.curation)?);
         let hosts = Arc::new(HostState::new(&config.xtream.hosts));
         let catalog = Arc::new(CatalogState::new());
         let epg = Arc::new(EpgState::new(config.epg.clone()));
@@ -45,6 +48,7 @@ impl AppState {
 
         Ok(Arc::new(Self {
             config: Arc::new(config),
+            curation,
             xtream,
             hosts,
             catalog,

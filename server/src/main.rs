@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
         Arc::clone(&state.hosts),
         state.xtream.clone(),
         config.catalog.clone(),
+        Arc::clone(&state.curation),
     );
 
     let app = router(state.clone());
