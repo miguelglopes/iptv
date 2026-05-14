@@ -99,7 +99,11 @@ function onKeyDown(e) {
 
 function onKeyUp(e) {
   var name = NAMES[e.keyCode];
-  if (name && name === holdKey) stopHold();
+  if (!name) return;
+  if (name === holdKey) stopHold();
+  // Notify subscribers of key-release. Used by main.js to commit a zap preview
+  // immediately when the user lets go of △▽, rather than waiting for the idle timer.
+  if (handlers.release) handlers.release(name);
 }
 
 export function setRemoteHandlers(map) {

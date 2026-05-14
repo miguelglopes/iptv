@@ -445,42 +445,39 @@ function listHtml(items) {
   var html = '';
   var listActive = state.panel === 'list';
   for (var i = 0; i < items.length; i++) {
-    var focus = (listActive && i === state.focusIdx) ? ' focused' : (i === state.focusIdx ? ' focused-dim' : '');
     var it = items[i];
+    if (it.kind === 'header') {
+      // Header sits as a sibling of .list-item but isn't navigable — no data-i, no
+      // .list-item class. Click/hover delegates match `.list-item` only, so headers
+      // are inert by construction. Keep the data-i attribute on channels so the
+      // children[focusIdx] index lines up with the items[] array (headers occupy
+      // their own slot too).
+      html += '<div class="list-header" data-h="1">' + esc(it.text) + '</div>';
+      continue;
+    }
+    var focus = (listActive && i === state.focusIdx) ? ' focused' : (i === state.focusIdx ? ' focused-dim' : '');
     if (it.kind === 'recent') {
       html += '<div class="list-item recent' + focus + '" data-i="' + i + '"><span class="ret">↩</span> ' + esc(it.text) + '</div>';
     } else {
       var played = it.played ? ' played' : '';
-      html += '<div class="list-item' + played + focus + '" data-i="' + i + '">' + esc(it.channel.name) + '</div>';
+      var marker = it.inRecentsSection ? '<span class="recent-dot">●</span> ' : '';
+      html += '<div class="list-item' + played + focus + '" data-i="' + i + '">' + marker + esc(it.channel.name) + '</div>';
     }
   }
   return html;
 }
 
-// Server returns channels already sorted (default_rank then alpha). The client adds
-// the per-device "recently played" preference on top: pinned channels float to the
-// top in their stored order.
-function sortByRecency(channels) {
-  var recent = loadRecentChannels();
-  if (!recent.length) return channels.slice();
-  var recentRank = {};
-  for (var i = 0; i < recent.length; i++) recentRank[recent[i]] = i;
-  var keyed = channels.map(function (c, idx) {
-    var r = recentRank[c.key];
-    return { c: c, r: r !== undefined ? r : Infinity, i: idx };
-  });
-  keyed.sort(function (a, b) {
-    if (a.r !== b.r) return a.r - b.r;
-    return a.i - b.i;
-  });
-  return keyed.map(function (k) { return k.c; });
-}
+// Channels are always shown in the server's default order (default_rank then alpha) —
+// the list never reshuffles around recents. visibleItems() surfaces the recently-watched
+// set as a separate section pinned to the top of the list, then the full catalogue
+// underneath. The recent channels appear twice (once in each section); both rows route
+// through the same activate() path so behaviour is identical.
+var RECENTS_SECTION_MAX = 8;
 
 function visibleChannels() {
-  var ranked = sortByRecency(state.channels);
-  if (!state.search) return ranked;
+  if (!state.search) return state.channels.slice();
   var s = state.search.toLowerCase();
-  return ranked.filter(function (c) { return c.name.toLowerCase().indexOf(s) >= 0; });
+  return state.channels.filter(function (c) { return c.name.toLowerCase().indexOf(s) >= 0; });
 }
 
 function visibleItems() {
@@ -491,9 +488,67 @@ function visibleItems() {
   var recent = loadRecentChannels();
   var played = {};
   for (var i = 0; i < recent.length; i++) played[recent[i]] = true;
-  return visibleChannels().map(function (c) {
-    return { kind: 'channel', channel: c, played: !!played[c.key] };
-  });
+  var channels = visibleChannels();
+  var items = [];
+  // Recents section: only when not actively filtering — during search the user is
+  // looking for a specific channel, not browsing what they've watched.
+  if (!state.search && recent.length) {
+    var byKey = {};
+    for (var x = 0; x < channels.length; x++) byKey[channels[x].key] = channels[x];
+    var recentChannels = [];
+    for (var j = 0; j < recent.length && recentChannels.length < RECENTS_SECTION_MAX; j++) {
+      var rc = byKey[recent[j]];
+      if (rc) recentChannels.push(rc);
+    }
+    if (recentChannels.length) {
+      items.push({ kind: 'header', text: 'Recently watched' });
+      for (var k = 0; k < recentChannels.length; k++) {
+        items.push({ kind: 'channel', channel: recentChannels[k], played: true, inRecentsSection: true });
+      }
+      items.push({ kind: 'header', text: 'All channels' });
+    }
+  }
+  for (var m = 0; m < channels.length; m++) {
+    items.push({ kind: 'channel', channel: channels[m], played: !!played[channels[m].key] });
+  }
+  return items;
+}
+
+// Return the nearest non-header index from `from`, moving in direction `dir` (±1).
+// -1 if we run off the edge.
+function findNonHeader(items, from, dir) {
+  var i = from;
+  while (i >= 0 && i < items.length && items[i].kind === 'header') i += dir;
+  return (i >= 0 && i < items.length) ? i : -1;
+}
+
+// Snap state.focusIdx onto a navigable row. Called from renderList so resets like
+// `state.focusIdx = 0` (which would land on the Recently-watched header) never stick.
+function validateFocus(items) {
+  if (!items.length) { state.focusIdx = 0; return; }
+  if (state.focusIdx < 0) state.focusIdx = 0;
+  if (state.focusIdx >= items.length) state.focusIdx = items.length - 1;
+  if (items[state.focusIdx].kind === 'header') {
+    var fwd = findNonHeader(items, state.focusIdx, 1);
+    var back = findNonHeader(items, state.focusIdx, -1);
+    state.focusIdx = fwd >= 0 ? fwd : (back >= 0 ? back : 0);
+  }
+}
+
+// Find a sensible focus row for a given channel key. Prefers the recents-section copy
+// (so the just-played channel sits at the top of the list when returning to mini) and
+// falls back to the all-channels copy.
+function focusIdxForChannel(channelKey) {
+  var items = visibleItems();
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    if (it.kind === 'channel' && it.channel.key === channelKey && it.inRecentsSection) return i;
+  }
+  for (var j = 0; j < items.length; j++) {
+    var it2 = items[j];
+    if (it2.kind === 'channel' && it2.channel.key === channelKey) return j;
+  }
+  return 0;
 }
 
 function hostStatusLabel() {
@@ -525,6 +580,7 @@ function renderList() {
   var listEl = document.getElementById('list');
   if (!listEl) return;
   var items = visibleItems();
+  validateFocus(items);
   listEl.innerHTML = listHtml(items);
   setHint(hintText(items.length));
   scrollToFocus();
@@ -569,7 +625,11 @@ function scrollToFocus() {
   var list = document.getElementById('list');
   if (!list) return;
   var el = list.querySelector('.list-item.focused');
-  scrollIntoCenter(el, list);
+  // Use nearest, not center: when the focused item is the first row of a section
+  // (e.g., the top of Recently-watched), centering would push the section header
+  // off-screen above the viewport. nearest only scrolls when actually needed, so
+  // the header stays visible above the focused row.
+  scrollIntoNearest(el, list);
 }
 
 function moveFocus(delta) {
@@ -630,12 +690,19 @@ function moveFocus(delta) {
   var nextL = state.focusIdx + delta;
   if (nextL < 0) nextL = 0;
   if (nextL >= list.length) nextL = list.length - 1;
+  // Headers between sections aren't navigable — snap to the nearest channel in the
+  // direction of motion (so △▽ never lands on a section heading), then fall back to
+  // the opposite direction at the very edges.
+  var dir = delta >= 0 ? 1 : -1;
+  var snapped = findNonHeader(list, nextL, dir);
+  if (snapped < 0) snapped = findNonHeader(list, nextL, -dir);
+  if (snapped < 0) return;
   var prevL = state.focusIdx;
-  state.focusIdx = nextL;
+  state.focusIdx = snapped;
   var listEl = document.getElementById('list');
   if (listEl) {
     var prevElL = listEl.children[prevL];
-    var nextElL = listEl.children[nextL];
+    var nextElL = listEl.children[snapped];
     if (prevElL && prevElL !== nextElL) prevElL.classList.remove('focused');
     if (nextElL) {
       nextElL.classList.add('focused');
@@ -651,7 +718,13 @@ function jumpToEdge(end) {
   if (state.panel !== 'list') return;
   var list = visibleItems();
   if (!list.length) return;
-  state.focusIdx = end ? list.length - 1 : 0;
+  if (end) {
+    var idx = findNonHeader(list, list.length - 1, -1);
+    state.focusIdx = idx >= 0 ? idx : list.length - 1;
+  } else {
+    var idx2 = findNonHeader(list, 0, 1);
+    state.focusIdx = idx2 >= 0 ? idx2 : 0;
+  }
   renderList();
 }
 
@@ -706,6 +779,11 @@ function play(channel) {
   if (state.search) pushSearchHistory(state.search);
   captureZapList();
   pushRecentChannel(channel.key);
+  // The recents section was just bumped — re-anchor focus on this channel so it lines
+  // up in the list when we come back to mini. Without this, state.focusIdx points to
+  // wherever the click happened and now refers to a different row (the recents header
+  // / a different channel) because everything shifted down.
+  state.focusIdx = focusIdxForChannel(channel.key);
   state.playing = { channel: channel, mode: 'live' };
   state.mini = false;
   updateBodyClass();
@@ -753,6 +831,7 @@ function playCatchup(channel, program) {
   }
   captureZapList();
   pushRecentChannel(channel.key);
+  state.focusIdx = focusIdxForChannel(channel.key);
   var atIso = program.start.toISOString();
   var durationMin = Math.ceil((program.end.getTime() - program.start.getTime()) / 60000) + 5;
   var url = catchupUrl(channel, atIso, durationMin);
@@ -770,28 +849,116 @@ function playCatchup(channel, program) {
   player.play(url);
 }
 
+// Channel zap (only valid during fullscreen playback). Two phases so holding the key
+// (or quickly tapping it several times) doesn't thrash the player pipeline:
+//
+//   1. Preview — each △▽ press updates `zapState` and the on-screen channel strip
+//      but DOES NOT touch the <video> element. The actually-playing channel stays
+//      visible underneath while the user scrolls through neighbouring channels.
+//   2. Commit — fires after ZAP_COMMIT_MS of idle. Each new press restarts the
+//      timer, so consecutive taps keep scrolling and only the final pause commits.
+//      Promotes the preview channel to state.playing and calls player.play().
+//
+// state.zapList was captured in default order at fullscreen entry, so △▽ always
+// follows the catalogue's sort — pinning a recent never reshuffles the zap order.
+var zapState = null;
 var zapTimer = null;
+var commitHideTimer = null;
+var ZAP_COMMIT_MS = 500;
+var POST_COMMIT_LINGER_MS = 2000;
+
 function zap(delta) {
+  if (!state.playing) return;
+  // Cancel any post-commit linger — we're starting a fresh preview cycle, the
+  // strip should immediately reflect the new target rather than wait out the timer
+  // and then snap.
+  clearTimeout(commitHideTimer);
+  commitHideTimer = null;
   var list = state.zapList || visibleChannels();
-  if (!list.length || !state.playing) return;
+  if (!list.length) return;
+  // Pivot off the in-progress preview during a hold so successive presses advance one
+  // step each, not all jumping from the original channel.
+  var pivotKey = zapState ? zapState.channel.key : state.playing.channel.key;
   var curIdx = -1;
   for (var i = 0; i < list.length; i++) {
-    if (list[i].key === state.playing.channel.key) { curIdx = i; break; }
+    if (list[i].key === pivotKey) { curIdx = i; break; }
   }
-  if (curIdx < 0) curIdx = state.focusIdx;
-  state.focusIdx = (curIdx + delta + list.length) % list.length;
-  var ch = list[state.focusIdx];
-  state.playing = { channel: ch, mode: 'live' };
-  updateBodyClass();
-  setOverlay(ch.name, '', '…', true);
+  if (curIdx < 0) curIdx = 0;
+  var nextIdx = (curIdx + delta + list.length) % list.length;
+  zapState = { idx: nextIdx, channel: list[nextIdx], list: list };
+  showZapPreview(list, nextIdx);
+  hideOverlay();
   clearTimeout(zapTimer);
-  zapTimer = setTimeout(function () {
-    zapTimer = null;
-    if (state.playing) {
-      pushRecentChannel(state.playing.channel.key);
-      player.play(state.playing.channel.play_url);
-    }
-  }, 250);
+  zapTimer = setTimeout(commitZap, ZAP_COMMIT_MS);
+}
+
+function commitZap() {
+  clearTimeout(zapTimer);
+  zapTimer = null;
+  if (!zapState) { hideZapPreview(); return; }
+  if (!state.playing) { zapState = null; hideZapPreview(); return; }
+  var ch = zapState.channel;
+  var list = zapState.list;
+  var idx = zapState.idx;
+  zapState = null;
+  state.playing = { channel: ch, mode: 'live' };
+  // Order matters: pushRecentChannel BEFORE focusIdxForChannel, so the snap sees the
+  // new recents-section row at the top and anchors there. If we snapped first, the
+  // recents list would grow underneath us and state.focusIdx would point one row off.
+  pushRecentChannel(ch.key);
+  state.focusIdx = focusIdxForChannel(ch.key);
+  updateBodyClass();
+  setOverlay(ch.name, '', 'live', true);
+  logEvent('zap-commit', ch.name, { url: ch.play_url });
+  player.play(ch.play_url);
+  // Linger: keep the preview strip visible for POST_COMMIT_LINGER_MS so the user has
+  // a confirmation of what they landed on. Re-render first — state.playing is now
+  // the committed channel, which clears the LIVE pill from the row we just left
+  // (the gold highlight on `current` already signals "this is now live").
+  showZapPreview(list, idx);
+  clearTimeout(commitHideTimer);
+  commitHideTimer = setTimeout(function () {
+    commitHideTimer = null;
+    hideZapPreview();
+  }, POST_COMMIT_LINGER_MS);
+}
+
+function cancelZap() {
+  clearTimeout(zapTimer);
+  zapTimer = null;
+  clearTimeout(commitHideTimer);
+  commitHideTimer = null;
+  zapState = null;
+  hideZapPreview();
+}
+
+var ZAP_PREVIEW_WINDOW = 11;
+function showZapPreview(list, idx) {
+  var el = document.getElementById('zap-preview');
+  if (!el) return;
+  // 5-row strip centred on the preview channel. Slide the window at list edges so the
+  // strip is always 5 lines (stable visual frame while scrolling).
+  var half = Math.floor(ZAP_PREVIEW_WINDOW / 2);
+  var start = idx - half;
+  var end = idx + half;
+  if (start < 0) { end += -start; start = 0; }
+  if (end >= list.length) { start -= (end - list.length + 1); end = list.length - 1; }
+  if (start < 0) start = 0;
+  if (end >= list.length) end = list.length - 1;
+  var html = '';
+  for (var i = start; i <= end; i++) {
+    var cls = (i === idx) ? 'zap-row current' : 'zap-row dim';
+    var isLive = state.playing && list[i].key === state.playing.channel.key;
+    var tag = isLive && i !== idx ? '<span class="zap-live">LIVE</span>' : '';
+    html += '<div class="' + cls + '">' + tag + esc(list[i].name) + '</div>';
+  }
+  el.innerHTML = html;
+  el.classList.add('visible');
+}
+
+function hideZapPreview() {
+  var el = document.getElementById('zap-preview');
+  if (el) el.classList.remove('visible');
 }
 
 function seekCatchup(seconds) {
@@ -811,6 +978,9 @@ function seekCatchup(seconds) {
 var switchTimer = null;
 function switchSource() {
   if (!state.playing) return;
+  // Mid-zap Green should refresh the currently-playing channel's source, not the
+  // preview target — drop the preview so the user stays on what they're watching.
+  cancelZap();
   setOverlay(state.playing.channel.name, '', 'switching source…', true);
   logEvent('switch', state.playing.channel.name);
   clearTimeout(switchTimer);
@@ -896,8 +1066,10 @@ function activate() {
 function back() {
   if (state.playing) {
     if (!state.mini) {
+      // Abandon any in-progress zap preview — the user is exiting fullscreen, not
+      // confirming a channel switch.
+      cancelZap();
       state.mini = true;
-      clearTimeout(zapTimer); zapTimer = null;
       if (state.panel === 'settings') state.panel = 'list';
       updateBodyClass();
       attachVideoForMode();
@@ -981,6 +1153,7 @@ function enterCatchupAtNow(offsetSec) {
 
 function toggleCatchupMode() {
   if (!state.playing) return;
+  cancelZap();
   var ch = state.playing.channel;
   if (state.playing.mode === 'catchup') {
     state.playing = { channel: ch, mode: 'live' };
@@ -998,8 +1171,12 @@ function unrecent() {
   var items = visibleItems();
   var it = items[state.focusIdx];
   if (!it || it.kind !== 'channel' || !it.played) return;
-  if (!removeRecentChannel(it.channel.key)) return;
-  setOverlay(it.channel.name, '', 'removed from recents');
+  var ch = it.channel;
+  if (!removeRecentChannel(ch.key)) return;
+  // Stay anchored on the same conceptual channel — focusIdxForChannel falls back to
+  // its all-channels row when the recents-section copy disappears.
+  state.focusIdx = focusIdxForChannel(ch.key);
+  setOverlay(ch.name, '', 'removed from recents');
   renderList();
 }
 
@@ -1117,6 +1294,13 @@ setRemoteHandlers({
     var c = document.body.classList;
     c.add('no-cursor');
     c.remove('pointer-active');
+  },
+  release: function () {
+    // Intentionally a no-op for now. Earlier this committed an in-progress zap on
+    // every keyup, but that meant a single tap → immediate channel change, which
+    // made rapid tap-tap-tap thrash the player. ZAP_COMMIT_MS (500 ms idle) is now
+    // the only commit path, so consecutive taps keep scrolling the preview and only
+    // the final pause swaps the video.
   }
 });
 

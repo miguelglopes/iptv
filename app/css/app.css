@@ -500,6 +500,62 @@ body.mini #catchup-badge { display: none; }  /* mini player has no room — over
 }
 body.playing #legend { display: block; }
 #legend.visible { opacity: 1; }
+
+/* Channel zap preview. Appears only during fullscreen playback while the user is
+   holding (or tapping) △▽. Shows a 5-row strip with the preview target highlighted,
+   so users can see what they're about to switch to without the video tearing down
+   on every keystroke. Fades 200ms after the commit (release or idle). */
+#zap-preview {
+  display: none;
+  position: fixed;
+  right: 48px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 260;
+  padding: 14px 18px;
+  background: rgba(10, 10, 20, 0.86);
+  border-radius: 8px;
+  color: #fff;
+  font-family: -apple-system, "Helvetica Neue", "Segoe UI", sans-serif;
+  pointer-events: none;
+  min-width: 280px;
+  max-width: 440px;
+  opacity: 0;
+  transition: opacity 200ms;
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.6);
+}
+body.playing #zap-preview { display: block; }
+#zap-preview.visible { opacity: 1; }
+.zap-row {
+  padding: 8px 12px;
+  font-size: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: 4px;
+  color: #aaaabb;
+}
+.zap-row.dim { opacity: 0.62; }
+.zap-row.current {
+  color: #ffffff;
+  font-weight: 600;
+  background: rgba(255, 204, 102, 0.22);
+  border-left: 4px solid #ffcc66;
+  padding-left: 10px;
+}
+.zap-row .zap-live {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-right: 8px;
+  font-size: 10px;
+  font-family: ui-monospace, monospace;
+  letter-spacing: 1px;
+  color: #ff5555;
+  border: 1px solid rgba(255, 85, 85, 0.5);
+  border-radius: 3px;
+  font-weight: 700;
+  vertical-align: middle;
+}
 #legend .lbl {
   font-size: 11px;
   text-transform: uppercase;
@@ -535,6 +591,36 @@ body.playing #legend { display: block; }
   color: #ffcc66;
   font-style: normal;
   margin-right: 8px;
+}
+
+/* Section heading inside the channel list. Used to separate "Recently watched" from
+   "All channels". Not a .list-item — click/hover delegates skip these by selector,
+   and navigation (moveFocus / jumpToEdge) snaps through them via findNonHeader.
+   Sized for legibility at 3m from a 65" TV; mobile media query shrinks it. */
+.list-header {
+  font-size: 16px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: #ffcc66;
+  font-weight: 700;
+  padding: 16px 10px 6px;
+  font-family: ui-monospace, monospace;
+  flex-shrink: 0;
+  border-bottom: 1px dashed rgba(255, 204, 102, 0.35);
+  margin-bottom: 6px;
+  pointer-events: none;
+  user-select: none;
+}
+.list-header:first-child { padding-top: 4px; }
+
+/* Subtle dot in front of recents-section rows so the duplicate of a main-list channel
+   visually identifies as the pinned/recent copy. The .played background still tints
+   the all-channels row in amber, but the dot is the unambiguous "this one is in
+   recents" cue. */
+.list-item .recent-dot {
+  color: #ffcc66;
+  margin-right: 8px;
+  font-size: 14px;
 }
 
 .search.exiled {
@@ -705,4 +791,15 @@ body.playing #legend { display: block; }
   #overlay .ov-title { font-size: 22px; }
   #overlay .ov-sub { font-size: 14px; }
   #catchup-badge { top: 16px; left: 16px; right: 16px; }
+
+  .list-header { font-size: 11px; padding: 10px 4px 2px; letter-spacing: 1px; }
+
+  #zap-preview {
+    right: 12px;
+    min-width: 0;
+    max-width: 70%;
+    padding: 10px 14px;
+  }
+  .zap-row { font-size: 14px; padding: 6px 10px; }
+  .zap-row .zap-live { font-size: 9px; padding: 1px 4px; margin-right: 6px; }
 }
