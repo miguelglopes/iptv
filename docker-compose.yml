@@ -11,6 +11,10 @@ services:
     volumes:
       - ./server/config.toml:/srv/iptv-proxy/config.toml:ro
       - ./app:/srv/app:ro
+      # Override the gitignored app/js/config.js (which carries the LAN URL the
+      # TV uses) with a same-origin config so the browser UI talks to this very
+      # container regardless of how it was reached.
+      - ./app/js/config.docker.js:/srv/app/js/config.js:ro
     environment:
       RUST_LOG: ${RUST_LOG:-info,iptv_proxy=info}
     healthcheck:
