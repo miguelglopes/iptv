@@ -213,6 +213,26 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
     let mut demoted: Vec<Candidate> = Vec::new();
 
     for src in &channel.sources {
+        // Radio (and any other self-contained source): URL given verbatim by
+        // `direct_source` — one candidate per source, no host fanout. Everything
+        // downstream (blacklist, demote, last-known-good, playlist rewrite,
+        // segment proxy) treats this URL the same way it treats an Xtream URL.
+        if let Some(direct) = &src.direct_source {
+            if state.blacklist.is_url_failed(direct) {
+                continue;
+            }
+            let host = derive_host(direct).unwrap_or_default();
+            if !host.is_empty() && state.blacklist.is_host_bad(&host) {
+                continue;
+            }
+            let cand = Candidate { url: direct.clone(), host };
+            if state.blacklist.is_url_demoted(direct) {
+                demoted.push(cand);
+            } else {
+                fresh.push(cand);
+            }
+            continue;
+        }
         for host in &alive {
             if state.blacklist.is_host_bad(host) {
                 continue;
@@ -244,15 +264,21 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
     fresh.extend(demoted);
 
     // If the blacklist filtered everything out, fall back to the unfiltered
-    // source × alive_host matrix. The blacklist is a hint, not a hard
-    // rule — failing the request without trying anything is worse than
-    // probing a possibly-stale entry. If they really are all dead, the
-    // attempt loop in `play_playlist` returns 502 within its budget.
-    if fresh.is_empty() && !alive.is_empty() {
+    // candidate set. The blacklist is a hint, not a hard rule — failing the
+    // request without trying anything is worse than probing a possibly-stale
+    // entry. If they really are all dead, the attempt loop in `play_playlist`
+    // returns 502 within its budget.
+    let has_xtream_source = channel.sources.iter().any(|s| s.direct_source.is_none());
+    if fresh.is_empty() && (!alive.is_empty() || channel.sources.iter().any(|s| s.direct_source.is_some())) {
         for src in &channel.sources {
-            for host in &alive {
-                let url = state.xtream.stream_url(host, src.stream_id, "m3u8");
-                fresh.push(Candidate { url, host: host.clone() });
+            if let Some(direct) = &src.direct_source {
+                let host = derive_host(direct).unwrap_or_default();
+                fresh.push(Candidate { url: direct.clone(), host });
+            } else if has_xtream_source {
+                for host in &alive {
+                    let url = state.xtream.stream_url(host, src.stream_id, "m3u8");
+                    fresh.push(Candidate { url, host: host.clone() });
+                }
             }
         }
     }
@@ -420,7 +446,10 @@ fn decode_segment_token(token: &str) -> Result<SegmentToken, (StatusCode, String
         .next()
         .unwrap_or(token)
         .trim_end_matches(".ts")
-        .trim_end_matches(".m4s");
+        .trim_end_matches(".m4s")
+        .trim_end_matches(".m3u8")
+        .trim_end_matches(".aac")
+        .trim_end_matches(".mp3");
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token.as_bytes())
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad segment token".into()))?;
@@ -476,8 +505,56 @@ pub async fn proxy_segment(
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
     let upstream_path = upstream.split('?').next().unwrap_or(&upstream);
+    let final_url = resp.url().clone();
+    let is_playlist = content_type.contains("mpegurl")
+        || content_type.contains("m3u8")
+        || upstream_path.ends_with(".m3u8");
     let is_ts = content_type.contains("mp2t") || upstream_path.ends_with(".ts");
     let stream_id = segment.p.as_deref().and_then(stream_id_from_source_url);
+
+    // Nested HLS: the master playlist references a chunklist `.m3u8` which we
+    // proxied through `/seg/<token>.m3u8`. When the browser now fetches that,
+    // the response is still a playlist — needs its inner segment URLs rewritten
+    // too. Reuse the same `rewrite_playlist` machinery used for the master,
+    // recurring once until it bottoms out at real `.ts` (or `.aac`) segments.
+    if is_playlist {
+        let public_base = request_base_url(&headers, state.config.public_base_url.as_deref());
+        let channel_key = segment.c.clone().unwrap_or_default();
+        let source_url = segment.p.clone().unwrap_or_else(|| upstream.clone());
+        let upstream_headers = resp.headers().clone();
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("nested playlist body read failed: {} → {}", upstream, e);
+                mark_segment_failure(&state, &segment);
+                return Err((StatusCode::BAD_GATEWAY, format!("body read: {e}")));
+            }
+        };
+        let body = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                // Not UTF-8 — pass through; the player will surface whatever
+                // error the content type implies.
+                return passthrough_response(status, &upstream_headers, bytes);
+            }
+        };
+        let rewritten =
+            match rewrite_playlist(body, &final_url, &public_base, &channel_key, &source_url) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("nested playlist rewrite failed: {} → {}", upstream, e);
+                    return Err((StatusCode::BAD_GATEWAY, format!("rewrite: {e}")));
+                }
+            };
+        let bytes_out = rewritten.into_bytes();
+        let mut builder = Response::builder().status(status);
+        builder = builder.header(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE);
+        builder = builder.header(header::CACHE_CONTROL, "no-store");
+        builder = builder.header(header::CONTENT_LENGTH, bytes_out.len());
+        return builder
+            .body(Body::from(bytes_out))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("body build error: {e}")));
+    }
 
     // For MPEG-TS segments with a known stream_id, buffer the body so we can
     // (a) classify the codec / detect DVB subtitle PIDs and (b) optionally
@@ -531,6 +608,30 @@ pub async fn proxy_segment(
     let body = Body::from_stream(stream);
     builder
         .body(body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("body build error: {e}")))
+}
+
+fn passthrough_response(
+    status: StatusCode,
+    upstream_headers: &reqwest::header::HeaderMap,
+    bytes: Bytes,
+) -> Result<Response, (StatusCode, String)> {
+    let mut builder = Response::builder().status(status);
+    for h in [
+        header::CONTENT_TYPE,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::CACHE_CONTROL,
+        header::ETAG,
+        header::LAST_MODIFIED,
+    ] {
+        if let Some(v) = upstream_headers.get(&h) {
+            builder = builder.header(&h, v);
+        }
+    }
+    builder = builder.header(header::CONTENT_LENGTH, bytes.len());
+    builder
+        .body(Body::from(bytes))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("body build error: {e}")))
 }
 
@@ -1071,9 +1172,11 @@ mod tests {
     #[test]
     fn pick_archive_source_prefers_highest_score() {
         use crate::canonical::CanonicalSource;
+        use crate::xtream::ChannelKind;
         let ch = CanonicalChannel {
             key: "x".into(),
             name: "X".into(),
+            kind: ChannelKind::Tv,
             sources: vec![
                 CanonicalSource {
                     stream_id: 1,
@@ -1082,6 +1185,7 @@ mod tests {
                     logo: None,
                     tv_archive: true,
                     tv_archive_duration: Some(3),
+                    direct_source: None,
                 },
                 CanonicalSource {
                     stream_id: 2,
@@ -1090,6 +1194,7 @@ mod tests {
                     logo: None,
                     tv_archive: true,
                     tv_archive_duration: Some(3),
+                    direct_source: None,
                 },
                 CanonicalSource {
                     stream_id: 3,
@@ -1098,6 +1203,7 @@ mod tests {
                     logo: None,
                     tv_archive: false,
                     tv_archive_duration: None,
+                    direct_source: None,
                 },
             ],
         };
@@ -1109,9 +1215,11 @@ mod tests {
     #[test]
     fn pick_archive_source_returns_none_when_no_archive() {
         use crate::canonical::CanonicalSource;
+        use crate::xtream::ChannelKind;
         let ch = CanonicalChannel {
             key: "x".into(),
             name: "X".into(),
+            kind: ChannelKind::Tv,
             sources: vec![CanonicalSource {
                 stream_id: 1,
                 name: "RAW".into(),
@@ -1119,6 +1227,7 @@ mod tests {
                 logo: None,
                 tv_archive: false,
                 tv_archive_duration: None,
+                direct_source: None,
             }],
         };
         assert!(ch.pick_archive_source().is_none());

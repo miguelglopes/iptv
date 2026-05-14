@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
+use reqwest::Client;
 use serde::Serialize;
+use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -65,6 +67,7 @@ impl EpgState {
 pub async fn fetch_epg_for_channel(
     epg: &EpgState,
     client: &XtreamClient,
+    upstream_http: &Client,
     channel_key: &str,
     candidates: Vec<EpgCandidate>,
 ) -> CachedEpg {
@@ -91,7 +94,7 @@ pub async fn fetch_epg_for_channel(
     }
 
     let timeout = Duration::from_secs(epg.config.fetch_timeout_secs);
-    let result = walk_all_in_parallel(client, candidates, timeout, &epg.fetch_semaphore).await;
+    let result = walk_all_in_parallel(client, upstream_http, candidates, timeout, &epg.fetch_semaphore).await;
 
     let cached = CachedEpg {
         programs: dedupe_programs(result.programs),
@@ -126,13 +129,64 @@ fn empty_cached() -> CachedEpg {
     }
 }
 
+/// EPG candidate: either an Xtream source (host × stream_id pair, possibly one
+/// of many for the same channel) or a self-contained RTP-radio fetch keyed by
+/// the station's RTP channel code + a target date.
+///
+/// The walk-in-parallel / score / abort-early / dedupe / cache machinery is
+/// shared — only `fetch_one` branches on the variant to pick the right HTTP
+/// fetch + parser.
 #[derive(Debug, Clone)]
-pub struct EpgCandidate {
-    pub stream_id: u64,
-    pub host: String,
-    /// Higher = walked sooner. Used to prioritise catch-up-supporting streams
-    /// so their `has_archive` flags survive the first-good-enough abort.
-    pub priority: u8,
+pub enum EpgCandidate {
+    Xtream {
+        stream_id: u64,
+        host: String,
+        /// Higher = walked sooner. Used to prioritise catch-up-supporting
+        /// streams so their `has_archive` flags survive the first-good-enough
+        /// abort.
+        priority: u8,
+    },
+    RtpRadio {
+        /// RTP's per-station integer code in the URL pattern
+        /// `https://www.rtp.pt/EPG/json/rtp-channels-page/list-grid/radio/{code}/{date}/lis`.
+        code: u32,
+        /// Target date in `D-M-YYYY` format (no zero-padding) — RTP's
+        /// endpoint is picky about this. Build with `format_rtp_date()`.
+        date: String,
+    },
+}
+
+impl EpgCandidate {
+    fn priority(&self) -> u8 {
+        match self {
+            EpgCandidate::Xtream { priority, .. } => *priority,
+            // RtpRadio has no notion of catch-up so leave at 0 — walks
+            // alongside non-archive Xtream candidates.
+            EpgCandidate::RtpRadio { .. } => 0,
+        }
+    }
+    fn stream_id_for_log(&self) -> u64 {
+        match self {
+            EpgCandidate::Xtream { stream_id, .. } => *stream_id,
+            EpgCandidate::RtpRadio { code, .. } => u64::from(*code),
+        }
+    }
+    fn host_for_log(&self) -> String {
+        match self {
+            EpgCandidate::Xtream { host, .. } => host.clone(),
+            EpgCandidate::RtpRadio { code, date } => format!("rtp-radio/{code}/{date}"),
+        }
+    }
+}
+
+/// Format a date for RTP's `D-M-YYYY` (e.g. `14-5-2026`) endpoint path.
+pub fn format_rtp_date(d: time::Date) -> String {
+    format!(
+        "{}-{}-{}",
+        d.day(),
+        u8::from(d.month()),
+        d.year(),
+    )
 }
 
 const GOOD_ENOUGH_PROGRAMS: usize = 20;
@@ -149,6 +203,7 @@ struct WalkOutcome {
 
 async fn walk_all_in_parallel(
     client: &XtreamClient,
+    upstream_http: &Client,
     mut candidates: Vec<EpgCandidate>,
     timeout: Duration,
     semaphore: &Arc<Semaphore>,
@@ -160,16 +215,17 @@ async fn walk_all_in_parallel(
     // Walk high-priority candidates first so their response is one of the first
     // few to arrive — important for catch-up channels where only the archive
     // source's response carries `has_archive` flags.
-    candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
-    let priority_total = candidates.iter().filter(|c| c.priority > 0).count();
+    candidates.sort_by(|a, b| b.priority().cmp(&a.priority()));
+    let priority_total = candidates.iter().filter(|c| c.priority() > 0).count();
 
     let mut tasks = FuturesUnordered::new();
     for cand in candidates {
         let client = client.clone();
+        let http = upstream_http.clone();
         let sem = Arc::clone(semaphore);
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
-            let programs = fetch_one(&client, &cand, timeout).await;
+            let programs = fetch_one(&client, &http, &cand, timeout).await;
             (cand, programs)
         }));
     }
@@ -181,20 +237,21 @@ async fn walk_all_in_parallel(
 
     while let Some(joined) = tasks.next().await {
         let Ok((cand, programs)) = joined else { continue };
-        if cand.priority > 0 {
+        let cand_priority = cand.priority();
+        if cand_priority > 0 {
             priority_remaining = priority_remaining.saturating_sub(1);
         }
         let (score, span, count) = score_epg(&programs);
-        let prefer = (cand.priority, score) > (best_priority, best_score);
+        let prefer = (cand_priority, score) > (best_priority, best_score);
         if prefer {
             best_score = score;
-            best_priority = cand.priority;
+            best_priority = cand_priority;
             best = WalkOutcome {
                 programs,
                 program_count: count,
                 span_hours: span,
-                stream_id: Some(cand.stream_id),
-                host: Some(cand.host),
+                stream_id: Some(cand.stream_id_for_log()),
+                host: Some(cand.host_for_log()),
             };
         }
         // Don't abort while we're still waiting on priority candidates — their
@@ -225,25 +282,154 @@ async fn walk_all_in_parallel(
     best
 }
 
-async fn fetch_one(client: &XtreamClient, cand: &EpgCandidate, timeout: Duration) -> Vec<EpgProgram> {
-    let full = tokio::time::timeout(timeout, client.simple_data_table(&cand.host, cand.stream_id)).await;
-    if let Ok(Ok(p)) = full {
-        if !p.is_empty() {
-            return p;
+async fn fetch_one(
+    client: &XtreamClient,
+    upstream_http: &Client,
+    cand: &EpgCandidate,
+    timeout: Duration,
+) -> Vec<EpgProgram> {
+    match cand {
+        EpgCandidate::Xtream { stream_id, host, .. } => {
+            let full = tokio::time::timeout(timeout, client.simple_data_table(host, *stream_id)).await;
+            if let Ok(Ok(p)) = full {
+                if !p.is_empty() {
+                    return p;
+                }
+            }
+            let short = tokio::time::timeout(timeout, client.short_epg(host, *stream_id, Some(8))).await;
+            match short {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    debug!("EPG fetch failed for stream {} on {}: {}", stream_id, host, e);
+                    Vec::new()
+                }
+                Err(_) => {
+                    debug!("EPG fetch timeout for stream {} on {}", stream_id, host);
+                    Vec::new()
+                }
+            }
+        }
+        EpgCandidate::RtpRadio { code, date } => {
+            match tokio::time::timeout(
+                timeout,
+                fetch_rtp_radio_day(upstream_http, *code, date),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    debug!("RTP radio EPG fetch failed for code {} ({}): {}", code, date, e);
+                    Vec::new()
+                }
+                Err(_) => {
+                    debug!("RTP radio EPG fetch timeout for code {} ({})", code, date);
+                    Vec::new()
+                }
+            }
         }
     }
-    let short = tokio::time::timeout(timeout, client.short_epg(&cand.host, cand.stream_id, Some(8))).await;
-    match short {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            debug!("EPG fetch failed for stream {} on {}: {}", cand.stream_id, cand.host, e);
-            Vec::new()
-        }
-        Err(_) => {
-            debug!("EPG fetch timeout for stream {} on {}", cand.stream_id, cand.host);
-            Vec::new()
+}
+
+/// Fetch RTP radio EPG for one (code, date) pair. The endpoint pattern is
+/// the same one iptv-org/epg uses for RTP TV — just with `radio` in the path
+/// instead of `tv` — and returns morning/afternoon/evening buckets of programs.
+async fn fetch_rtp_radio_day(
+    http: &Client,
+    code: u32,
+    date: &str,
+) -> anyhow::Result<Vec<EpgProgram>> {
+    let url = format!(
+        "https://www.rtp.pt/EPG/json/rtp-channels-page/list-grid/radio/{code}/{date}/lis"
+    );
+    let body = http.get(&url).send().await?.error_for_status()?.text().await?;
+    Ok(parse_rtp_radio_response(&body))
+}
+
+fn parse_rtp_radio_response(body: &str) -> Vec<EpgProgram> {
+    let value: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let result = match value.get("result") {
+        Some(Value::Object(m)) => m,
+        _ => return Vec::new(),
+    };
+    // Buckets are "morning"/"afternoon"/"evening" — concat them in chronological order.
+    let mut entries: Vec<&Value> = Vec::new();
+    for bucket in ["morning", "afternoon", "evening"] {
+        if let Some(Value::Array(arr)) = result.get(bucket) {
+            entries.extend(arr.iter());
         }
     }
+    let mut programs: Vec<EpgProgram> = Vec::new();
+    for entry in entries {
+        let Some(start) = parse_rtp_date_str(entry.get("date").and_then(|d| d.as_str())) else {
+            continue;
+        };
+        let raw_name = entry.get("name").and_then(|d| d.as_str()).unwrap_or("");
+        let raw_desc = entry.get("description").and_then(|d| d.as_str()).unwrap_or("");
+        programs.push(EpgProgram {
+            title: rtp_decode(raw_name),
+            description: rtp_decode(raw_desc),
+            start: Some(start),
+            end: None, // RTP doesn't expose an explicit end; filled below from next start.
+            has_archive: false,
+        });
+    }
+    // Backfill `end` from the next program's start. The final program's end is
+    // left None — the client UI handles None gracefully.
+    for i in 0..programs.len() {
+        if let Some(next_start) = programs.get(i + 1).and_then(|p| p.start) {
+            programs[i].end = Some(next_start);
+        }
+    }
+    programs
+}
+
+fn parse_rtp_date_str(s: Option<&str>) -> Option<OffsetDateTime> {
+    let s = s?;
+    // Format: "2026-05-14 00:00:00", interpreted in Europe/Lisbon. RTP's data
+    // is given in local Lisbon time; we convert to UTC for consistency with
+    // the Xtream EPG path (Xtream returns Unix timestamps which we already
+    // store as UTC).
+    let fmt = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let naive = time::PrimitiveDateTime::parse(s, fmt).ok()?;
+    // Lisbon is UTC+0 in winter, UTC+1 in summer (DST). Approximate with a
+    // fixed +1 offset for May–October, +0 otherwise. The client renders local
+    // time so a one-hour skew on the DST boundary is the worst case.
+    let month: u8 = naive.month().into();
+    let offset = if (4..=10).contains(&month) {
+        time::UtcOffset::from_hms(1, 0, 0).ok()?
+    } else {
+        time::UtcOffset::UTC
+    };
+    Some(naive.assume_offset(offset).to_offset(time::UtcOffset::UTC))
+}
+
+/// RTP's JSON sometimes contains HTML-entity-encoded characters
+/// (`&ccedil;` → ç, etc.) and occasionally Base64-encoded title strings.
+/// For now we just decode common HTML entities; the strings we've seen are
+/// plain text otherwise.
+fn rtp_decode(s: &str) -> String {
+    let s = s
+        .replace("&ccedil;", "ç")
+        .replace("&Ccedil;", "Ç")
+        .replace("&atilde;", "ã")
+        .replace("&Atilde;", "Ã")
+        .replace("&otilde;", "õ")
+        .replace("&Otilde;", "Õ")
+        .replace("&aacute;", "á")
+        .replace("&eacute;", "é")
+        .replace("&iacute;", "í")
+        .replace("&oacute;", "ó")
+        .replace("&uacute;", "ú")
+        .replace("&Aacute;", "Á")
+        .replace("&Eacute;", "É")
+        .replace("&Iacute;", "Í")
+        .replace("&Oacute;", "Ó")
+        .replace("&Uacute;", "Ú")
+        .replace("&amp;", "&");
+    s
 }
 
 fn score_epg(programs: &[EpgProgram]) -> (i64, i64, usize) {

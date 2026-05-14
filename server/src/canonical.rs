@@ -6,7 +6,7 @@ use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::default_order::Curation;
-use crate::xtream::LiveStream;
+use crate::xtream::{ChannelKind, LiveStream};
 
 static SUPERSCRIPTS_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"[\u{1D00}-\u{1DBF}\u{02B0}-\u{02FF}\u{02C0}-\u{02FF}\u{00B2}\u{00B3}\u{00B9}\u{2070}\u{2071}\u{2074}-\u{209F}\u{207A}-\u{207F}]+").unwrap()
@@ -188,6 +188,12 @@ fn prefer_display(a: &str, b: &str) -> String {
 pub struct CanonicalChannel {
     pub key: String,
     pub name: String,
+    /// Tv (from Xtream hosts) vs Radio (from vendored M3U). Drives client-side
+    /// mode-tab filtering and server-side curation/EPG routing. Set on every
+    /// source in `build_canonical`; in practice a single channel is always all
+    /// one kind because the canonical_key namespaces "Antena 1" (radio) away
+    /// from any TV channel that would have the same key.
+    pub kind: ChannelKind,
     pub sources: Vec<CanonicalSource>,
 }
 
@@ -210,6 +216,12 @@ pub struct CanonicalSource {
     pub tv_archive: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tv_archive_duration: Option<u32>,
+    /// Propagated from `LiveStream.direct_source`. None = standard Xtream path
+    /// (proxy builds URL from host × stream_id). Some(url) = self-contained
+    /// source (radio): proxy uses this URL directly, skipping the host loop.
+    /// See `proxy::build_candidates`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_source: Option<String>,
 }
 
 pub fn quality_tier(name: &str) -> Option<&'static str> {
@@ -261,9 +273,19 @@ pub fn build_canonical(streams: &[LiveStream], curation: &Curation) -> Vec<Canon
         let entry = groups.entry(key.clone()).or_insert_with(|| CanonicalChannel {
             key: key.clone(),
             name: display.clone(),
+            kind: st.kind,
             sources: Vec::new(),
         });
         entry.name = prefer_display(&entry.name, &display);
+        // Xtream's `direct_source` is almost always present as `""` (empty
+        // string) on live streams — Some("") would route through the
+        // direct-URL branch in proxy::build_candidates and try to fetch the
+        // empty URL. Coerce empty → None at the canonical boundary so the
+        // direct branch only triggers on legitimately populated URLs (today,
+        // that's radio entries from radio.rs).
+        let direct_source = st.direct_source
+            .clone()
+            .filter(|s| !s.trim().is_empty());
         entry.sources.push(CanonicalSource {
             stream_id: st.stream_id,
             name: st.name.clone(),
@@ -271,6 +293,7 @@ pub fn build_canonical(streams: &[LiveStream], curation: &Curation) -> Vec<Canon
             logo,
             tv_archive,
             tv_archive_duration,
+            direct_source,
         });
     }
 
@@ -327,14 +350,7 @@ mod tests {
         LiveStream {
             stream_id: id,
             name: name.to_string(),
-            stream_icon: String::new(),
-            category_id: String::new(),
-            epg_channel_id: None,
-            added: None,
-            custom_sid: None,
-            tv_archive: None,
-            tv_archive_duration: None,
-            direct_source: None,
+            ..Default::default()
         }
     }
 
@@ -342,14 +358,9 @@ mod tests {
         LiveStream {
             stream_id: id,
             name: name.to_string(),
-            stream_icon: String::new(),
-            category_id: String::new(),
-            epg_channel_id: None,
-            added: None,
-            custom_sid: None,
             tv_archive: Some(serde_json::json!(1)),
             tv_archive_duration: Some(serde_json::json!(days.to_string())),
-            direct_source: None,
+            ..Default::default()
         }
     }
 
@@ -588,14 +599,9 @@ mod tests {
         let stream = LiveStream {
             stream_id: 99,
             name: "RTP 1 HD".into(),
-            stream_icon: String::new(),
-            category_id: String::new(),
-            epg_channel_id: None,
-            added: None,
-            custom_sid: None,
             tv_archive: Some(serde_json::json!(1)),
             tv_archive_duration: Some(serde_json::json!("0")),
-            direct_source: None,
+            ..Default::default()
         };
         let cans = build_canonical(&[stream], &c);
         assert!(!cans[0].sources[0].tv_archive);

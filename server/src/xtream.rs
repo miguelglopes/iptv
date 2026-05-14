@@ -145,7 +145,21 @@ impl UserInfo {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Distinguishes TV channels (sourced from Xtream hosts) from radio stations
+/// (sourced from a vendored M3U). The whole pipeline — canonicalisation, dedup,
+/// blacklist, failover — runs on both kinds identically; this tag exists so the
+/// proxy candidate builder picks `direct_source` for radio instead of building
+/// an `xtream.stream_url(host, stream_id, ext)`, and so the client can filter
+/// the list by mode tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelKind {
+    #[default]
+    Tv,
+    Radio,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LiveStream {
     #[serde(default, deserialize_with = "de_u64_lenient")]
     pub stream_id: u64,
@@ -167,6 +181,11 @@ pub struct LiveStream {
     pub tv_archive_duration: Option<Value>,
     #[serde(default)]
     pub direct_source: Option<String>,
+    /// Not present in Xtream JSON — defaults to Tv via `Default`. Radio source
+    /// loaders explicitly set this to `Radio` when constructing LiveStream
+    /// instances from the vendored M3U.
+    #[serde(default, skip)]
+    pub kind: ChannelKind,
 }
 
 impl LiveStream {

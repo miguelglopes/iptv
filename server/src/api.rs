@@ -9,9 +9,28 @@ use time::OffsetDateTime;
 
 use crate::canonical::quality_tier;
 use crate::codec::Classification;
-use crate::epg::{fetch_epg_for_channel, EpgCandidate};
+use crate::epg::{fetch_epg_for_channel, format_rtp_date, EpgCandidate};
 use crate::state::AppState;
-use crate::xtream::EpgProgram;
+use crate::xtream::{ChannelKind, EpgProgram};
+
+/// Map from canonical channel key (post-canonicalisation) to RTP's per-station
+/// integer code in the radio EPG endpoint. Probed live against rtp.pt:
+/// `/EPG/json/rtp-channels-page/list-grid/radio/{code}/{date}/lis`.
+///
+/// Codes empirically verified 2026-05-14 by program-name matching against
+/// known shows. Channels not in this table get no EPG candidates and fall
+/// back to the existing "no schedule info" empty state — same UX as any TV
+/// channel without EPG.
+fn rtp_radio_code(channel_key: &str) -> Option<u32> {
+    match channel_key {
+        "antena1" => Some(1),
+        "antena2" => Some(2),
+        "antena3" => Some(3),
+        "rdpafrica" => Some(4),
+        "rdpinternacional" => Some(5),
+        _ => None,
+    }
+}
 
 /// Derive `scheme://host[:port]` from the incoming request so URLs we emit
 /// (play_url, segment URLs) resolve back to whichever address the client used
@@ -48,6 +67,7 @@ pub fn request_base_url(headers: &HeaderMap, fallback: Option<&str>) -> String {
 pub struct ChannelDto {
     pub key: String,
     pub name: String,
+    pub kind: ChannelKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,7 +147,15 @@ pub async fn list_channels(
         .enumerate()
         .map(|(orig_i, ch)| {
             let logo = ch.sources.iter().find_map(|s| s.logo.clone());
-            let d = state.curation.rank_of(&ch.key);
+            // Pick the right curation per kind. Radio names live in their own
+            // namespace (see [radio_curation] in config) so an "Antena 3" radio
+            // doesn't borrow rank from a "Antena 3" TV channel that happened to
+            // share the same canonical_key.
+            let curation = match ch.kind {
+                ChannelKind::Radio => &state.radio_curation,
+                ChannelKind::Tv => &state.curation,
+            };
+            let d = curation.rank_of(&ch.key);
             let bucket: u8 = if d.is_some() { 0 } else { 1 };
             let sub = d.unwrap_or(usize::MAX);
             let archive_src = ch.pick_archive_source();
@@ -137,6 +165,7 @@ pub async fn list_channels(
             let dto = ChannelDto {
                 key: ch.key.clone(),
                 name: ch.name.clone(),
+                kind: ch.kind,
                 logo,
                 default_rank: d,
                 source_count: ch.sources.len(),
@@ -164,25 +193,56 @@ pub async fn get_epg(
     let ch = snap
         .lookup(&key)
         .ok_or((StatusCode::NOT_FOUND, format!("unknown channel: {key}")))?;
-    let alive = state.hosts.alive_hosts_ranked();
-    if alive.is_empty() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "no alive hosts".into()));
-    }
-    let mut cands = Vec::new();
-    for src in &ch.sources {
-        let priority = if src.tv_archive { 1 } else { 0 };
-        for host in &alive {
-            if state.blacklist.is_host_bad(host) {
-                continue;
+
+    let cands: Vec<EpgCandidate> = match ch.kind {
+        ChannelKind::Tv => {
+            let alive = state.hosts.alive_hosts_ranked();
+            if alive.is_empty() {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "no alive hosts".into()));
             }
-            cands.push(EpgCandidate {
-                stream_id: src.stream_id,
-                host: host.clone(),
-                priority,
-            });
+            let mut cs = Vec::new();
+            for src in &ch.sources {
+                let priority = if src.tv_archive { 1 } else { 0 };
+                for host in &alive {
+                    if state.blacklist.is_host_bad(host) {
+                        continue;
+                    }
+                    cs.push(EpgCandidate::Xtream {
+                        stream_id: src.stream_id,
+                        host: host.clone(),
+                        priority,
+                    });
+                }
+            }
+            cs
         }
-    }
-    let cached = fetch_epg_for_channel(&state.epg, &state.xtream, &key, cands).await;
+        ChannelKind::Radio => {
+            // Map canonical key → RTP radio code. Stations not in the table
+            // emit zero candidates; the empty Vec triggers the existing
+            // "no schedule info" empty state.
+            match rtp_radio_code(&ch.key) {
+                Some(code) => {
+                    let now = OffsetDateTime::now_utc();
+                    let today = now.date();
+                    let tomorrow = today + time::Duration::days(1);
+                    vec![
+                        EpgCandidate::RtpRadio { code, date: format_rtp_date(today) },
+                        EpgCandidate::RtpRadio { code, date: format_rtp_date(tomorrow) },
+                    ]
+                }
+                None => Vec::new(),
+            }
+        }
+    };
+
+    let cached = fetch_epg_for_channel(
+        &state.epg,
+        &state.xtream,
+        &state.upstream_http,
+        &key,
+        cands,
+    )
+    .await;
     Ok(Json(cached.programs))
 }
 

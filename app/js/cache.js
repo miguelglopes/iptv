@@ -31,62 +31,99 @@ export function clearSearchHistory() {
   try { localStorage.removeItem(SEARCH_KEY); } catch (e) {}
 }
 
-var RECENT_KEY = 'xtream.recent.channels.v1';
+var RECENT_KEY_PREFIX = 'xtream.recent.channels.v1';
 var RECENT_MAX = 100;
 // Timestamp of the most recent play. Auto-resume on boot uses this to decide whether
 // the previously-watched channel is still a relevant default — a recent on the same
 // day says "resume", a recent from last month does not.
-var LAST_PLAY_TS_KEY = 'xtream.recent.last_play_ts.v1';
+var LAST_PLAY_TS_KEY_PREFIX = 'xtream.recent.last_play_ts.v1';
 
-// In-memory cache of the parsed recents list. visibleItems / sortByRecency call
-// loadRecentChannels several times per render — without this, every call re-parsed
-// the JSON. Invalidated whenever we write through (push / remove / clear).
-var recentCache = null;
+// Per-mode recents: each mode has its own list under a suffixed localStorage key.
+// Switching tabs swaps the recents seamlessly. The active mode itself is persisted
+// separately so the next boot resumes into the right list (see loadActiveMode).
+function recentKeyFor(mode) { return RECENT_KEY_PREFIX + '.' + (mode || 'tv'); }
+function lastPlayTsKeyFor(mode) { return LAST_PLAY_TS_KEY_PREFIX + '.' + (mode || 'tv'); }
 
-export function loadRecentChannels() {
-  if (recentCache) return recentCache;
+// In-memory cache of the parsed recents list, scoped by mode. visibleItems /
+// sortByRecency call loadRecentChannels several times per render — without this,
+// every call re-parsed the JSON. Invalidated whenever we write through.
+var recentCache = {};
+
+export function loadRecentChannels(mode) {
+  if (recentCache[mode]) return recentCache[mode];
   try {
-    var v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
-    recentCache = Array.isArray(v) ? v : [];
+    var v = JSON.parse(localStorage.getItem(recentKeyFor(mode)) || '[]');
+    recentCache[mode] = Array.isArray(v) ? v : [];
   } catch (e) {
-    recentCache = [];
+    recentCache[mode] = [];
   }
-  return recentCache;
+  return recentCache[mode];
 }
 
-export function pushRecentChannel(channelKey) {
+export function pushRecentChannel(channelKey, mode) {
   if (!channelKey) return;
-  var r = loadRecentChannels().filter(function (k) { return k !== channelKey; });
+  var r = loadRecentChannels(mode).filter(function (k) { return k !== channelKey; });
   r.unshift(channelKey);
   if (r.length > RECENT_MAX) r.length = RECENT_MAX;
-  recentCache = r;
-  try { localStorage.setItem(RECENT_KEY, JSON.stringify(r)); } catch (e) {}
-  try { localStorage.setItem(LAST_PLAY_TS_KEY, String(Date.now())); } catch (e) {}
+  recentCache[mode] = r;
+  try { localStorage.setItem(recentKeyFor(mode), JSON.stringify(r)); } catch (e) {}
+  try { localStorage.setItem(lastPlayTsKeyFor(mode), String(Date.now())); } catch (e) {}
 }
 
-export function removeRecentChannel(channelKey) {
+export function removeRecentChannel(channelKey, mode) {
   if (!channelKey) return false;
-  var cur = loadRecentChannels();
+  var cur = loadRecentChannels(mode);
   var r = cur.filter(function (k) { return k !== channelKey; });
   if (r.length === cur.length) return false;
-  recentCache = r;
-  try { localStorage.setItem(RECENT_KEY, JSON.stringify(r)); } catch (e) {}
+  recentCache[mode] = r;
+  try { localStorage.setItem(recentKeyFor(mode), JSON.stringify(r)); } catch (e) {}
   return true;
 }
 
-export function clearRecentChannels() {
-  recentCache = [];
-  try { localStorage.removeItem(RECENT_KEY); } catch (e) {}
-  try { localStorage.removeItem(LAST_PLAY_TS_KEY); } catch (e) {}
+export function clearRecentChannels(mode) {
+  // If a mode is passed, clear only that one. Settings "Clear recent channels"
+  // calls without a mode → clear both, plus the legacy unsuffixed entries from
+  // before per-mode recents existed.
+  if (mode) {
+    recentCache[mode] = [];
+    try { localStorage.removeItem(recentKeyFor(mode)); } catch (e) {}
+    try { localStorage.removeItem(lastPlayTsKeyFor(mode)); } catch (e) {}
+    return;
+  }
+  recentCache = {};
+  try {
+    localStorage.removeItem(recentKeyFor('tv'));
+    localStorage.removeItem(recentKeyFor('radio'));
+    localStorage.removeItem(lastPlayTsKeyFor('tv'));
+    localStorage.removeItem(lastPlayTsKeyFor('radio'));
+    // Legacy unsuffixed keys from before per-mode recents — clean up on first
+    // use so they don't sit forever.
+    localStorage.removeItem(RECENT_KEY_PREFIX);
+    localStorage.removeItem(LAST_PLAY_TS_KEY_PREFIX);
+  } catch (e) {}
 }
 
-export function loadLastPlayTimestamp() {
+export function loadLastPlayTimestamp(mode) {
   try {
-    var raw = localStorage.getItem(LAST_PLAY_TS_KEY);
+    var raw = localStorage.getItem(lastPlayTsKeyFor(mode));
     if (!raw) return 0;
     var n = parseInt(raw, 10);
     return isFinite(n) ? n : 0;
   } catch (e) { return 0; }
+}
+
+// Last-active mode pointer. tryAutoResume() reads this so boot resumes into
+// the mode the user last had open, not arbitrarily into 'tv'. Saved by the
+// mode-switch handler in main.js.
+var MODE_KEY = 'xtream.active.mode.v1';
+export function loadActiveMode() {
+  try {
+    var v = localStorage.getItem(MODE_KEY);
+    return (v === 'tv' || v === 'radio') ? v : 'tv';
+  } catch (e) { return 'tv'; }
+}
+export function saveActiveMode(mode) {
+  try { localStorage.setItem(MODE_KEY, mode); } catch (e) {}
 }
 
 var CHANNELS_KEY = 'iptv.channels.v1';

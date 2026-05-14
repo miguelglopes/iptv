@@ -96,3 +96,23 @@ provider_boosts = [
 # more accented variant name wins.
 [curation.display_overrides]
 # benfica = "Benfica TV"
+
+# Radio mode — parse a vendored M3U at every catalog refresh, merge resulting
+# kind=Radio channels into the canonical list. Disabled by default; flip to true
+# to surface a 📻 RADIO tab in the channel list alongside 📺 TV. v1 keeps only
+# HLS (.m3u8) entries from the M3U; Icecast/MP3 entries are dropped silently.
+# Recommended source: vendor activistpt/IPTV/radios.m3u as `radios.m3u` next to
+# config.toml.
+[radio]
+enabled = false
+m3u_path = "radios.m3u"
+
+# Separate curation namespace for radio channels — same shape as [curation],
+# independent so radio names don't collide with TV aliases. Empty defaults give
+# alphabetical-by-display-name order.
+[radio_curation]
+order = [
+    # "Antena 1", "Antena 2", "Antena 3", ...
+]
+[radio_curation.aliases]
+[radio_curation.display_overrides]

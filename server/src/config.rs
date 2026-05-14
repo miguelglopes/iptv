@@ -25,7 +25,32 @@ pub struct Config {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub curation: CurationConfig,
+    /// Optional radio block. When present + enabled, the server parses the
+    /// referenced M3U at every catalog refresh and merges the resulting
+    /// `kind = Radio` streams into the canonical channel list.
+    #[serde(default)]
+    pub radio: RadioConfig,
+    /// Curation block for radio channels. Independent from `[curation]` so
+    /// the radio order / aliases / display_overrides don't have to share a
+    /// namespace with TV. Reuses the same `CurationConfig` type — no schema
+    /// fork.
+    #[serde(default)]
+    pub radio_curation: CurationConfig,
 }
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RadioConfig {
+    /// If false (default), no radio is loaded and the kind=Radio channel
+    /// list is empty. Lets us land the code with the feature dark.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the vendored M3U file, relative to the server binary's CWD.
+    /// Defaults to `radios.m3u` next to `config.toml`.
+    #[serde(default = "default_radio_m3u_path")]
+    pub m3u_path: PathBuf,
+}
+
+fn default_radio_m3u_path() -> PathBuf { PathBuf::from("radios.m3u") }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct CurationConfig {

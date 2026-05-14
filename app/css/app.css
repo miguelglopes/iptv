@@ -270,6 +270,65 @@ body.mini.panel-player .top-slot {
 .k-b { color: #66b3ff; }
 .k-r { color: #ff6666; }
 
+/* Mode tabs (TV / RADIO) — live INSIDE .header-top alongside the h1 and hint
+   so they don't eat a separate row of vertical space. Compact size to match
+   the heading bar height. Same visual language as .list-item: amber "played"
+   tint for the active tab, gold focus ring if the tab row ever gains focus
+   (not wired today; digit shortcuts 1/2 and pointer clicks are sufficient). */
+.mode-tabs {
+  display: inline-flex;
+  gap: 6px;
+}
+.tab {
+  padding: 4px 12px;
+  border-radius: 4px;
+  background: rgba(20, 20, 31, 0.72);
+  border: 2px solid transparent;
+  color: #d4d4e0;
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.tab .icon { font-size: 15px; }
+.tab .count {
+  color: #aaaabb;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+.tab.active {
+  background: rgba(48, 40, 22, 0.78);
+  color: #ffcc66;
+}
+.tab.active .count { color: #d8b56b; }
+.tab:hover { border-color: rgba(255, 204, 102, 0.45); }
+.tab.focused {
+  border-color: #ffcc66;
+  background: rgba(40, 34, 58, 0.92);
+  color: #ffffff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* Channel-row logo. Lazy-loaded via <img loading="lazy" onerror="this.remove()">
+   so failing URLs (some Bauer/IOL logos time out) silently fall back to
+   text-only. Same template for TV and radio — TV's `ChannelDto.logo` was
+   already populated by the server, this just renders it.
+   max-width + height:auto preserve each logo's natural aspect ratio: horizontal
+   banners (RTP 2000×568) render wide, square logos (Cidade FM) render at their
+   natural square within the cap. No fixed box → no letterboxing artefacts. */
+.list-item img.logo {
+  height: auto;
+  width: auto;
+  max-height: 36px;
+  max-width: 72px;
+  object-fit: contain;
+  margin-right: 14px;
+  flex-shrink: 0;
+}
+
 /* EPG / Guide panel — sits inside the same right aside the settings shares. */
 .epg-channel {
   font-size: 24px;

@@ -16,6 +16,10 @@ use crate::xtream::XtreamClient;
 pub struct AppState {
     pub config: Arc<Config>,
     pub curation: Arc<Curation>,
+    /// Second Curation instance from `[radio_curation]`. Same type, same
+    /// schema — independent namespace so radio names don't collide with TV
+    /// curation aliases. Looked up by `kind` in `api::list_channels`.
+    pub radio_curation: Arc<Curation>,
     pub xtream: XtreamClient,
     pub hosts: Arc<HostState>,
     pub catalog: Arc<CatalogState>,
@@ -34,6 +38,7 @@ impl AppState {
             Duration::from_secs(8),
         )?;
         let curation = Arc::new(Curation::from_config(&config.curation)?);
+        let radio_curation = Arc::new(Curation::from_config(&config.radio_curation)?);
         let hosts = Arc::new(HostState::new(&config.xtream.hosts));
         let catalog = Arc::new(CatalogState::new());
         let epg = Arc::new(EpgState::new(config.epg.clone()));
@@ -51,6 +56,7 @@ impl AppState {
         Ok(Arc::new(Self {
             config: Arc::new(config),
             curation,
+            radio_curation,
             xtream,
             hosts,
             catalog,

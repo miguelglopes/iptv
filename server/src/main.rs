@@ -23,6 +23,7 @@ mod epg;
 mod hosts;
 mod play_log;
 mod proxy;
+mod radio;
 mod state;
 mod xtream;
 
@@ -67,6 +68,8 @@ async fn main() -> Result<()> {
         state.xtream.clone(),
         config.catalog.clone(),
         Arc::clone(&state.curation),
+        Arc::clone(&state.radio_curation),
+        config.radio.clone(),
     );
 
     let app = router(state.clone());

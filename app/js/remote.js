@@ -14,7 +14,10 @@ var NAMES = {
   // PageUp/PageDown as channelUp/Down on laptop.
   33: 'channelUp', 34: 'channelDown',
   // Home / End → jump to top / bottom of list.
-  36: 'home', 35: 'end'
+  36: 'home', 35: 'end',
+  // Digits 1 / 2 toggle the channel-list mode (TV / RADIO). The only new
+  // bindings the radio feature adds; all four colour buttons are taken.
+  49: 'mode1', 50: 'mode2'
 };
 
 // Letter aliases for the colour buttons (laptop only). Suppressed while typing into

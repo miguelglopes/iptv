@@ -5,7 +5,8 @@ import {
   loadRecentChannels, pushRecentChannel, removeRecentChannel, clearRecentChannels,
   loadChannelsCache, saveChannelsCache, clearChannelsCache,
   loadEpg, saveEpg,
-  loadLastPlayTimestamp
+  loadLastPlayTimestamp,
+  loadActiveMode, saveActiveMode
 } from './cache.js';
 import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, adminClearBlacklist, adminClearDemoted, adminClearAllSources } from './api.js';
 // Namespace import so the field stays optional — older config.js files that pre-date
@@ -26,7 +27,9 @@ var REPLAY_SVG = '<svg class="replay-icon" viewBox="0 0 24 24" fill="currentColo
 
 var state = {
   view: 'channels',       // 'channels' | 'playing'
-  channels: [],           // [{ key, name, logo?, default_rank?, source_count, play_url }]
+  channels: [],           // [{ key, name, kind, logo?, default_rank?, source_count, play_url }]
+  mode: loadActiveMode(), // 'tv' | 'radio' — filters `channels` by kind. Persisted so boot
+                          // resumes into the last-used mode (see tryAutoResume).
   focusIdx: 0,
   playing: null,          // { channel }
   mini: false,            // playing in a small corner window — list/search/settings remain interactive
@@ -488,7 +491,14 @@ function listHtml(items) {
     } else {
       var played = it.played ? ' played' : '';
       var marker = it.inRecentsSection ? '<span class="recent-dot">●</span> ' : '';
-      html += '<div class="list-item' + played + focus + '" data-i="' + i + '">' + marker + esc(it.channel.name) + '</div>';
+      // Logo: <img loading="lazy" onerror="this.remove()">. Same template for
+      // TV and radio. TV's ChannelDto.logo was already populated by the server
+      // (from Xtream's stream_icon) and just sat unused — this renders it.
+      // onerror = self-remove so dead URLs degrade to text-only without flicker.
+      var logo = it.channel.logo
+        ? '<img class="logo" src="' + esc(it.channel.logo) + '" loading="lazy" onerror="this.remove()">'
+        : '';
+      html += '<div class="list-item' + played + focus + '" data-i="' + i + '">' + marker + logo + esc(it.channel.name) + '</div>';
     }
   }
   return html;
@@ -501,10 +511,56 @@ function listHtml(items) {
 // through the same activate() path so behaviour is identical.
 var RECENTS_SECTION_MAX = 8;
 
+// Filter state.channels by the active mode tab (TV or radio). The mode is the
+// *only* gate between TV and radio rendering — every other rendering path
+// (recents, search, list-item template, scroll, focus) is shared.
+function inMode(c) {
+  var kind = c.kind || 'tv';
+  return kind === state.mode;
+}
+
 function visibleChannels() {
-  if (!state.search) return state.channels.slice();
+  var base = state.channels.filter(inMode);
+  if (!state.search) return base;
   var s = state.search.toLowerCase();
-  return state.channels.filter(function (c) { return c.name.toLowerCase().indexOf(s) >= 0; });
+  return base.filter(function (c) { return c.name.toLowerCase().indexOf(s) >= 0; });
+}
+
+// Switch mode tab. Resets focus to the top of the new list (otherwise focusIdx
+// would point at an arbitrary row of the previously-active list). Persists the
+// new mode so the next boot resumes into it. Closes any open search (the
+// search history is shared across modes, so a typed query that was filtering
+// TV channels would silently filter the radio list to zero matches).
+function setMode(newMode) {
+  if (newMode !== 'tv' && newMode !== 'radio') return;
+  if (state.mode === newMode) return;
+  state.mode = newMode;
+  saveActiveMode(newMode);
+  state.search = null;
+  state.focusIdx = 0;
+  state.epg.focusKey = null;
+  state.epg.rowIdx = -1;
+  updateModeTabs();
+  updateBodyClass();
+  renderList();
+}
+
+// Paint the .active class on whichever tab matches state.mode and refresh the
+// per-tab channel counts. Called from renderList so the counts stay in sync
+// with state.channels.
+function updateModeTabs() {
+  var tabs = document.querySelectorAll('.mode-tabs .tab');
+  var counts = { tv: 0, radio: 0 };
+  for (var i = 0; i < state.channels.length; i++) {
+    var k = state.channels[i].kind || 'tv';
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  for (var t = 0; t < tabs.length; t++) {
+    var m = tabs[t].getAttribute('data-mode');
+    tabs[t].classList.toggle('active', m === state.mode);
+    var cspan = tabs[t].querySelector('.count');
+    if (cspan) cspan.textContent = counts[m] ? '(' + counts[m] + ')' : '';
+  }
 }
 
 function visibleItems() {
@@ -512,7 +568,7 @@ function visibleItems() {
     var h = loadSearchHistory();
     if (h.length) return h.map(function (t) { return { kind: 'recent', text: t }; });
   }
-  var recent = loadRecentChannels();
+  var recent = loadRecentChannels(state.mode);
   var played = {};
   for (var i = 0; i < recent.length; i++) played[recent[i]] = true;
   var channels = visibleChannels();
@@ -606,6 +662,7 @@ function setHint(text) {
 function renderList() {
   var listEl = document.getElementById('list');
   if (!listEl) return;
+  updateModeTabs();
   var items = visibleItems();
   validateFocus(items);
   listEl.innerHTML = listHtml(items);
@@ -805,7 +862,7 @@ function captureZapList() {
 function play(channel) {
   if (state.search) pushSearchHistory(state.search);
   captureZapList();
-  pushRecentChannel(channel.key);
+  pushRecentChannel(channel.key, state.mode);
   // The recents section was just bumped — re-anchor focus on this channel so it lines
   // up in the list when we come back to mini. Without this, state.focusIdx points to
   // wherever the click happened and now refers to a different row (the recents header
@@ -827,14 +884,20 @@ var autoResumeTried = false;
 function tryAutoResume() {
   if (autoResumeTried || userInteracted || state.playing || state.error) return;
   if (!state.channels.length) return;
-  var recents = loadRecentChannels();
+  // state.mode was initialised from loadActiveMode() at state-init time, so the
+  // recents we pull and the channel we resume into are both from the last
+  // mode the user had open.
+  var recents = loadRecentChannels(state.mode);
   if (!recents.length) return;
-  var lastTs = loadLastPlayTimestamp();
+  var lastTs = loadLastPlayTimestamp(state.mode);
   if (!lastTs || (Date.now() - lastTs) > AUTO_RESUME_MAX_AGE_MS) return;
   var targetKey = recents[0];
   var ch = null;
   for (var i = 0; i < state.channels.length; i++) {
-    if (state.channels[i].key === targetKey) { ch = state.channels[i]; break; }
+    // Filter by mode too so a radio canonical key that happens to collide with
+    // a TV key can't auto-resume the wrong channel.
+    var c = state.channels[i];
+    if (c.key === targetKey && (c.kind || 'tv') === state.mode) { ch = c; break; }
   }
   if (!ch) return;
   autoResumeTried = true;
@@ -857,7 +920,7 @@ function playCatchup(channel, program) {
     return;
   }
   captureZapList();
-  pushRecentChannel(channel.key);
+  pushRecentChannel(channel.key, state.mode);
   state.focusIdx = focusIdxForChannel(channel.key);
   var atIso = program.start.toISOString();
   var durationMin = Math.ceil((program.end.getTime() - program.start.getTime()) / 60000) + 5;
@@ -934,7 +997,7 @@ function commitZap() {
   // Order matters: pushRecentChannel BEFORE focusIdxForChannel, so the snap sees the
   // new recents-section row at the top and anchors there. If we snapped first, the
   // recents list would grow underneath us and state.focusIdx would point one row off.
-  pushRecentChannel(ch.key);
+  pushRecentChannel(ch.key, state.mode);
   state.focusIdx = focusIdxForChannel(ch.key);
   updateBodyClass();
   // No setOverlay here — the bottom-centre banner already carries channel name + LIVE,
@@ -1320,7 +1383,7 @@ function unrecent() {
   var it = items[state.focusIdx];
   if (!it || it.kind !== 'channel' || !it.played) return;
   var ch = it.channel;
-  if (!removeRecentChannel(ch.key)) return;
+  if (!removeRecentChannel(ch.key, state.mode)) return;
   // Stay anchored on the same conceptual channel — focusIdxForChannel falls back to
   // its all-channels row when the recents-section copy disappears.
   state.focusIdx = focusIdxForChannel(ch.key);
@@ -1445,6 +1508,8 @@ setRemoteHandlers({
   channelDown: function () { (state.playing && !state.mini) ? zap(1) : moveFocus(1); },
   home: function () { jumpToEdge(false); },
   end: function () { jumpToEdge(true); },
+  mode1: function () { setMode('tv'); },
+  mode2: function () { setMode('radio'); },
   any: function () {
     userInteracted = true;
     // Suppress the bottom-right key legend while the zap banner is visible — they
@@ -1497,6 +1562,12 @@ document.addEventListener('click', function (e) {
     }
     return;
   }
+  // Mode-tabs tap → switch TV/RADIO. Same path the digit keys trigger.
+  var tabEl = e.target.closest('.mode-tabs .tab[data-mode]');
+  if (tabEl) {
+    setMode(tabEl.getAttribute('data-mode'));
+    return;
+  }
   // Header key-hint chips → same actions the colored remote keys trigger.
   var chip = e.target.closest('.keymap-inline .chip[data-action]');
   if (chip) {
@@ -1504,6 +1575,7 @@ document.addEventListener('click', function (e) {
     if (action === 'search') toggleSearch();
     else if (action === 'unrecent') unrecent();
     else if (action === 'ok') activate();
+    else if (action === 'mode') setMode(state.mode === 'tv' ? 'radio' : 'tv');
     return;
   }
   // Channel tap: focus that row and play.
