@@ -430,19 +430,38 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
         kb.cmp(&ka)
     });
 
+    // Last-known-good promotion. LKG only wins when its measurement is at
+    // least as good as the current top candidate — otherwise the
+    // measurement-driven ranking is preferred. Without this check, an old
+    // LKG pinned to an unmeasured host (set before the bootstrap sweep
+    // populated samples) would override the new ranking forever; the plan
+    // calls for clear_last_known_good() after sweep completion, but with
+    // max_connections=1 the sweep may not finish cleanly, so we need this
+    // belt-and-braces too.
     if let Some(lkg) = state.blacklist.last_known_good(&channel.key) {
         let demoted_lkg = state.blacklist.is_url_demoted(&lkg);
-        if let Some(pos) = fresh.iter().position(|c| c.url == lkg) {
-            let item = fresh.remove(pos);
-            fresh.insert(0, item);
-        } else if !demoted_lkg && !state.blacklist.is_url_failed(&lkg) {
-            let host = derive_host(&lkg).unwrap_or_default();
-            // Recover stream_id from the URL when possible. For radio LKG
-            // URLs (which don't match the Xtream pattern), 0 is the
-            // unavoidable fallback — but radio LKG is rarely useful for
-            // ranking since radio channels have one source each.
-            let stream_id = stream_id_from_source_url(&lkg).unwrap_or(0);
-            fresh.insert(0, Candidate { url: lkg, host, stream_id });
+        if !demoted_lkg && !state.blacklist.is_url_failed(&lkg) {
+            let lkg_host = derive_host(&lkg).unwrap_or_default();
+            let lkg_stream_id = stream_id_from_source_url(&lkg).unwrap_or(0);
+            let lkg_rank =
+                source_rank_key(lkg_stream_id, &lkg_host, &state.measured, &log_snap);
+            let top_rank = fresh.first().map(|c| {
+                source_rank_key(c.stream_id, &c.host, &state.measured, &log_snap)
+            });
+            // LKG promoted if competitive with rank-key top, or if no
+            // candidates exist (then LKG is all we have).
+            let lkg_competitive = match top_rank {
+                Some(top) => lkg_rank >= top,
+                None => true,
+            };
+            if lkg_competitive {
+                if let Some(pos) = fresh.iter().position(|c| c.url == lkg) {
+                    let item = fresh.remove(pos);
+                    fresh.insert(0, item);
+                } else {
+                    fresh.insert(0, Candidate { url: lkg, host: lkg_host, stream_id: lkg_stream_id });
+                }
+            }
         }
     }
 

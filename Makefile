@@ -33,7 +33,7 @@ ssh:
 	@./scripts/tv-ssh
 
 logs:
-	@./scripts/tv-ssh "tail -f /var/log/messages"
+	@./scripts/tv-ssh "if [ -f /var/log/messages ]; then tail -f /var/log/messages; else journalctl -f -t WebAppMgr -t com.mgl.xtream 2>/dev/null || journalctl -f --no-pager; fi"
 
 clean:
 	@./scripts/tv-ssh "rm -rf /media/developer/apps/usr/palm/applications/$(APP_ID)"
