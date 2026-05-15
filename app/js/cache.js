@@ -126,7 +126,14 @@ export function saveActiveMode(mode) {
   try { localStorage.setItem(MODE_KEY, mode); } catch (e) {}
 }
 
-var CHANNELS_KEY = 'iptv.channels.v1';
+// v1 cached channels without `kind` (pre-radio-mode). Bump to v2 when the
+// schema gained `kind`, so existing clients (notably the TV, which auto-
+// resumes from cache on every boot) invalidate their stale entries and
+// refetch. Without this bump, the channel list renders empty: the kind-
+// filtered tabs (TV / RADIO) match nothing because every cached row's
+// `kind` is undefined.
+var CHANNELS_KEY = 'iptv.channels.v2';
+var LEGACY_CHANNELS_KEYS = ['iptv.channels.v1'];
 
 export function loadChannelsCache() {
   try {
@@ -141,10 +148,17 @@ export function loadChannelsCache() {
 export function saveChannelsCache(channels) {
   if (!Array.isArray(channels)) return;
   try { localStorage.setItem(CHANNELS_KEY, JSON.stringify({ ts: Date.now(), channels: channels })); } catch (e) {}
+  // Best-effort: clean up older cache keys so we don't leak quota.
+  for (var i = 0; i < LEGACY_CHANNELS_KEYS.length; i++) {
+    try { localStorage.removeItem(LEGACY_CHANNELS_KEYS[i]); } catch (e) {}
+  }
 }
 
 export function clearChannelsCache() {
   try { localStorage.removeItem(CHANNELS_KEY); } catch (e) {}
+  for (var i = 0; i < LEGACY_CHANNELS_KEYS.length; i++) {
+    try { localStorage.removeItem(LEGACY_CHANNELS_KEYS[i]); } catch (e) {}
+  }
 }
 
 // Per-channel EPG snapshot for instant paint on focus. Server is authoritative; this
