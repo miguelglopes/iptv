@@ -15,6 +15,9 @@ services:
       # TV uses) with a same-origin config so the browser UI talks to this very
       # container regardless of how it was reached.
       - ./app/js/config.docker.js:/srv/app/js/config.js:ro
+      # Per-deploy state for the measured-quality cache. Read-write so the
+      # flush task can persist the sample buffer across container rebuilds.
+      - ./server/data:/srv/iptv-proxy/data
     environment:
       RUST_LOG: ${RUST_LOG:-info,iptv_proxy=info}
     healthcheck:

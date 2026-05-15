@@ -6,6 +6,7 @@ app/js/config.js
 .idea/
 .vscode/
 server/config.toml
+server/data/
 server/target/
 .claude/
 .playwright-mcp/

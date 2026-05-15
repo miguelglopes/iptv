@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,15 +19,51 @@ use crate::canonical::CanonicalChannel;
 #[cfg(test)]
 use crate::canonical::CanonicalSource;
 use crate::codec::{classify_ts_chunk, strip_subtitle_pids};
-use crate::play_log::{AttemptOutcome, PlayAttempt, PlayEvent};
+use crate::measured::{MeasuredQuality, MeasuredStore};
+use crate::play_log::{AttemptOutcome, PlayAttempt, PlayEvent, PlayLog};
+use crate::probe::is_placeholder_manifest;
 use crate::state::AppState;
 
 const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
+
+/// Flip to `false` if pre-flight check 3 (see docs/plan-measured-quality.md)
+/// reveals the B4 chipset can't decode HEVC main10. Inline constant rather
+/// than config plumbing — same operational cost (change + redeploy) and
+/// one less moving part. Setting to false makes the rank key treat 10-bit
+/// HEVC as 8-bit SDR (drops HDR rank), demoting it relative to working H.264.
+const TV_DECODES_HEVC_MAIN10: bool = true;
+
+/// RAII counter for in-flight `/play/*` requests. The bootstrap sweep checks
+/// this and yields when non-zero so it doesn't compete with users for the
+/// provider's connection slots. Owns an Arc clone so it can outlive any
+/// particular borrow of AppState.
+struct ActivePlayGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ActivePlayGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter: Arc::clone(counter) }
+    }
+}
+
+impl Drop for ActivePlayGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Candidate {
     url: String,
     host: String,
+    /// Upstream stream_id. For Xtream sources, parsed from the URL pattern.
+    /// For radio (`direct_source`), copied from `CanonicalSource.stream_id`
+    /// (a synthetic high-bit-set value); radio URLs don't carry it in their
+    /// path, so propagation through `Candidate` is the only way the
+    /// measurement layer can key by `(stream_id, host)`.
+    stream_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +75,17 @@ struct SegmentToken {
     c: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     probe: bool,
+    /// Segment duration in seconds, parsed from the upstream's `#EXTINF:`
+    /// tag at rewrite time. Used by `proxy_segment` to compute per-segment
+    /// kbps for the per-play bitrate EWMA. Absent on init segments and on
+    /// any path that doesn't go through `rewrite_playlist` (e.g. test mints).
+    #[serde(default, rename = "d", skip_serializing_if = "Option::is_none")]
+    d: Option<f32>,
+    /// Upstream host that served the playlist. Used to key per-(stream_id,
+    /// host) measurement samples. Same lifecycle as `d`: set by
+    /// `rewrite_playlist`, absent on older tokens.
+    #[serde(default, rename = "h", skip_serializing_if = "Option::is_none")]
+    h: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -90,6 +138,16 @@ pub async fn play_playlist(
 ) -> Result<Response, (StatusCode, String)> {
     let key = name.trim_end_matches(".m3u8").trim_end_matches(".ts");
     let probe_request = params.probe;
+    // Track active real plays so the bootstrap sweep can yield to user
+    // requests for the provider's connection slots. The probe-mode requests
+    // (capability probe) don't take this guard — they're cheap and we don't
+    // want them gating sweep starts. The guard drops at function exit
+    // regardless of which path returns the response.
+    let _active_play_guard = if probe_request {
+        None
+    } else {
+        Some(ActivePlayGuard::new(&state.active_plays))
+    };
     let catchup_request = parse_catchup_params(&params)?;
     let public_base = request_base_url(&headers, state.config.public_base_url.as_deref());
     // Use the client-supplied pid when present so feedback can blame the same
@@ -319,7 +377,11 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
             if !host.is_empty() && state.blacklist.is_host_bad(&host) {
                 continue;
             }
-            let cand = Candidate { url: direct.clone(), host };
+            let cand = Candidate {
+                url: direct.clone(),
+                host,
+                stream_id: src.stream_id,
+            };
             if state.blacklist.is_url_demoted(direct) {
                 demoted.push(cand);
             } else {
@@ -357,6 +419,17 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
         demoted.retain(|c| !fresh_urls.contains(c.url.as_str()));
     }
 
+    // Measurement-driven rank. Snapshot the play log once (not per-candidate)
+    // so success_score is O(candidates × history) rather than O(candidates²).
+    // Stable sort preserves the existing host-latency tie-break order for
+    // rank-equal candidates.
+    let log_snap = state.play_log.snapshot();
+    fresh.sort_by(|a, b| {
+        let ka = source_rank_key(a.stream_id, &a.host, &state.measured, &log_snap);
+        let kb = source_rank_key(b.stream_id, &b.host, &state.measured, &log_snap);
+        kb.cmp(&ka)
+    });
+
     if let Some(lkg) = state.blacklist.last_known_good(&channel.key) {
         let demoted_lkg = state.blacklist.is_url_demoted(&lkg);
         if let Some(pos) = fresh.iter().position(|c| c.url == lkg) {
@@ -364,7 +437,12 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
             fresh.insert(0, item);
         } else if !demoted_lkg && !state.blacklist.is_url_failed(&lkg) {
             let host = derive_host(&lkg).unwrap_or_default();
-            fresh.insert(0, Candidate { url: lkg, host });
+            // Recover stream_id from the URL when possible. For radio LKG
+            // URLs (which don't match the Xtream pattern), 0 is the
+            // unavoidable fallback — but radio LKG is rarely useful for
+            // ranking since radio channels have one source each.
+            let stream_id = stream_id_from_source_url(&lkg).unwrap_or(0);
+            fresh.insert(0, Candidate { url: lkg, host, stream_id });
         }
     }
 
@@ -381,17 +459,29 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
         for src in &channel.sources {
             if let Some(direct) = &src.direct_source {
                 let host = derive_host(direct).unwrap_or_default();
-                fresh.push(Candidate { url: direct.clone(), host });
+                fresh.push(Candidate {
+                    url: direct.clone(),
+                    host,
+                    stream_id: src.stream_id,
+                });
             } else if !src.origin_host.is_empty() {
                 let url = state.xtream.stream_url(&src.origin_host, src.stream_id, "m3u8");
-                fresh.push(Candidate { url, host: src.origin_host.clone() });
+                fresh.push(Candidate {
+                    url,
+                    host: src.origin_host.clone(),
+                    stream_id: src.stream_id,
+                });
             } else {
                 // No origin_host (legacy data) — fall back to fanning across
                 // alive hosts. Should only happen during the cold-start
                 // window between probe and first multi-host catalog refresh.
                 for host in &alive {
                     let url = state.xtream.stream_url(host, src.stream_id, "m3u8");
-                    fresh.push(Candidate { url, host: host.clone() });
+                    fresh.push(Candidate {
+                        url,
+                        host: host.clone(),
+                        stream_id: src.stream_id,
+                    });
                 }
             }
         }
@@ -399,6 +489,136 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
     }
 
     fresh
+}
+
+// --- Rank-key helpers ------------------------------------------------------
+//
+// Lexicographic comparison key for sorting candidates. Bigger is better.
+// Slots (descending priority):
+//   0. measured marker (1 if we have a measurement, 0 otherwise)
+//   1. success_bucket  — history-aware reliability for this (stream_id, host)
+//   2. hdr_rank        — HDR ahead of bpp (TV is OLED)
+//   3. bpp_bucket      — bitrate-per-pixel ahead of raw resolution (starved
+//                        1080p loses to well-fed 720p)
+//   4. pixels          — resolution as in-bucket tiebreaker
+//   5. codec_rank      — av1 > hevc > h264 > mpeg2
+//   6. fps_rank        — 50/60 > 25/30
+type RankKey = (i32, i32, i32, i32, i64, i32, i32);
+
+fn hdr_rank(pix_fmt: Option<&str>, transfer: Option<&str>) -> i32 {
+    let ten_bit = matches!(pix_fmt, Some(p) if p.contains("10"));
+    let hdr = matches!(transfer, Some("smpte2084") | Some("arib-std-b67"));
+    match (ten_bit, hdr) {
+        (_, true) => 2,
+        (true, _) => 1,
+        _ => 0,
+    }
+}
+
+fn bpp_bucket(kbps: Option<u32>, w: u32, h: u32) -> i32 {
+    let pixels_k = (w as u64 * h as u64) / 1000;
+    if pixels_k == 0 {
+        return -1;
+    }
+    match kbps {
+        Some(b) => {
+            // bpp in hundredths of kbps/kpx (avoids floats; integer math).
+            let bpp_hundredths = (b as u64 * 100) / pixels_k;
+            match bpp_hundredths {
+                x if x >= 300 => 4, // ~3.0 kbps/kpx — well-fed
+                x if x >= 200 => 3,
+                x if x >= 100 => 2,
+                x if x >= 50 => 1,
+                _ => 0, // starved
+            }
+        }
+        None => -1,
+    }
+}
+
+fn codec_rank(c: Option<&str>) -> i32 {
+    match c {
+        Some("av1") => 4,
+        Some("hevc") | Some("h265") => 3,
+        Some("h264") => 2,
+        Some("mpeg2video") => 1,
+        _ => 0,
+    }
+}
+
+fn fps_rank(f: Option<f32>) -> i32 {
+    match f {
+        Some(v) if v >= 48.0 => 2,
+        Some(v) if v >= 24.0 => 1,
+        _ => 0,
+    }
+}
+
+/// Per-(stream_id, host) success rate derived from the play log. Recent
+/// attempts weighted more heavily (0.9^i decay). Returns 0.5 for keys with
+/// no history so we don't penalise untested candidates.
+fn success_score(stream_id: u64, host: &str, log_snap: &[PlayEvent]) -> f32 {
+    let mut sum_w = 0.0_f32;
+    let mut sum = 0.0_f32;
+    let mut decay = 1.0_f32;
+    for ev in log_snap {
+        for att in &ev.attempts {
+            if att.host != host {
+                continue;
+            }
+            if stream_id_from_source_url(&att.url) != Some(stream_id) {
+                continue;
+            }
+            let v = match att.outcome {
+                AttemptOutcome::Ok => 1.0,
+                AttemptOutcome::Err { .. } | AttemptOutcome::Timeout => 0.0,
+            };
+            sum += v * decay;
+            sum_w += decay;
+            decay *= 0.9;
+        }
+    }
+    if sum_w == 0.0 {
+        0.5
+    } else {
+        sum / sum_w
+    }
+}
+
+fn success_bucket(score: f32) -> i32 {
+    (score * 10.0).round() as i32 // 0..=10
+}
+
+fn source_rank_key(
+    stream_id: u64,
+    host: &str,
+    measured: &MeasuredStore,
+    log_snap: &[PlayEvent],
+) -> RankKey {
+    let success = success_bucket(success_score(stream_id, host, log_snap));
+    match measured.get(stream_id, host) {
+        Some(q) => {
+            let pix_fmt_10bit = q.pix_fmt.as_deref().map(|p| p.contains("10")).unwrap_or(false);
+            let is_hevc = q.codec.as_deref() == Some("hevc");
+            let hdr_raw = hdr_rank(q.pix_fmt.as_deref(), q.color_transfer.as_deref());
+            // If TV can't decode HEVC main10, treat 10-bit HEVC as 8-bit SDR.
+            let hdr = if !TV_DECODES_HEVC_MAIN10 && is_hevc && pix_fmt_10bit {
+                0
+            } else {
+                hdr_raw
+            };
+            (
+                1, // measured > unmeasured
+                success,
+                hdr,
+                bpp_bucket(q.bitrate_kbps, q.width, q.height),
+                (q.width as u64 * q.height as u64) as i64,
+                codec_rank(q.codec.as_deref()),
+                fps_rank(q.framerate),
+            )
+        }
+        None => (0, success, 0, 0, 0, 0, 0),
+    }
 }
 
 fn push_xtream_candidate(
@@ -412,7 +632,11 @@ fn push_xtream_candidate(
     if state.blacklist.is_url_failed(&url) {
         return;
     }
-    let cand = Candidate { url: url.clone(), host: host.to_string() };
+    let cand = Candidate {
+        url: url.clone(),
+        host: host.to_string(),
+        stream_id,
+    };
     if state.blacklist.is_url_demoted(&url) {
         demoted.push(cand);
     } else {
@@ -459,11 +683,13 @@ async fn fetch_and_rewrite_playlist(
         // Xtream providers return HTTP 200 with a 1-segment ENDLIST playlist
         // pointing at a "placeholder" .ts (typically a few seconds of black
         // video) when the actual stream is unavailable — dead stream_id, geo
-        // block, account quota, etc. To the proxy that looks like a perfectly
-        // valid playlist; the client decodes it as a black screen and the
-        // candidate loop never falls through. Treat detected placeholders as
-        // a failure so the next candidate gets a turn.
-        if looks_like_placeholder_playlist(body) {
+        // block, account quota, etc. Two detectors cover this:
+        //   - `looks_like_placeholder_playlist`: filename-based (`black.ts`,
+        //     `offline.ts`, …) — catches the common cases
+        //   - `is_placeholder_manifest`: structural (#EXT-X-ENDLIST + ≤2
+        //     #EXTINF) — catches the auth-saturated cases where the
+        //     filename isn't a known needle (e.g. `media_NNNNN.ts`)
+        if looks_like_placeholder_playlist(body) || is_placeholder_manifest(body) {
             anyhow::bail!(
                 "upstream returned a placeholder/black playlist (stream unavailable on this source)"
             );
@@ -475,6 +701,7 @@ async fn fetch_and_rewrite_playlist(
             &channel.key,
             &cand.url,
             track_failures,
+            Some(&cand.host),
         )?;
         let mut response = Response::new(Body::from(rewritten));
         response.headers_mut().insert(
@@ -504,10 +731,16 @@ fn rewrite_playlist(
     channel_key: &str,
     source_url: &str,
     track_failures: bool,
+    upstream_host: Option<&str>,
 ) -> anyhow::Result<String> {
     let base = playlist_url.clone();
     let public_base = public_base.trim_end_matches('/');
     let mut out = String::with_capacity(body.len() + 256);
+
+    // Carry the most-recently-seen #EXTINF duration into the next segment
+    // URL's proxy token. Reset on each segment so a token doesn't inherit
+    // a stale duration from N lines back.
+    let mut pending_duration: Option<f32> = None;
 
     for line in body.lines() {
         let trimmed = line.trim();
@@ -516,6 +749,14 @@ fn rewrite_playlist(
             continue;
         }
         if trimmed.starts_with('#') {
+            if let Some(rest) = trimmed.strip_prefix("#EXTINF:") {
+                let dur_str = rest.split(',').next().unwrap_or(rest);
+                if let Ok(d) = dur_str.parse::<f32>() {
+                    if d > 0.0 {
+                        pending_duration = Some(d);
+                    }
+                }
+            }
             if let Some(rewritten) = rewrite_tag_with_uri(
                 trimmed,
                 &base,
@@ -523,6 +764,7 @@ fn rewrite_playlist(
                 channel_key,
                 source_url,
                 track_failures,
+                upstream_host,
             ) {
                 out.push_str(&rewritten);
                 out.push('\n');
@@ -539,8 +781,11 @@ fn rewrite_playlist(
                 channel_key,
                 source_url,
                 track_failures,
+                pending_duration,
+                upstream_host,
             ));
             out.push('\n');
+            pending_duration = None;
         } else {
             out.push_str(line);
             out.push('\n');
@@ -556,6 +801,7 @@ fn rewrite_tag_with_uri(
     channel_key: &str,
     source_url: &str,
     track_failures: bool,
+    upstream_host: Option<&str>,
 ) -> Option<String> {
     let uri_marker = "URI=\"";
     let idx = line.find(uri_marker)?;
@@ -563,12 +809,17 @@ fn rewrite_tag_with_uri(
     let rel_end = line[start..].find('"')?;
     let raw = &line[start..start + rel_end];
     let resolved = base.join(raw).ok()?;
+    // No duration to attach for URI=-tag references — these are usually init
+    // segments, subtitle tracks, etc. Bitrate measurement only applies to
+    // media segments (the lines after #EXTINF).
     let new_uri = proxy_url(
         public_base,
         resolved.as_str(),
         channel_key,
         source_url,
         track_failures,
+        None,
+        upstream_host,
     );
     let mut s = String::with_capacity(line.len() + new_uri.len());
     s.push_str(&line[..start]);
@@ -583,12 +834,16 @@ fn proxy_url(
     channel_key: &str,
     source_url: &str,
     track_failures: bool,
+    duration: Option<f32>,
+    host: Option<&str>,
 ) -> String {
     let payload = SegmentToken {
         u: absolute_upstream.to_string(),
         p: Some(source_url.to_string()),
         c: Some(channel_key.to_string()),
         probe: !track_failures,
+        d: duration,
+        h: host.map(|s| s.to_string()),
     };
     let json = serde_json::to_string(&payload).unwrap_or_else(|_| absolute_upstream.to_string());
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -684,6 +939,8 @@ fn decode_segment_token(token: &str) -> Result<SegmentToken, (StatusCode, String
         p: None,
         c: None,
         probe: false,
+        d: None,
+        h: None,
     })
 }
 
@@ -768,6 +1025,7 @@ pub async fn proxy_segment(
             &channel_key,
             &source_url,
             !segment.probe,
+            segment.h.as_deref(),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -799,7 +1057,38 @@ pub async fn proxy_segment(
                 return Err((StatusCode::BAD_GATEWAY, format!("body read: {e}")));
             }
         };
+        // Per-play bitrate observation: before handle_ts_segment mutates
+        // the bytes (subtitle PID strip changes the size), record the
+        // observed kbps for the per-(stream_id, host) EWMA. Skip probe-mode
+        // segments so the client capability probe never shapes measurements.
+        if !segment.probe {
+            if let (Some(sid), Some(d), Some(h)) = (stream_id, segment.d, segment.h.as_deref()) {
+                if d > 0.0 && bytes.len() > 0 {
+                    let kbps = bytes.len() as f64 * 8.0 / 1000.0 / d as f64;
+                    state.per_play.note_segment_kbps(sid, h, kbps as f32);
+                }
+            }
+        }
         let processed = handle_ts_segment(&state, stream_id.unwrap(), &bytes, &segment);
+        // After handle_ts_segment has run (and possibly cached the
+        // classification), push per-play metadata into the accumulator.
+        // Idempotent — subsequent calls just refresh last_activity.
+        if !segment.probe {
+            if let (Some(sid), Some(h)) = (stream_id, segment.h.as_deref()) {
+                if let Some(c) = state.classifier.get(sid) {
+                    state.per_play.note_classification(
+                        sid,
+                        h,
+                        c.width,
+                        c.height,
+                        c.codec_string(),
+                        c.pix_fmt.clone(),
+                        c.color_transfer.clone(),
+                        c.framerate,
+                    );
+                }
+            }
+        }
         let mut builder = Response::builder().status(status);
         for h in [
             header::CONTENT_TYPE,
@@ -1330,7 +1619,11 @@ async fn catchup_play(
             upstream = %upstream,
             "catch-up playlist fetch"
         );
-        let cand = Candidate { url: upstream.clone(), host: host.clone() };
+        let cand = Candidate {
+            url: upstream.clone(),
+            host: host.clone(),
+            stream_id: source.stream_id,
+        };
         let attempt_start = Instant::now();
         match tokio::time::timeout(
             attempt_timeout,
@@ -1708,6 +2001,8 @@ mod tests {
             "antena1",
             "https://upstream.example/master.m3u8",
             false,
+            None,
+            None,
         );
         let token = url.rsplit('/').next().unwrap();
         let decoded = decode_segment_token(token).unwrap();
@@ -1728,10 +2023,14 @@ mod tests {
             "rtp1",
             "https://upstream.example/live.m3u8",
             true,
+            Some(5.0),
+            Some("http://cf.example"),
         );
         let token = url.rsplit('/').next().unwrap();
         let decoded = decode_segment_token(token).unwrap();
         assert!(!decoded.probe);
         assert_eq!(decoded.u, "https://upstream.example/seg.ts");
+        assert_eq!(decoded.d, Some(5.0));
+        assert_eq!(decoded.h.as_deref(), Some("http://cf.example"));
     }
 }

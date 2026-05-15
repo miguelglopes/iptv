@@ -21,10 +21,13 @@ mod config;
 mod default_order;
 mod epg;
 mod hosts;
+mod measured;
 mod play_log;
 mod play_sessions;
+mod probe;
 mod proxy;
 mod radio;
+mod sps;
 mod state;
 mod xtream;
 
@@ -61,6 +64,7 @@ async fn main() -> Result<()> {
         state.xtream.clone(),
         config.probe.clone(),
         config.xtream.hosts.clone(),
+        Arc::clone(&state.max_connections),
     );
 
     spawn_catalog_loop(
@@ -72,6 +76,14 @@ async fn main() -> Result<()> {
         Arc::clone(&state.radio_curation),
         config.radio.clone(),
     );
+
+    // Background tasks for the measured-quality system. All three run for
+    // the lifetime of the server and use cancel-safe primitives.
+    tokio::spawn(measured::run_flush_task(Arc::clone(&state.measured)));
+    tokio::spawn(
+        Arc::clone(&state.per_play).run_committer(Arc::clone(&state.measured)),
+    );
+    probe::spawn_bootstrap_sweep(state.clone());
 
     let app = router(state.clone());
 
@@ -99,6 +111,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/admin/clear-classifier", post(api::admin_clear_classifier))
         .route("/admin/clear-all", post(api::admin_clear_all))
         .route("/admin/recent-plays", get(api::admin_recent_plays))
+        .route("/admin/measured-quality", get(api::admin_measured_quality))
         .route("/api/probe/audio.m3u8", get(api::probe_audio))
         .route("/api/probe/video.m3u8", get(api::probe_video))
         .route("/play/:name", get(proxy::play_playlist))

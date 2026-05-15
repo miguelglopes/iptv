@@ -165,6 +165,14 @@ impl Blacklist {
         g.host_streams.clear();
     }
 
+    /// Drop all last-known-good pins. Called after the measured-quality
+    /// bootstrap sweep completes, so channels users played pre-measurement
+    /// don't stay pinned to whatever variant happened to be tried first —
+    /// the new measurement-driven ranking is allowed to win on the next play.
+    pub fn clear_last_known_good(&self) {
+        self.inner.write().last_known_good.clear();
+    }
+
     pub fn clear_demoted(&self) {
         let mut g = self.inner.write();
         g.demoted_urls.clear();

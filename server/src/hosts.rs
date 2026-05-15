@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -91,10 +92,11 @@ pub fn spawn_probe_loop(
     client: XtreamClient,
     config: ProbeConfig,
     hosts: Vec<String>,
+    max_connections: Arc<AtomicU32>,
 ) {
     tokio::spawn(async move {
         loop {
-            run_one_round(&state, &client, &config, &hosts).await;
+            run_one_round(&state, &client, &config, &hosts, &max_connections).await;
             let sleep = tokio::time::sleep(Duration::from_secs(config.interval_secs));
             tokio::select! {
                 _ = sleep => {},
@@ -111,6 +113,7 @@ async fn run_one_round(
     client: &XtreamClient,
     config: &ProbeConfig,
     hosts: &[String],
+    max_connections: &Arc<AtomicU32>,
 ) {
     let timeout = Duration::from_millis(config.timeout_ms);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(config.parallelism.max(1)));
@@ -121,9 +124,10 @@ async fn run_one_round(
         let client = client.clone();
         let state = Arc::clone(state);
         let sem = Arc::clone(&semaphore);
+        let max_cons = Arc::clone(max_connections);
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
-            let result = probe_one(&client, &host, timeout).await;
+            let result = probe_one(&client, &host, timeout, &max_cons).await;
             state.update(&host, result);
         }));
     }
@@ -138,12 +142,29 @@ async fn run_one_round(
     }
 }
 
-async fn probe_one(client: &XtreamClient, host: &str, timeout: Duration) -> ProbeResult {
+async fn probe_one(
+    client: &XtreamClient,
+    host: &str,
+    timeout: Duration,
+    max_connections: &Arc<AtomicU32>,
+) -> ProbeResult {
     let t0 = Instant::now();
     let fut = client.authenticate(host);
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(info)) => {
             let latency = t0.elapsed().as_millis() as u64;
+            // Discover max_connections lazily — the first probe that returns
+            // a parseable value wins. CAS to 0 sentinel so concurrent probes
+            // don't race to overwrite each other; idempotent if all probes
+            // see the same value.
+            if let Some(v) = info.max_connections_value() {
+                let _ = max_connections.compare_exchange(
+                    0,
+                    v,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
             if info.is_authenticated() {
                 ProbeResult { alive: true, latency_ms: Some(latency), error: None }
             } else {

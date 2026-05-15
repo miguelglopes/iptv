@@ -497,6 +497,34 @@ pub async fn admin_recent_plays(State(state): State<Arc<AppState>>) -> impl Into
     Json(state.play_log.snapshot())
 }
 
+/// Measured-quality cache dump. One entry per `(stream_id, host)` key, each
+/// with its raw sample buffer plus the aggregate the ranker actually reads.
+/// No write endpoint — all writes come from the proxy's own sweep / per-play
+/// hooks. Useful for sanity-checking what the ranker is using and for
+/// finding 10-bit HEVC sources during pre-flight check 3.
+pub async fn admin_measured_quality(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    #[derive(serde::Serialize)]
+    struct Entry {
+        stream_id: u64,
+        host: String,
+        samples: std::collections::VecDeque<crate::measured::Sample>,
+        aggregate: Option<crate::measured::MeasuredQuality>,
+    }
+    let snap = state.measured.snapshot();
+    let entries: Vec<Entry> = snap
+        .into_iter()
+        .map(|((stream_id, host), entry)| Entry {
+            stream_id,
+            host,
+            aggregate: entry.aggregate(),
+            samples: entry.samples,
+        })
+        .collect();
+    Json(entries)
+}
+
 /// Capability probe: redirect to a playable channel of the requested kind so
 /// the client can run a real play-test against the actual content shape we
 /// serve.

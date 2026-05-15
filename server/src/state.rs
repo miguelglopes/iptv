@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use reqwest::Client;
@@ -10,6 +12,7 @@ use crate::config::Config;
 use crate::default_order::Curation;
 use crate::epg::EpgState;
 use crate::hosts::HostState;
+use crate::measured::{MeasuredStore, PerPlayAccumulator};
 use crate::play_log::PlayLog;
 use crate::play_sessions::PlaySessions;
 use crate::xtream::XtreamClient;
@@ -33,6 +36,19 @@ pub struct AppState {
     /// upstream the failing client was served, instead of racing against the
     /// global last-known-good. See `play_sessions.rs`.
     pub play_sessions: Arc<PlaySessions>,
+    /// Measured stream-quality cache (per `(stream_id, host)` rolling buffer).
+    pub measured: Arc<MeasuredStore>,
+    /// In-progress per-play observations; committed as a single Sample when
+    /// activity quiesces. Drained by a background task spawned from main.rs.
+    pub per_play: Arc<PerPlayAccumulator>,
+    /// Number of `/play/*` requests currently in flight. The measurement
+    /// sweep yields when this is non-zero so it doesn't compete with users
+    /// for upstream connection slots.
+    pub active_plays: Arc<AtomicUsize>,
+    /// Provider `max_connections` discovered from the first successful
+    /// `authenticate()`. 0 means "not yet discovered" — sweep falls back
+    /// to a conservative default until set.
+    pub max_connections: Arc<AtomicU32>,
 }
 
 impl AppState {
@@ -58,6 +74,12 @@ impl AppState {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()?;
 
+        // Measured-quality store. Path is relative to the server CWD by
+        // default (same convention as radios.m3u). docker-compose mounts
+        // `./server/data` into the container so this survives rebuilds.
+        let measured_path = std::path::PathBuf::from("data/measured_quality.json");
+        let measured = Arc::new(MeasuredStore::load_or_empty(measured_path));
+
         Ok(Arc::new(Self {
             config: Arc::new(config),
             curation,
@@ -71,6 +93,10 @@ impl AppState {
             upstream_http,
             play_log: Arc::new(PlayLog::new()),
             play_sessions: Arc::new(PlaySessions::new()),
+            measured,
+            per_play: Arc::new(PerPlayAccumulator::new()),
+            active_plays: Arc::new(AtomicUsize::new(0)),
+            max_connections: Arc::new(AtomicU32::new(0)),
         }))
     }
 }

@@ -149,6 +149,17 @@ impl UserInfo {
             _ => false,
         }
     }
+
+    /// Provider's `max_connections` as a u32. Returns None for missing /
+    /// unparseable values, in which case the consumer should pick a sensible
+    /// default (2 is typical for Xtream accounts).
+    pub fn max_connections_value(&self) -> Option<u32> {
+        match self.max_connections.as_ref()? {
+            Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+            Value::String(s) => s.parse::<u32>().ok(),
+            _ => None,
+        }
+    }
 }
 
 /// Distinguishes TV channels (sourced from Xtream hosts) from radio stations

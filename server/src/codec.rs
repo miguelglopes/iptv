@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use parking_lot::RwLock;
 use serde::Serialize;
 
+use crate::sps::{find_sps_nal, parse_h264_sps, parse_hevc_sps, SpsCodec, SpsInfo};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
@@ -18,6 +20,34 @@ pub struct Classification {
     pub pmt_pid: Option<u16>,
     pub pcr_pid: Option<u16>,
     pub subtitle_pids: Vec<u16>,
+    /// Populated when an SPS NAL is found in the video PID's PES payload.
+    /// Width/height are post-crop (e.g. 1920x1080 not 1920x1088).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framerate: Option<f32>,
+    /// "yuv420p" / "yuv420p10le" / etc. — the `10` substring is the ranker's
+    /// 10-bit signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pix_fmt: Option<String>,
+    /// "bt709" (SDR), "smpte2084" (HDR10), "arib-std-b67" (HLG), etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_transfer: Option<String>,
+}
+
+impl Classification {
+    /// Map the codec enum to the lowercase string the rank-key uses
+    /// (av1/hevc/h264/mpeg2video/...). Falls back to `None` for `Other`
+    /// because we can't tell what it is from PMT stream_type alone.
+    pub fn codec_string(&self) -> Option<String> {
+        match self.video_codec? {
+            VideoCodec::H264 => Some("h264".into()),
+            VideoCodec::Hevc => Some("hevc".into()),
+            VideoCodec::Other => None,
+        }
+    }
 }
 
 impl Classification {
@@ -232,7 +262,9 @@ fn has_subtitling_descriptor(descriptors: &[u8]) -> bool {
     false
 }
 
-/// Classify a TS chunk by parsing its PAT and PMT.
+/// Classify a TS chunk by parsing its PAT and PMT, then (if a video PID is
+/// known and the codec is H.264 or HEVC) walking that PID's PES payload to
+/// extract SPS-level resolution / colour / framerate.
 pub fn classify_ts_chunk(bytes: &[u8]) -> Option<Classification> {
     let start = ts_alignment(bytes)?;
     let mut pmt_pid: Option<u16> = None;
@@ -250,16 +282,103 @@ pub fn classify_ts_chunk(bytes: &[u8]) -> Option<Classification> {
     let pmt_pid = pmt_pid?;
 
     let mut i = start;
+    let mut classification: Option<Classification> = None;
     while i + TS_PACKET_LEN <= bytes.len() {
         let pkt = read_packet(&bytes[i..i + TS_PACKET_LEN])?;
         if pkt.pid == pmt_pid && pkt.payload_unit_start && pkt.has_payload {
             if let Some(summary) = parse_pmt(&pkt.bytes[pkt.payload_offset..]) {
-                return Some(summarize(pmt_pid, summary));
+                classification = Some(summarize(pmt_pid, summary));
+                break;
             }
         }
         i += TS_PACKET_LEN;
     }
-    None
+    let mut c = classification?;
+
+    // SPS extraction for ranking. Only meaningful for H.264 / HEVC; MPEG-2
+    // gets resolution from its own headers but we don't need to surface
+    // mpeg2video metadata for the ranker (it'll lose anyway via codec_rank).
+    if let (Some(codec), Some(vpid)) = (c.video_codec, c.video_pid) {
+        let sps_codec = match codec {
+            VideoCodec::H264 => Some(SpsCodec::H264),
+            VideoCodec::Hevc => Some(SpsCodec::Hevc),
+            VideoCodec::Other => None,
+        };
+        if let Some(sc) = sps_codec {
+            if let Some(es) = collect_video_es(bytes, start, vpid) {
+                if let Some(rbsp) = find_sps_nal(&es, sc) {
+                    let info: SpsInfo = match codec {
+                        VideoCodec::H264 => parse_h264_sps(&rbsp).unwrap_or_default(),
+                        VideoCodec::Hevc => parse_hevc_sps(&rbsp).unwrap_or_default(),
+                        VideoCodec::Other => SpsInfo::default(),
+                    };
+                    c.width = info.width;
+                    c.height = info.height;
+                    c.framerate = info.framerate;
+                    c.pix_fmt = info.pix_fmt;
+                    c.color_transfer = info.color_transfer;
+                }
+            }
+        }
+    }
+    Some(c)
+}
+
+/// Concatenate the payload bytes of every TS packet with PID == `video_pid`,
+/// trimming the PES header on each PUSI-marked packet. The result is an
+/// Annex-B elementary stream slice that `find_sps_nal` can scan directly.
+/// Caps at ~64 KB so we don't allocate unbounded memory on long chunks.
+fn collect_video_es(bytes: &[u8], start: usize, video_pid: u16) -> Option<Vec<u8>> {
+    const MAX_ES: usize = 64 * 1024;
+    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut i = start;
+    while i + TS_PACKET_LEN <= bytes.len() && out.len() < MAX_ES {
+        let pkt = read_packet(&bytes[i..i + TS_PACKET_LEN])?;
+        if pkt.pid == video_pid && pkt.has_payload {
+            let payload = &pkt.bytes[pkt.payload_offset..];
+            if pkt.payload_unit_start {
+                // Skip the PES header. Minimum 6 bytes (start code + stream_id +
+                // length); on optional flags, the PES_header_data_length byte
+                // at offset 8 tells us how many additional bytes to skip.
+                if let Some(es_start) = pes_payload_offset(payload) {
+                    out.extend_from_slice(&payload[es_start..]);
+                } else {
+                    // Malformed PES — bail and use what we have so far.
+                    break;
+                }
+            } else {
+                out.extend_from_slice(payload);
+            }
+        }
+        i += TS_PACKET_LEN;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Given a slice that begins at a PES packet (`00 00 01 <stream_id> ...`),
+/// return the offset where the elementary stream payload starts (past the
+/// PES header). Returns `None` for malformed inputs.
+fn pes_payload_offset(payload: &[u8]) -> Option<usize> {
+    if payload.len() < 9 || &payload[..3] != [0, 0, 1] {
+        return None;
+    }
+    // Optional flags byte at offset 6 (the "10" prefix marker), then
+    // PES_header_data_length at offset 8.
+    if payload[6] & 0xC0 != 0x80 {
+        // No optional flags — payload starts right after the 6-byte header.
+        return Some(6);
+    }
+    let pes_header_data_length = payload[8] as usize;
+    let start = 9 + pes_header_data_length;
+    if start <= payload.len() {
+        Some(start)
+    } else {
+        None
+    }
 }
 
 fn summarize(pmt_pid: u16, s: PmtSummary) -> Classification {
@@ -300,6 +419,11 @@ fn summarize(pmt_pid: u16, s: PmtSummary) -> Classification {
         pmt_pid: Some(pmt_pid),
         pcr_pid: Some(s.pcr_pid),
         subtitle_pids,
+        width: None,
+        height: None,
+        framerate: None,
+        pix_fmt: None,
+        color_transfer: None,
     }
 }
 
@@ -744,6 +868,11 @@ mod tests {
                 pmt_pid: Some(0x0020),
                 pcr_pid: Some(0x0100),
                 subtitle_pids: vec![],
+                width: None,
+                height: None,
+                framerate: None,
+                pix_fmt: None,
+                color_transfer: None,
             },
         );
         assert_eq!(c.get(42).unwrap().video_codec, Some(VideoCodec::Hevc));
