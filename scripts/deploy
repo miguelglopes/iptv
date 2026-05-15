@@ -30,6 +30,20 @@ SSH_OPTS=(
 
 t0=$(date +%s.%N)
 
+# app/js/config.js carries the proxy URL the TV resolves at runtime. It's
+# gitignored (per-network LAN URL), so on a fresh clone it's missing — and
+# `ares-package` happily ships an IPK without it. The TV then fails to import
+# PROXY_BASE_URL, main.js never boots, and the channel list renders empty
+# with no useful error on the TV side. Fail loud here instead.
+if [[ ! -f "$SRC/js/config.js" ]]; then
+  cat >&2 <<EOF
+ERROR: $SRC/js/config.js is missing.
+Copy $SRC/js/config.example.js to $SRC/js/config.js and set PROXY_BASE_URL
+to the proxy URL the TV will resolve (e.g. https://iptv.mglopes.com).
+EOF
+  exit 1
+fi
+
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 ares-package "$SRC" -o "$BUILD_DIR" >/dev/null
