@@ -1160,6 +1160,27 @@ fn handle_ts_segment(
     segment: &SegmentToken,
 ) -> Vec<u8> {
     let classification = match state.classifier.get(stream_id) {
+        // Partial cache: first segment parsed PMT/PAT but the SPS NAL wasn't
+        // present in it (segment started mid-GOP, common at random join
+        // points). Re-attempt SPS extraction on this segment so per-play
+        // samples can pick up width/height/colour metadata. Update the cache
+        // only if the new attempt added information.
+        Some(c) if c.width.is_none() => {
+            match classify_ts_chunk(bytes) {
+                Some(new_c) if new_c.width.is_some() => {
+                    debug!(
+                        stream_id = stream_id,
+                        w = ?new_c.width,
+                        h = ?new_c.height,
+                        codec = ?new_c.codec_string(),
+                        "classifier: SPS extracted on retry",
+                    );
+                    state.classifier.set(stream_id, new_c.clone());
+                    new_c
+                }
+                _ => c,
+            }
+        }
         Some(c) => c,
         None => match classify_ts_chunk(bytes) {
             Some(c) => {
@@ -1170,6 +1191,8 @@ fn handle_ts_segment(
                     video = ?c.video_pid,
                     pcr = ?c.pcr_pid,
                     subs = c.subtitle_pids.len(),
+                    w = ?c.width,
+                    h = ?c.height,
                     "classified stream"
                 );
                 state.classifier.set(stream_id, c.clone());

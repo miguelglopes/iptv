@@ -135,25 +135,35 @@ pub async fn measure_once(client: &Client, manifest_url: &str) -> Option<Sample>
     let cls = classify_ts_chunk(&bytes)?;
     let kbps = (bytes.len() as f64 * 8.0 / 1000.0 / duration as f64) as u32;
 
-    // Step 5: plausibility.
+    // Step 5: require a meaningful sample — codec + resolution must be set.
+    // First-segment-of-stream may not contain an SPS NAL if the segment
+    // happens to start mid-GOP. Without W/H we can't usefully rank, and
+    // pushing a partial sample would burn a slot in the cap-5 buffer (and
+    // potentially pollute the most-recent-stable-fields aggregator). Better
+    // to drop it; the per-play path will pick the stream up once a user
+    // actually watches it, and the next sweep cycle (if any) gets another
+    // chance against a different segment.
+    let codec = cls.codec_string()?;
+    let width = cls.width?;
+    let height = cls.height?;
+
+    // Plausibility.
     if kbps < BITRATE_MIN_KBPS {
         debug!(url = %segment_url, kbps, "sweep: bitrate below floor");
         return None;
     }
-    if let (Some(w), Some(h)) = (cls.width, cls.height) {
-        let pixels = w as u64 * h as u64;
-        if pixels != 0 && pixels < MIN_PIXELS {
-            debug!(url = %segment_url, w, h, "sweep: resolution below floor");
-            return None;
-        }
+    let pixels = width as u64 * height as u64;
+    if pixels < MIN_PIXELS {
+        debug!(url = %segment_url, width, height, "sweep: resolution below floor");
+        return None;
     }
 
     Some(Sample {
         at: time::OffsetDateTime::now_utc(),
         source: SampleSource::Sweep,
-        width: cls.width.unwrap_or(0),
-        height: cls.height.unwrap_or(0),
-        codec: cls.codec_string(),
+        width,
+        height,
+        codec: Some(codec),
         pix_fmt: cls.pix_fmt.clone(),
         color_transfer: cls.color_transfer.clone(),
         framerate: cls.framerate,
