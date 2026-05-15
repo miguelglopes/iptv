@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -120,4 +121,10 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        // Gzip / Brotli for text payloads. Skips /play/, /seg/ (HLS/TS segments are
+        // already compressed), and respects client Accept-Encoding. Hits hls.min.js
+        // (~400 KB → ~120 KB), main.js (~70 KB), app.css (~32 KB), and
+        // /api/channels JSON (~100 KB for 400 channels) — wire-size reductions on
+        // every cold boot, no client changes required.
+        .layer(CompressionLayer::new().gzip(true).br(true))
 }
