@@ -99,50 +99,57 @@ pub fn spawn_catalog_loop(
             if alive.is_empty() && radio_streams.is_empty() {
                 warn!("catalog refresh skipped: no alive hosts and no radio sources");
             } else {
-                let tv_result = if alive.is_empty() {
-                    Ok((Vec::new(), String::new()))
-                } else {
-                    refresh_once(&client, &alive).await
-                };
-                match tv_result {
-                    Ok((streams, host)) => {
-                        // Build TV and radio canonicals separately so each uses its
-                        // own curation (aliases / display_overrides / order).
-                        // build_canonical groups by canonical_key, so feeding both
-                        // into one call would let radio aliases pollute TV keys.
-                        let mut channels = build_canonical(&streams, &curation);
-                        let radio_channels = build_canonical(&radio_streams, &radio_curation);
-                        let radio_count = radio_channels.len();
-                        channels.extend(radio_channels);
+                // Fetch streams from EVERY alive host in parallel so per-host-
+                // exclusive channels surface AND so each stream stays tagged
+                // with the host that actually has it. build_candidates uses
+                // origin_host to route the right stream_id to the right host
+                // (instead of speculatively fanning across all hosts and 404-ing
+                // when the provider doesn't share IDs).
+                let (streams, succeeded_hosts) = refresh_all(&client, &alive).await;
 
-                        let mut by_key = HashMap::with_capacity(channels.len());
-                        for (i, c) in channels.iter().enumerate() {
-                            by_key.insert(c.key.clone(), i);
-                        }
-                        let stream_count = streams.len() + radio_streams.len();
-                        let snap = CatalogSnapshot {
-                            channels,
-                            by_key,
-                            last_refreshed: Some(OffsetDateTime::now_utc()),
-                            source_host: if host.is_empty() { None } else { Some(host) },
-                            stream_count,
-                        };
-                        info!(
-                            "catalog refreshed: {} streams → {} canonical channels ({} radio)",
-                            snap.stream_count,
-                            snap.channels.len(),
-                            radio_count,
-                        );
-                        state.install(snap);
-                        // Only count as a full success when we actually got TV
-                        // streams. A radio-only "success" during the cold-start
-                        // window (before the probe loop has marked any host
-                        // alive) would otherwise sleep for refresh_interval_secs
-                        // and leave the user with no TV channels for an hour.
-                        last_refresh_succeeded = !streams.is_empty();
-                    }
-                    Err(e) => warn!("catalog refresh failed across all alive hosts: {e}"),
+                // Build TV and radio canonicals separately so each uses its
+                // own curation (aliases / display_overrides / order).
+                // build_canonical groups by canonical_key, so feeding both
+                // into one call would let radio aliases pollute TV keys.
+                let mut channels = build_canonical(&streams, &curation);
+                let radio_channels = build_canonical(&radio_streams, &radio_curation);
+                let radio_count = radio_channels.len();
+                channels.extend(radio_channels);
+
+                let mut by_key = HashMap::with_capacity(channels.len());
+                for (i, c) in channels.iter().enumerate() {
+                    by_key.insert(c.key.clone(), i);
                 }
+                let stream_count = streams.len() + radio_streams.len();
+                let source_host = if succeeded_hosts.is_empty() {
+                    None
+                } else if succeeded_hosts.len() == 1 {
+                    Some(succeeded_hosts[0].clone())
+                } else {
+                    Some(format!("{} hosts", succeeded_hosts.len()))
+                };
+                let snap = CatalogSnapshot {
+                    channels,
+                    by_key,
+                    last_refreshed: Some(OffsetDateTime::now_utc()),
+                    source_host,
+                    stream_count,
+                };
+                info!(
+                    "catalog refreshed: {} streams from {}/{} alive hosts → {} canonical channels ({} radio)",
+                    snap.stream_count,
+                    succeeded_hosts.len(),
+                    alive.len(),
+                    snap.channels.len(),
+                    radio_count,
+                );
+                state.install(snap);
+                // Only count as a full success when we actually got TV
+                // streams. A radio-only "success" during the cold-start
+                // window (before the probe loop has marked any host
+                // alive) would otherwise sleep for refresh_interval_secs
+                // and leave the user with no TV channels for an hour.
+                last_refresh_succeeded = !streams.is_empty();
             }
 
             let next_delay = if last_refresh_succeeded {
@@ -159,19 +166,40 @@ pub fn spawn_catalog_loop(
     });
 }
 
-async fn refresh_once(
+/// Fetch the live-stream list from every alive host concurrently. Returns the
+/// union of streams (each already tagged with `origin_host` by
+/// `XtreamClient::all_live_streams`) plus the set of hosts that responded
+/// successfully. Per-host failures are logged but don't abort the merge —
+/// a single dead host shouldn't strip other hosts' channels from the catalog.
+async fn refresh_all(
     client: &XtreamClient,
     alive: &[String],
-) -> anyhow::Result<(Vec<LiveStream>, String)> {
-    let mut last_err: Option<anyhow::Error> = None;
+) -> (Vec<LiveStream>, Vec<String>) {
+    use tokio::task::JoinSet;
+    let mut set = JoinSet::new();
     for h in alive {
-        match client.all_live_streams(h).await {
-            Ok(streams) => return Ok((streams, h.clone())),
+        let h = h.clone();
+        let client = client.clone();
+        set.spawn(async move {
+            let res = client.all_live_streams(&h).await;
+            (h, res)
+        });
+    }
+    let mut all_streams: Vec<LiveStream> = Vec::new();
+    let mut succeeded: Vec<String> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((host, Ok(streams))) => {
+                all_streams.extend(streams);
+                succeeded.push(host);
+            }
+            Ok((host, Err(e))) => {
+                warn!("get_live_streams failed via {}: {}", host, e);
+            }
             Err(e) => {
-                warn!("get_live_streams failed via {}: {}", h, e);
-                last_err = Some(e);
+                warn!("catalog fetch task panicked: {e}");
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no hosts to try")))
+    (all_streams, succeeded)
 }

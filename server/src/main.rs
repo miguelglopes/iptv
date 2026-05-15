@@ -22,6 +22,7 @@ mod default_order;
 mod epg;
 mod hosts;
 mod play_log;
+mod play_sessions;
 mod proxy;
 mod radio;
 mod state;
@@ -86,6 +87,8 @@ fn router(state: Arc<AppState>) -> Router {
     let ui_dir = state.config.ui_dir.clone();
     info!("serving UI from {}", ui_dir.display());
     Router::new()
+        .route("/", get(api::serve_index))
+        .route("/index.html", get(api::serve_index))
         .route("/api/channels", get(api::list_channels))
         .route("/api/epg/:key", get(api::get_epg))
         .route("/api/status", get(api::status))
@@ -96,6 +99,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/admin/clear-classifier", post(api::admin_clear_classifier))
         .route("/admin/clear-all", post(api::admin_clear_all))
         .route("/admin/recent-plays", get(api::admin_recent_plays))
+        .route("/api/probe/audio.m3u8", get(api::probe_audio))
+        .route("/api/probe/video.m3u8", get(api::probe_video))
         .route("/play/:name", get(proxy::play_playlist))
         .route("/seg/:token", get(proxy::proxy_segment))
         .fallback_service(ServeDir::new(ui_dir))

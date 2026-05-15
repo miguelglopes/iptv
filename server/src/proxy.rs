@@ -14,7 +14,9 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::canonical::{CanonicalChannel, CanonicalSource};
+use crate::canonical::CanonicalChannel;
+#[cfg(test)]
+use crate::canonical::CanonicalSource;
 use crate::codec::{classify_ts_chunk, strip_subtitle_pids};
 use crate::play_log::{AttemptOutcome, PlayAttempt, PlayEvent};
 use crate::state::AppState;
@@ -34,6 +36,27 @@ struct SegmentToken {
     p: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     c: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    probe: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+fn de_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Bool(b) => Ok(b),
+        serde_json::Value::Number(n) => Ok(n.as_u64().map(|x| x != 0).unwrap_or(false)),
+        serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "" | "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(D::Error::custom(format!("not a bool: {other}"))),
+        },
+        _ => Err(D::Error::custom("expected bool")),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,6 +67,19 @@ pub struct PlayParams {
     pub from: Option<String>,
     #[serde(default)]
     pub duration: Option<String>,
+    /// Capability-probe request marker. Accepts `1`/`0`, `true`/`false`,
+    /// `yes`/`no`. Axum's Query extractor errors on plain `?probe=1` against
+    /// a bare `bool` field — the lenient parser tolerates both shapes.
+    #[serde(default, deserialize_with = "de_bool_lenient")]
+    pub probe: bool,
+    /// Client-generated play-id. Threaded into the play URL as `?pid=<hex>`
+    /// so the server can attribute this exact attempt back to a specific
+    /// upstream choice when the client later reports a failure (avoids the
+    /// LKG race when concurrent clients play the same channel). Optional —
+    /// when absent the server falls back to its own counter for logging and
+    /// to LKG-based blame for feedback (legacy behaviour).
+    #[serde(default)]
+    pub pid: Option<String>,
 }
 
 pub async fn play_playlist(
@@ -53,9 +89,25 @@ pub async fn play_playlist(
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let key = name.trim_end_matches(".m3u8").trim_end_matches(".ts");
+    let probe_request = params.probe;
     let catchup_request = parse_catchup_params(&params)?;
     let public_base = request_base_url(&headers, state.config.public_base_url.as_deref());
-    let play_id = state.play_log.next_id();
+    // Use the client-supplied pid when present so feedback can blame the same
+    // upstream the client actually saw. Sanitize defensively — pid is opaque to
+    // the proxy but ends up in tracing fields and log files. Truncate to keep
+    // memory bounded under a hostile client.
+    let client_pid = params
+        .pid
+        .as_deref()
+        .map(sanitize_pid)
+        .filter(|s| !s.is_empty());
+    let play_id = if probe_request {
+        "probe".to_string()
+    } else {
+        client_pid
+            .clone()
+            .unwrap_or_else(|| state.play_log.next_id())
+    };
 
     let snap = state.catalog.snapshot();
     let channel = snap
@@ -64,7 +116,7 @@ pub async fn play_playlist(
         .ok_or((StatusCode::NOT_FOUND, format!("unknown channel: {key}")))?;
 
     if let Some(req) = catchup_request {
-        return catchup_play(state, channel, req, &public_base, &play_id).await;
+        return catchup_play(state, channel, req, &public_base, &play_id, client_pid.as_deref()).await;
     }
 
     let candidates = build_candidates(&state, &channel);
@@ -73,8 +125,19 @@ pub async fn play_playlist(
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
     }
 
-    let budget = Duration::from_secs(state.config.proxy.play_budget_secs);
     let per_attempt = Duration::from_secs(state.config.proxy.per_attempt_timeout_secs);
+    // Probe requests are run from the boot-time capability detector — the
+    // client gives up after a few seconds. Cap the total budget so we fail
+    // fast on a broken probe channel instead of dragging through the full
+    // failover pipeline (which would timeout client-side anyway and falsely
+    // report "no live_video_hls cap"). One per_attempt of slack on top of
+    // a single attempt absorbs an initial slow upstream without dragging
+    // the boot.
+    let budget = if probe_request {
+        per_attempt.saturating_mul(2)
+    } else {
+        Duration::from_secs(state.config.proxy.play_budget_secs)
+    };
     let started = Instant::now();
     let started_wall = time::OffsetDateTime::now_utc();
 
@@ -101,19 +164,34 @@ pub async fn play_playlist(
         let attempt_start = Instant::now();
         match tokio::time::timeout(
             attempt_timeout,
-            fetch_and_rewrite_playlist(&state, &channel, cand, &public_base),
+            fetch_and_rewrite_playlist(
+                &state,
+                &channel,
+                cand,
+                &public_base,
+                !probe_request,
+            ),
         )
         .await
         {
             Ok(Ok(resp)) => {
                 let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
-                state.blacklist.note_url_succeeded(&channel.key, &cand.url);
-                schedule_opportunistic_validation(
-                    Arc::clone(&state),
-                    channel.key.clone(),
-                    &candidates,
-                    idx,
-                );
+                if !probe_request {
+                    state.blacklist.note_url_succeeded(&channel.key, &cand.url);
+                    // Persist (pid → upstream) for the feedback endpoint to consume
+                    // when this client later reports success/failure. Only meaningful
+                    // when the client passed a pid — otherwise feedback falls back
+                    // to LKG-based blame.
+                    if let Some(pid) = client_pid.as_deref() {
+                        state.play_sessions.note(pid, &channel.key, &cand.url);
+                    }
+                    schedule_opportunistic_validation(
+                        Arc::clone(&state),
+                        channel.key.clone(),
+                        &candidates,
+                        idx,
+                    );
+                }
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -128,17 +206,19 @@ pub async fn play_playlist(
                     elapsed_ms,
                     "play ok"
                 );
-                state.play_log.record(PlayEvent {
-                    id: play_id.clone(),
-                    started: started_wall,
-                    channel: channel.key.clone(),
-                    catchup: false,
-                    total_ms: started.elapsed().as_millis() as u64,
-                    candidates_total: candidates.len(),
-                    succeeded: true,
-                    error: None,
-                    attempts,
-                });
+                if !probe_request {
+                    state.play_log.record(PlayEvent {
+                        id: play_id.clone(),
+                        started: started_wall,
+                        channel: channel.key.clone(),
+                        catchup: false,
+                        total_ms: started.elapsed().as_millis() as u64,
+                        candidates_total: candidates.len(),
+                        succeeded: true,
+                        error: None,
+                        attempts,
+                    });
+                }
                 return Ok(resp);
             }
             Ok(Err(e)) => {
@@ -153,7 +233,9 @@ pub async fn play_playlist(
                     error = %reason,
                     "playlist fetch failed",
                 );
-                state.blacklist.note_url_failed(&cand.url);
+                if !probe_request {
+                    state.blacklist.mark_failed(&cand.url);
+                }
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -173,7 +255,9 @@ pub async fn play_playlist(
                     elapsed_ms,
                     "playlist fetch timed out",
                 );
-                state.blacklist.note_url_failed(&cand.url);
+                if !probe_request {
+                    state.blacklist.mark_failed(&cand.url);
+                }
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -193,17 +277,19 @@ pub async fn play_playlist(
         err = last_err.as_deref().unwrap_or("budget exhausted"),
     );
     warn!(play = %play_id, channel = %channel.key, attempts = tried, "play failed: all candidates exhausted");
-    state.play_log.record(PlayEvent {
-        id: play_id.clone(),
-        started: started_wall,
-        channel: channel.key.clone(),
-        catchup: false,
-        total_ms: started.elapsed().as_millis() as u64,
-        candidates_total: candidates.len(),
-        succeeded: false,
-        error: Some(last_err.unwrap_or_else(|| "budget exhausted".into())),
-        attempts,
-    });
+    if !probe_request {
+        state.play_log.record(PlayEvent {
+            id: play_id.clone(),
+            started: started_wall,
+            channel: channel.key.clone(),
+            catchup: false,
+            total_ms: started.elapsed().as_millis() as u64,
+            candidates_total: candidates.len(),
+            succeeded: false,
+            error: Some(last_err.unwrap_or_else(|| "budget exhausted".into())),
+            attempts,
+        });
+    }
     Err((StatusCode::BAD_GATEWAY, err_text))
 }
 
@@ -212,12 +298,20 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
     let mut fresh: Vec<Candidate> = Vec::new();
     let mut demoted: Vec<Candidate> = Vec::new();
 
+    // Per-source emission order (within score-desc sources):
+    //   1. Primary candidate: origin_host × stream_id — the host that actually
+    //      reported this stream in the catalog. Tried first because it's the
+    //      one we know has it.
+    //   2. Speculative candidates: other alive hosts × stream_id — only useful
+    //      when the provider replicates stream_ids across hosts. They may 404
+    //      otherwise; that's fine, they get demoted and eventually filtered.
+    // After enumeration, dedupe by URL (different sources can collide on the
+    // same speculative URL) preserving first-seen order so primaries always
+    // win over speculatives.
     for src in &channel.sources {
-        // Radio (and any other self-contained source): URL given verbatim by
-        // `direct_source` — one candidate per source, no host fanout. Everything
-        // downstream (blacklist, demote, last-known-good, playlist rewrite,
-        // segment proxy) treats this URL the same way it treats an Xtream URL.
         if let Some(direct) = &src.direct_source {
+            // Radio: URL given verbatim by `direct_source` — one candidate
+            // per source, no host fanout.
             if state.blacklist.is_url_failed(direct) {
                 continue;
             }
@@ -233,21 +327,34 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
             }
             continue;
         }
+        // Xtream TV source. Emit primary first, then speculatives.
+        let primary_host = src.origin_host.as_str();
+        if !primary_host.is_empty()
+            && alive.iter().any(|h| h == primary_host)
+            && !state.blacklist.is_host_bad(primary_host)
+        {
+            push_xtream_candidate(state, primary_host, src.stream_id, &mut fresh, &mut demoted);
+        }
         for host in &alive {
+            if host == primary_host {
+                continue;
+            }
             if state.blacklist.is_host_bad(host) {
                 continue;
             }
-            let url = state.xtream.stream_url(host, src.stream_id, "m3u8");
-            if state.blacklist.is_url_failed(&url) {
-                continue;
-            }
-            let cand = Candidate { url: url.clone(), host: host.clone() };
-            if state.blacklist.is_url_demoted(&url) {
-                demoted.push(cand);
-            } else {
-                fresh.push(cand);
-            }
+            push_xtream_candidate(state, host, src.stream_id, &mut fresh, &mut demoted);
         }
+    }
+
+    // Dedupe by URL — preserve order so primaries stay ahead of speculatives.
+    dedup_preserving_order(&mut fresh);
+    dedup_preserving_order(&mut demoted);
+    // Any URL that appears in `fresh` shouldn't *also* live in `demoted` (would
+    // cause us to retry the same URL twice in a single request).
+    {
+        let fresh_urls: std::collections::HashSet<&str> =
+            fresh.iter().map(|c| c.url.as_str()).collect();
+        demoted.retain(|c| !fresh_urls.contains(c.url.as_str()));
     }
 
     if let Some(lkg) = state.blacklist.last_known_good(&channel.key) {
@@ -267,23 +374,55 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
     // candidate set. The blacklist is a hint, not a hard rule — failing the
     // request without trying anything is worse than probing a possibly-stale
     // entry. If they really are all dead, the attempt loop in `play_playlist`
-    // returns 502 within its budget.
-    let has_xtream_source = channel.sources.iter().any(|s| s.direct_source.is_none());
-    if fresh.is_empty() && (!alive.is_empty() || channel.sources.iter().any(|s| s.direct_source.is_some())) {
+    // returns whatever error within its budget.
+    if fresh.is_empty()
+        && (!alive.is_empty() || channel.sources.iter().any(|s| s.direct_source.is_some()))
+    {
         for src in &channel.sources {
             if let Some(direct) = &src.direct_source {
                 let host = derive_host(direct).unwrap_or_default();
                 fresh.push(Candidate { url: direct.clone(), host });
-            } else if has_xtream_source {
+            } else if !src.origin_host.is_empty() {
+                let url = state.xtream.stream_url(&src.origin_host, src.stream_id, "m3u8");
+                fresh.push(Candidate { url, host: src.origin_host.clone() });
+            } else {
+                // No origin_host (legacy data) — fall back to fanning across
+                // alive hosts. Should only happen during the cold-start
+                // window between probe and first multi-host catalog refresh.
                 for host in &alive {
                     let url = state.xtream.stream_url(host, src.stream_id, "m3u8");
                     fresh.push(Candidate { url, host: host.clone() });
                 }
             }
         }
+        dedup_preserving_order(&mut fresh);
     }
 
     fresh
+}
+
+fn push_xtream_candidate(
+    state: &AppState,
+    host: &str,
+    stream_id: u64,
+    fresh: &mut Vec<Candidate>,
+    demoted: &mut Vec<Candidate>,
+) {
+    let url = state.xtream.stream_url(host, stream_id, "m3u8");
+    if state.blacklist.is_url_failed(&url) {
+        return;
+    }
+    let cand = Candidate { url: url.clone(), host: host.to_string() };
+    if state.blacklist.is_url_demoted(&url) {
+        demoted.push(cand);
+    } else {
+        fresh.push(cand);
+    }
+}
+
+fn dedup_preserving_order(v: &mut Vec<Candidate>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    v.retain(|c| seen.insert(c.url.clone()));
 }
 
 async fn fetch_and_rewrite_playlist(
@@ -291,6 +430,7 @@ async fn fetch_and_rewrite_playlist(
     channel: &CanonicalChannel,
     cand: &Candidate,
     public_base: &str,
+    track_failures: bool,
 ) -> anyhow::Result<Response> {
     debug!("playlist fetch: {} ({})", channel.key, cand.url);
     let resp = state
@@ -316,12 +456,25 @@ async fn fetch_and_rewrite_playlist(
     let body = std::str::from_utf8(&bytes)?;
 
     if body.starts_with("#EXTM3U") || content_type.contains("mpegurl") || content_type.contains("m3u8") {
+        // Xtream providers return HTTP 200 with a 1-segment ENDLIST playlist
+        // pointing at a "placeholder" .ts (typically a few seconds of black
+        // video) when the actual stream is unavailable — dead stream_id, geo
+        // block, account quota, etc. To the proxy that looks like a perfectly
+        // valid playlist; the client decodes it as a black screen and the
+        // candidate loop never falls through. Treat detected placeholders as
+        // a failure so the next candidate gets a turn.
+        if looks_like_placeholder_playlist(body) {
+            anyhow::bail!(
+                "upstream returned a placeholder/black playlist (stream unavailable on this source)"
+            );
+        }
         let rewritten = rewrite_playlist(
             body,
             &final_url,
             public_base,
             &channel.key,
             &cand.url,
+            track_failures,
         )?;
         let mut response = Response::new(Body::from(rewritten));
         response.headers_mut().insert(
@@ -350,6 +503,7 @@ fn rewrite_playlist(
     public_base: &str,
     channel_key: &str,
     source_url: &str,
+    track_failures: bool,
 ) -> anyhow::Result<String> {
     let base = playlist_url.clone();
     let public_base = public_base.trim_end_matches('/');
@@ -362,7 +516,14 @@ fn rewrite_playlist(
             continue;
         }
         if trimmed.starts_with('#') {
-            if let Some(rewritten) = rewrite_tag_with_uri(trimmed, &base, public_base, channel_key, source_url) {
+            if let Some(rewritten) = rewrite_tag_with_uri(
+                trimmed,
+                &base,
+                public_base,
+                channel_key,
+                source_url,
+                track_failures,
+            ) {
                 out.push_str(&rewritten);
                 out.push('\n');
             } else {
@@ -372,7 +533,13 @@ fn rewrite_playlist(
             continue;
         }
         if let Ok(resolved) = base.join(trimmed) {
-            out.push_str(&proxy_url(public_base, resolved.as_str(), channel_key, source_url));
+            out.push_str(&proxy_url(
+                public_base,
+                resolved.as_str(),
+                channel_key,
+                source_url,
+                track_failures,
+            ));
             out.push('\n');
         } else {
             out.push_str(line);
@@ -388,6 +555,7 @@ fn rewrite_tag_with_uri(
     public_base: &str,
     channel_key: &str,
     source_url: &str,
+    track_failures: bool,
 ) -> Option<String> {
     let uri_marker = "URI=\"";
     let idx = line.find(uri_marker)?;
@@ -395,7 +563,13 @@ fn rewrite_tag_with_uri(
     let rel_end = line[start..].find('"')?;
     let raw = &line[start..start + rel_end];
     let resolved = base.join(raw).ok()?;
-    let new_uri = proxy_url(public_base, resolved.as_str(), channel_key, source_url);
+    let new_uri = proxy_url(
+        public_base,
+        resolved.as_str(),
+        channel_key,
+        source_url,
+        track_failures,
+    );
     let mut s = String::with_capacity(line.len() + new_uri.len());
     s.push_str(&line[..start]);
     s.push_str(&new_uri);
@@ -403,11 +577,18 @@ fn rewrite_tag_with_uri(
     Some(s)
 }
 
-fn proxy_url(public_base: &str, absolute_upstream: &str, channel_key: &str, source_url: &str) -> String {
+fn proxy_url(
+    public_base: &str,
+    absolute_upstream: &str,
+    channel_key: &str,
+    source_url: &str,
+    track_failures: bool,
+) -> String {
     let payload = SegmentToken {
         u: absolute_upstream.to_string(),
         p: Some(source_url.to_string()),
         c: Some(channel_key.to_string()),
+        probe: !track_failures,
     };
     let json = serde_json::to_string(&payload).unwrap_or_else(|_| absolute_upstream.to_string());
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -433,6 +614,43 @@ fn upstream_ext(url: &str) -> Option<String> {
 fn is_abuse_url(u: &Url) -> bool {
     let host = u.host_str().unwrap_or("");
     host.contains("cloudflare-terms-of-service-abuse") || host.contains("abuse")
+}
+
+/// True if the playlist body looks like the Xtream "stream unavailable"
+/// placeholder — a short ENDLIST playlist whose segments point at a
+/// well-known filler filename (`black.ts`, `offline.ts`, …). The provider
+/// returns these instead of HTTP errors when an account/IP can't reach the
+/// real stream, which makes them indistinguishable from real playlists at
+/// the HTTP layer. Caller treats a match as a fetch failure so the candidate
+/// loop falls through to the next source.
+fn looks_like_placeholder_playlist(body: &str) -> bool {
+    // Match on filename component so we don't false-positive on legitimate
+    // streams whose path happens to contain one of these as a substring.
+    // Lowercased once per body — segment URLs are short and case-insensitive
+    // on the parts we care about.
+    static NEEDLES: &[&str] = &[
+        "/black.ts",
+        "/offline.ts",
+        "/no_signal.ts",
+        "/no-signal.ts",
+        "/nosignal.ts",
+        "/notavailable.ts",
+        "/not-available.ts",
+        "/comingsoon.ts",
+        "/coming-soon.ts",
+        "/closed.ts",
+    ];
+    for line in body.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let lower = l.to_ascii_lowercase();
+        if NEEDLES.iter().any(|needle| lower.contains(needle)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn derive_host(url: &str) -> Option<String> {
@@ -461,7 +679,12 @@ fn decode_segment_token(token: &str) -> Result<SegmentToken, (StatusCode, String
     let upstream = std::str::from_utf8(&decoded)
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad segment token (utf8)".into()))?
         .to_string();
-    Ok(SegmentToken { u: upstream, p: None, c: None })
+    Ok(SegmentToken {
+        u: upstream,
+        p: None,
+        c: None,
+        probe: false,
+    })
 }
 
 pub async fn proxy_segment(
@@ -538,14 +761,20 @@ pub async fn proxy_segment(
                 return passthrough_response(status, &upstream_headers, bytes);
             }
         };
-        let rewritten =
-            match rewrite_playlist(body, &final_url, &public_base, &channel_key, &source_url) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("nested playlist rewrite failed: {} → {}", upstream, e);
-                    return Err((StatusCode::BAD_GATEWAY, format!("rewrite: {e}")));
-                }
-            };
+        let rewritten = match rewrite_playlist(
+            body,
+            &final_url,
+            &public_base,
+            &channel_key,
+            &source_url,
+            !segment.probe,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("nested playlist rewrite failed: {} → {}", upstream, e);
+                return Err((StatusCode::BAD_GATEWAY, format!("rewrite: {e}")));
+            }
+        };
         let bytes_out = rewritten.into_bytes();
         let mut builder = Response::builder().status(status);
         builder = builder.header(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE);
@@ -570,7 +799,7 @@ pub async fn proxy_segment(
                 return Err((StatusCode::BAD_GATEWAY, format!("body read: {e}")));
             }
         };
-        let processed = handle_ts_segment(&state, stream_id.unwrap(), &bytes);
+        let processed = handle_ts_segment(&state, stream_id.unwrap(), &bytes, &segment);
         let mut builder = Response::builder().status(status);
         for h in [
             header::CONTENT_TYPE,
@@ -635,7 +864,12 @@ fn passthrough_response(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("body build error: {e}")))
 }
 
-fn handle_ts_segment(state: &AppState, stream_id: u64, bytes: &Bytes) -> Vec<u8> {
+fn handle_ts_segment(
+    state: &AppState,
+    stream_id: u64,
+    bytes: &Bytes,
+    segment: &SegmentToken,
+) -> Vec<u8> {
     let classification = match state.classifier.get(stream_id) {
         Some(c) => c,
         None => match classify_ts_chunk(bytes) {
@@ -660,6 +894,27 @@ fn handle_ts_segment(state: &AppState, stream_id: u64, bytes: &Bytes) -> Vec<u8>
         return bytes.to_vec();
     };
     if pids.is_empty() {
+        // No strippable subs. But if the classifier found subtitle PIDs we
+        // *can't* strip (because PCR rides on the same PID), demote the source
+        // — the webOS demuxer freezes on DVB subs and we have no way to fix
+        // it in flight. Better to send the next candidate next time. The
+        // demote also affects LKG handling so this same URL won't be the
+        // preferred pick on the next play.
+        if !classification.subtitle_pids.is_empty() && !segment.probe {
+            if let Some(source_url) = segment.p.as_deref() {
+                if !state.blacklist.is_url_demoted(source_url) {
+                    warn!(
+                        stream_id = stream_id,
+                        url = %source_url,
+                        "DVB subs collide with PCR PID; demoting source — webOS demuxer would stall"
+                    );
+                    state.blacklist.demote_url(source_url);
+                    if let Some(channel_key) = segment.c.as_deref() {
+                        state.blacklist.drop_last_known_good_if_matches(channel_key, source_url);
+                    }
+                }
+            }
+        }
         return bytes.to_vec();
     }
     strip_subtitle_pids(bytes, pmt_pid, &pids)
@@ -690,9 +945,12 @@ fn stream_id_from_source_url(url: &str) -> Option<u64> {
 }
 
 fn mark_segment_failure(state: &AppState, segment: &SegmentToken) {
-    state.blacklist.note_url_failed(&segment.u);
+    if segment.probe {
+        return;
+    }
+    state.blacklist.mark_failed(&segment.u);
     if let Some(source_url) = segment.p.as_deref() {
-        state.blacklist.note_url_failed(source_url);
+        state.blacklist.mark_failed(source_url);
         if let Some(channel_key) = segment.c.as_deref() {
             if let Some(lkg) = state.blacklist.last_known_good(channel_key) {
                 if lkg == source_url {
@@ -701,6 +959,100 @@ fn mark_segment_failure(state: &AppState, segment: &SegmentToken) {
             }
         }
     }
+}
+
+/// Walk one segment-deep into a master playlist and verify the segment is
+/// fetchable. Returns Ok on a 2xx response with a non-empty body; Err
+/// otherwise. Handles one level of nested playlist (master → chunklist →
+/// segment), which is what this provider serves. Range-limits the segment
+/// fetch to 512 bytes so we don't pull a full TS chunk just to check liveness.
+async fn validate_one_segment(
+    state: &AppState,
+    playlist_url: &Url,
+    body: &Bytes,
+    timeout: Duration,
+) -> Result<(), String> {
+    let text = std::str::from_utf8(body).map_err(|e| format!("utf8: {e}"))?;
+    let first_uri = pick_first_uri_in_playlist(text).ok_or("no URI in playlist".to_string())?;
+    let resolved = playlist_url
+        .join(&first_uri)
+        .map_err(|e| format!("resolve {first_uri}: {e}"))?;
+
+    let resp = tokio::time::timeout(
+        timeout,
+        state
+            .upstream_http
+            .get(resolved.as_str())
+            .header(reqwest::header::RANGE, "bytes=0-511")
+            .send(),
+    )
+    .await
+    .map_err(|_| "segment fetch timed out".to_string())?
+    .map_err(|e| format!("segment request: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() && !status.is_redirection() {
+        return Err(format!("segment status {}", status.as_u16()));
+    }
+    let final_url = resp.url().clone();
+    if is_abuse_url(&final_url) {
+        return Err("segment redirected to abuse page".into());
+    }
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Nested playlist: chunklist response. Recurse one level — fetch the first
+    // segment URI from it. Stop after one recursion; deeper nests aren't
+    // observed in practice and would risk a probing loop.
+    if content_type.contains("mpegurl")
+        || content_type.contains("m3u8")
+        || final_url.path().ends_with(".m3u8")
+    {
+        let inner_bytes = tokio::time::timeout(timeout, resp.bytes())
+            .await
+            .map_err(|_| "chunklist body timed out".to_string())?
+            .map_err(|e| format!("chunklist body: {e}"))?;
+        let inner_text = std::str::from_utf8(&inner_bytes).map_err(|e| format!("chunklist utf8: {e}"))?;
+        let inner_uri = pick_first_uri_in_playlist(inner_text)
+            .ok_or("no URI in chunklist".to_string())?;
+        let inner_resolved = final_url
+            .join(&inner_uri)
+            .map_err(|e| format!("resolve inner {inner_uri}: {e}"))?;
+        let inner_resp = tokio::time::timeout(
+            timeout,
+            state
+                .upstream_http
+                .get(inner_resolved.as_str())
+                .header(reqwest::header::RANGE, "bytes=0-511")
+                .send(),
+        )
+        .await
+        .map_err(|_| "inner segment fetch timed out".to_string())?
+        .map_err(|e| format!("inner segment: {e}"))?;
+        let inner_status = inner_resp.status();
+        if !inner_status.is_success() && !inner_status.is_redirection() {
+            return Err(format!("inner segment status {}", inner_status.as_u16()));
+        }
+        return Ok(());
+    }
+
+    // Real segment: drain a few bytes to confirm the body actually transfers.
+    let _ = tokio::time::timeout(timeout, resp.bytes()).await;
+    Ok(())
+}
+
+fn pick_first_uri_in_playlist(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        return Some(l.to_string());
+    }
+    None
 }
 
 fn schedule_opportunistic_validation(
@@ -744,7 +1096,7 @@ fn schedule_opportunistic_validation(
                             status = %status,
                             "opportunistic validation: bad status"
                         );
-                        state.blacklist.note_url_failed(&cand.url);
+                        state.blacklist.mark_failed(&cand.url);
                         continue;
                     }
                     if is_abuse_url(&final_url) {
@@ -753,21 +1105,53 @@ fn schedule_opportunistic_validation(
                             url = %cand.url,
                             "opportunistic validation: abuse redirect"
                         );
-                        state.blacklist.note_url_failed(&cand.url);
+                        state.blacklist.mark_failed(&cand.url);
                         continue;
                     }
                     match resp.bytes().await {
                         Ok(bytes) => {
                             let head = std::str::from_utf8(bytes.get(..7).unwrap_or(&[])).unwrap_or("");
-                            if head.starts_with("#EXTM3U") {
-                                debug!(channel = %channel_key, url = %cand.url, "opportunistic validation: ok");
+                            let body_str = std::str::from_utf8(&bytes).unwrap_or("");
+                            if head.starts_with("#EXTM3U")
+                                && looks_like_placeholder_playlist(body_str)
+                            {
+                                warn!(
+                                    channel = %channel_key,
+                                    url = %cand.url,
+                                    "opportunistic validation: placeholder playlist"
+                                );
+                                state.blacklist.mark_failed(&cand.url);
+                            } else if head.starts_with("#EXTM3U") {
+                                // Master playlist is OK; now verify segments are
+                                // actually fetchable. A surprisingly common
+                                // failure mode is "playlist responds but every
+                                // segment URL 502s" — the URL-only validation
+                                // missed it. Follow the chunklist + one segment.
+                                match validate_one_segment(&state, &final_url, &bytes, timeout).await {
+                                    Ok(()) => {
+                                        debug!(
+                                            channel = %channel_key,
+                                            url = %cand.url,
+                                            "opportunistic validation: playlist + segment ok"
+                                        );
+                                    }
+                                    Err(reason) => {
+                                        warn!(
+                                            channel = %channel_key,
+                                            url = %cand.url,
+                                            reason = %reason,
+                                            "opportunistic validation: playlist ok but segment failed"
+                                        );
+                                        state.blacklist.mark_failed(&cand.url);
+                                    }
+                                }
                             } else {
                                 warn!(
                                     channel = %channel_key,
                                     url = %cand.url,
                                     "opportunistic validation: not a playlist"
                                 );
-                                state.blacklist.note_url_failed(&cand.url);
+                                state.blacklist.mark_failed(&cand.url);
                             }
                         }
                         Err(e) => {
@@ -777,7 +1161,7 @@ fn schedule_opportunistic_validation(
                                 err = %e,
                                 "opportunistic validation: body read failed"
                             );
-                            state.blacklist.note_url_failed(&cand.url);
+                            state.blacklist.mark_failed(&cand.url);
                         }
                     }
                 }
@@ -788,7 +1172,7 @@ fn schedule_opportunistic_validation(
                         err = %e,
                         "opportunistic validation: request error"
                     );
-                    state.blacklist.note_url_failed(&cand.url);
+                    state.blacklist.mark_failed(&cand.url);
                 }
                 Err(_) => {
                     warn!(
@@ -796,7 +1180,7 @@ fn schedule_opportunistic_validation(
                         url = %cand.url,
                         "opportunistic validation: timeout"
                     );
-                    state.blacklist.note_url_failed(&cand.url);
+                    state.blacklist.mark_failed(&cand.url);
                 }
             }
         }
@@ -873,6 +1257,7 @@ async fn catchup_play(
     req: CatchupRequest,
     public_base: &str,
     play_id: &str,
+    client_pid: Option<&str>,
 ) -> Result<Response, (StatusCode, String)> {
     let started = Instant::now();
     let started_wall = time::OffsetDateTime::now_utc();
@@ -893,10 +1278,13 @@ async fn catchup_play(
         ));
     }
 
-    let host = pick_archive_host(&state, &channel, source).ok_or((
-        StatusCode::BAD_GATEWAY,
-        "catch-up upstream failed: no alive host".into(),
-    ))?;
+    let candidate_hosts = archive_candidate_hosts(&state);
+    if candidate_hosts.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "catch-up upstream failed: no alive host".into(),
+        ));
+    }
 
     let now = OffsetDateTime::now_utc();
     let duration_min = match req.explicit_duration_min {
@@ -911,95 +1299,168 @@ async fn catchup_play(
         }
     };
 
-    let upstream = state.xtream.timeshift_url(&host, source.stream_id, duration_min, req.start);
-
-    debug!(
+    let per_attempt = Duration::from_secs(state.config.proxy.per_attempt_timeout_secs);
+    let budget = Duration::from_secs(state.config.proxy.play_budget_secs);
+    let mut attempts: Vec<PlayAttempt> = Vec::new();
+    let mut last_err: Option<String> = None;
+    let total_candidates = candidate_hosts.len();
+    info!(
+        play = %play_id,
         channel = %channel.key,
-        host = %host,
-        stream_id = source.stream_id,
-        start = %req.start,
-        duration_min = duration_min,
-        upstream = %upstream,
-        "catch-up playlist fetch"
+        candidates = total_candidates,
+        "catchup play start"
     );
 
-    // Catch-up has a single source; the per-attempt timeout used for live
-    // failover doesn't apply. Lean on the upstream_http client's own timeout.
-    let cand = Candidate { url: upstream.clone(), host };
-    let attempt_start = Instant::now();
-    info!(play = %play_id, channel = %channel.key, "catchup play start");
-    match fetch_and_rewrite_playlist(&state, &channel, &cand, public_base).await {
-        Ok(resp) => {
-            let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
-            info!(play = %play_id, channel = %channel.key, host = %cand.host, elapsed_ms, "catchup play ok");
-            state.play_log.record(PlayEvent {
-                id: play_id.to_string(),
-                started: started_wall,
-                channel: channel.key.clone(),
-                catchup: true,
-                total_ms: started.elapsed().as_millis() as u64,
-                candidates_total: 1,
-                succeeded: true,
-                error: None,
-                attempts: vec![PlayAttempt {
+    for host in candidate_hosts {
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            warn!(play = %play_id, channel = %channel.key, "catchup budget exhausted");
+            break;
+        }
+        let remaining = budget.saturating_sub(elapsed);
+        let attempt_timeout = per_attempt.min(remaining);
+
+        let upstream = state.xtream.timeshift_url(&host, source.stream_id, duration_min, req.start);
+        debug!(
+            channel = %channel.key,
+            host = %host,
+            stream_id = source.stream_id,
+            start = %req.start,
+            duration_min = duration_min,
+            upstream = %upstream,
+            "catch-up playlist fetch"
+        );
+        let cand = Candidate { url: upstream.clone(), host: host.clone() };
+        let attempt_start = Instant::now();
+        match tokio::time::timeout(
+            attempt_timeout,
+            fetch_and_rewrite_playlist(&state, &channel, &cand, public_base, true),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                info!(play = %play_id, channel = %channel.key, host = %cand.host, elapsed_ms, "catchup play ok");
+                if let Some(pid) = client_pid {
+                    state.play_sessions.note(pid, &channel.key, &cand.url);
+                }
+                attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
                     elapsed_ms,
                     outcome: AttemptOutcome::Ok,
-                }],
-            });
-            Ok(resp)
-        }
-        Err(e) => {
-            let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
-            let reason = e.to_string();
-            warn!(
-                play = %play_id,
-                channel = %channel.key,
-                url = %cand.url,
-                elapsed_ms,
-                error = %reason,
-                "catch-up upstream failed",
-            );
-            state.play_log.record(PlayEvent {
-                id: play_id.to_string(),
-                started: started_wall,
-                channel: channel.key.clone(),
-                catchup: true,
-                total_ms: started.elapsed().as_millis() as u64,
-                candidates_total: 1,
-                succeeded: false,
-                error: Some(reason.clone()),
-                attempts: vec![PlayAttempt {
+                });
+                state.play_log.record(PlayEvent {
+                    id: play_id.to_string(),
+                    started: started_wall,
+                    channel: channel.key.clone(),
+                    catchup: true,
+                    total_ms: started.elapsed().as_millis() as u64,
+                    candidates_total: total_candidates,
+                    succeeded: true,
+                    error: None,
+                    attempts,
+                });
+                return Ok(resp);
+            }
+            Ok(Err(e)) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                let reason = e.to_string();
+                warn!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    url = %cand.url,
+                    elapsed_ms,
+                    error = %reason,
+                    "catch-up upstream failed",
+                );
+                // Catchup is a single-source path; URL-level failure tracking still
+                // applies so a permanently-bad host's URLs get demoted/blacklisted
+                // like live URLs do.
+                state.blacklist.mark_failed(&cand.url);
+                attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
                     elapsed_ms,
-                    outcome: AttemptOutcome::Err { reason },
-                }],
-            });
-            Err((
-                StatusCode::BAD_GATEWAY,
-                format!("catch-up upstream failed: {e}"),
-            ))
+                    outcome: AttemptOutcome::Err { reason: reason.clone() },
+                });
+                last_err = Some(reason);
+                continue;
+            }
+            Err(_) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                warn!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    url = %cand.url,
+                    elapsed_ms,
+                    "catch-up upstream timed out",
+                );
+                state.blacklist.mark_failed(&cand.url);
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Timeout,
+                });
+                last_err = Some(format!("timeout after {attempt_timeout:?}"));
+                continue;
+            }
         }
     }
+
+    let err_text = format!(
+        "catch-up upstream failed: {}",
+        last_err.as_deref().unwrap_or("no alive host accepted the request"),
+    );
+    state.play_log.record(PlayEvent {
+        id: play_id.to_string(),
+        started: started_wall,
+        channel: channel.key.clone(),
+        catchup: true,
+        total_ms: started.elapsed().as_millis() as u64,
+        candidates_total: total_candidates,
+        succeeded: false,
+        error: Some(last_err.unwrap_or_else(|| "no alive host accepted the request".into())),
+        attempts,
+    });
+    Err((StatusCode::BAD_GATEWAY, err_text))
 }
 
-fn pick_archive_host(
-    state: &AppState,
-    _channel: &CanonicalChannel,
-    _source: &CanonicalSource,
-) -> Option<String> {
+/// Ordered list of alive hosts to try for a catch-up request, with the same
+/// safety-valve semantics as `build_candidates`: prefer non-blacklisted hosts,
+/// but fall back to the blacklisted ones if that's all we have. Returns
+/// hosts in latency-ascending order.
+fn archive_candidate_hosts(state: &AppState) -> Vec<String> {
     let alive = state.hosts.alive_hosts_ranked();
-    // Mirror build_candidates: if every alive host is blacklisted, probe one
-    // anyway. The blacklist is a hint — failing without trying anything is
-    // worse than retrying a possibly-stale entry. The downstream fetch will
-    // return 502 within its budget if the host really is dead.
-    alive
-        .iter()
-        .find(|h| !state.blacklist.is_host_bad(h))
-        .cloned()
-        .or_else(|| alive.into_iter().next())
+    let mut fresh: Vec<String> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for h in alive {
+        if state.blacklist.is_host_bad(&h) {
+            bad.push(h);
+        } else {
+            fresh.push(h);
+        }
+    }
+    if fresh.is_empty() {
+        // Blacklist filtered everything out — try the blacklisted ones anyway
+        // before returning 502. Matches build_candidates' fallback.
+        fresh.extend(bad);
+    }
+    fresh
+}
+
+/// pid is opaque to the proxy but ends up in tracing fields, log files and the
+/// /admin/recent-plays diagnostic. Allow only short alphanumerics so a hostile
+/// client can't inject control characters or pin arbitrarily-large strings into
+/// the play_sessions map.
+fn sanitize_pid(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(32)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1012,6 +1473,8 @@ mod tests {
             at: at.map(str::to_string),
             from: from.map(str::to_string),
             duration: dur.map(str::to_string),
+            probe: false,
+            pid: None,
         }
     }
 
@@ -1186,6 +1649,7 @@ mod tests {
                     tv_archive: true,
                     tv_archive_duration: Some(3),
                     direct_source: None,
+                    origin_host: String::new(),
                 },
                 CanonicalSource {
                     stream_id: 2,
@@ -1195,6 +1659,7 @@ mod tests {
                     tv_archive: true,
                     tv_archive_duration: Some(3),
                     direct_source: None,
+                    origin_host: String::new(),
                 },
                 CanonicalSource {
                     stream_id: 3,
@@ -1204,6 +1669,7 @@ mod tests {
                     tv_archive: false,
                     tv_archive_duration: None,
                     direct_source: None,
+                    origin_host: String::new(),
                 },
             ],
         };
@@ -1228,8 +1694,44 @@ mod tests {
                 tv_archive: false,
                 tv_archive_duration: None,
                 direct_source: None,
+                origin_host: String::new(),
             }],
         };
         assert!(ch.pick_archive_source().is_none());
+    }
+
+    #[test]
+    fn segment_token_marks_probe_requests_non_mutating() {
+        let url = proxy_url(
+            "https://iptv.example.test",
+            "https://upstream.example/chunklist.m3u8",
+            "antena1",
+            "https://upstream.example/master.m3u8",
+            false,
+        );
+        let token = url.rsplit('/').next().unwrap();
+        let decoded = decode_segment_token(token).unwrap();
+        assert!(decoded.probe);
+        assert_eq!(decoded.u, "https://upstream.example/chunklist.m3u8");
+        assert_eq!(
+            decoded.p.as_deref(),
+            Some("https://upstream.example/master.m3u8")
+        );
+        assert_eq!(decoded.c.as_deref(), Some("antena1"));
+    }
+
+    #[test]
+    fn segment_token_tracks_failures_for_regular_playback() {
+        let url = proxy_url(
+            "https://iptv.example.test",
+            "https://upstream.example/seg.ts",
+            "rtp1",
+            "https://upstream.example/live.m3u8",
+            true,
+        );
+        let token = url.rsplit('/').next().unwrap();
+        let decoded = decode_segment_token(token).unwrap();
+        assert!(!decoded.probe);
+        assert_eq!(decoded.u, "https://upstream.example/seg.ts");
     }
 }

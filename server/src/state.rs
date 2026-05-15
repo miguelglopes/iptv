@@ -11,6 +11,7 @@ use crate::default_order::Curation;
 use crate::epg::EpgState;
 use crate::hosts::HostState;
 use crate::play_log::PlayLog;
+use crate::play_sessions::PlaySessions;
 use crate::xtream::XtreamClient;
 
 pub struct AppState {
@@ -28,6 +29,10 @@ pub struct AppState {
     pub classifier: Arc<StreamClassifier>,
     pub upstream_http: Client,
     pub play_log: Arc<PlayLog>,
+    /// Per-play upstream attribution. Lets `/api/feedback` blame the exact
+    /// upstream the failing client was served, instead of racing against the
+    /// global last-known-good. See `play_sessions.rs`.
+    pub play_sessions: Arc<PlaySessions>,
 }
 
 impl AppState {
@@ -65,6 +70,7 @@ impl AppState {
             classifier,
             upstream_http,
             play_log: Arc::new(PlayLog::new()),
+            play_sessions: Arc::new(PlaySessions::new()),
         }))
     }
 }

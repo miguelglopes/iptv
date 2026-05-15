@@ -52,14 +52,22 @@ host_fail_threshold = 4
 url_ttl_secs = 3600
 host_ttl_secs = 3600
 demote_ttl_secs = 10800
+# Number of URL-level failures within `url_fail_window_secs` before a URL is
+# hard-blacklisted (build_candidates skips it entirely). First N-1 failures
+# still demote the URL — it sinks to the back of the candidate queue but stays
+# tried. Threshold absorbs network blips and occasional cross-client misblame.
+url_fail_threshold = 3
+url_fail_window_secs = 300
 
 [proxy]
 upstream_timeout_secs = 15
 segment_buffer_bytes = 65536
-play_budget_secs = 10
+# Upper bound on a single play request. With per_attempt_timeout_secs=5 this
+# allows ~12 candidate attempts; in practice candidates exhaust well before.
+play_budget_secs = 60
 per_attempt_timeout_secs = 5
 opportunistic_validate_count = 2
-opportunistic_validate_timeout_secs = 4
+opportunistic_validate_timeout_secs = 6
 
 # Optional taste / locale knobs. Omit the whole section to get a neutral catalog:
 # channels appear in alphabetical-by-display-name order, with only universal

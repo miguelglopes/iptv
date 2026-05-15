@@ -8,7 +8,8 @@ import {
   loadLastPlayTimestamp,
   loadActiveMode, saveActiveMode
 } from './cache.js';
-import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, adminClearBlacklist, adminClearDemoted, adminClearAllSources } from './api.js';
+import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, adminClearBlacklist, adminClearDemoted, adminClearAllSources, setClientCaps } from './api.js';
+import { ensureCaps, clearCaps } from './caps.js';
 // Namespace import so the field stays optional — older config.js files that pre-date
 // PROVIDER_LAG_MS won't crash with a named-import SyntaxError; we just fall back to 0.
 import * as cfg from './config.js';
@@ -214,6 +215,13 @@ function clearChannelsCacheAction() {
   notifyCleared('Cached channels (next boot refetches)');
 }
 
+function rerunCapsAction() {
+  clearCaps();
+  clearChannelsCache();
+  notifyCleared('Capability cache — re-detecting on reload');
+  location.reload();
+}
+
 function clearAllAction() {
   try { localStorage.clear(); } catch (e) {}
   location.reload();
@@ -229,6 +237,7 @@ var SETTINGS_ACTIONS = [
   clearSearchHistoryAction,
   clearRecentChannelsAction,
   clearChannelsCacheAction,
+  rerunCapsAction,
   clearAllAction
 ];
 var SETTINGS_COUNT = SETTINGS_ACTIONS.length;
@@ -859,6 +868,23 @@ function captureZapList() {
   state.zapList = visibleChannels();
 }
 
+// Per-play identifier the server uses to attribute upstream choices back to this
+// exact play attempt. Server reads `?pid=…` from the play URL, stores
+// (pid → chosen-upstream), then resolves the same pid when this client later
+// POSTs /api/feedback so the demote/blacklist targets the URL we actually
+// played (not whatever LKG points at when feedback arrives — which races
+// when multiple clients are touching the same channel).
+function newPlayId() {
+  // Two random calls so we get a full 12-hex-char token even when toString(16)
+  // returns a short fractional under some engines.
+  return (Math.random().toString(16).slice(2, 10)
+        + Math.random().toString(16).slice(2, 6)).slice(0, 12);
+}
+
+function appendPid(url, pid) {
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'pid=' + encodeURIComponent(pid);
+}
+
 function play(channel) {
   if (state.search) pushSearchHistory(state.search);
   captureZapList();
@@ -868,13 +894,15 @@ function play(channel) {
   // wherever the click happened and now refers to a different row (the recents header
   // / a different channel) because everything shifted down.
   state.focusIdx = focusIdxForChannel(channel.key);
-  state.playing = { channel: channel, mode: 'live' };
+  var pid = newPlayId();
+  state.playing = { channel: channel, mode: 'live', playId: pid };
   state.mini = false;
   updateBodyClass();
   setOverlay(channel.name, '', 'connecting…', true);
   mark('playStart');
-  logEvent('play', channel.name, { url: channel.play_url });
-  player.play(channel.play_url);
+  var url = appendPid(channel.play_url, pid);
+  logEvent('play', channel.name, { url: url, pid: pid });
+  player.play(url);
 }
 
 // Auto-resume the most recently played channel on app boot.
@@ -924,18 +952,20 @@ function playCatchup(channel, program) {
   state.focusIdx = focusIdxForChannel(channel.key);
   var atIso = program.start.toISOString();
   var durationMin = Math.ceil((program.end.getTime() - program.start.getTime()) / 60000) + 5;
-  var url = catchupUrl(channel, atIso, durationMin);
+  var pid = newPlayId();
+  var url = appendPid(catchupUrl(channel, atIso, durationMin), pid);
   state.playing = {
     channel: channel,
     mode: 'catchup',
-    catchup: { program: program, atIso: atIso, durationMin: durationMin }
+    catchup: { program: program, atIso: atIso, durationMin: durationMin },
+    playId: pid
   };
   state.mini = false;
   updateBodyClass();
   showCatchupBadge();
   setOverlay(channel.name, program.title || '', 'CATCH-UP · loading…', true);
   mark('catchupStart');
-  logEvent('catchup', channel.name + ' / ' + (program.title || ''), { url: url, atIso: atIso, durationMin: durationMin });
+  logEvent('catchup', channel.name + ' / ' + (program.title || ''), { url: url, atIso: atIso, durationMin: durationMin, pid: pid });
   player.play(url);
 }
 
@@ -993,7 +1023,8 @@ function commitZap() {
   var list = zapState.list;
   var idx = zapState.idx;
   zapState = null;
-  state.playing = { channel: ch, mode: 'live' };
+  var pid = newPlayId();
+  state.playing = { channel: ch, mode: 'live', playId: pid };
   // Order matters: pushRecentChannel BEFORE focusIdxForChannel, so the snap sees the
   // new recents-section row at the top and anchors there. If we snapped first, the
   // recents list would grow underneath us and state.focusIdx would point one row off.
@@ -1003,8 +1034,9 @@ function commitZap() {
   // No setOverlay here — the bottom-centre banner already carries channel name + LIVE,
   // and the post-commit linger keeps it visible. player.onPlaying is also suppressed
   // for the same reason while the banner is up.
-  logEvent('zap-commit', ch.name, { url: ch.play_url });
-  player.play(ch.play_url);
+  var url = appendPid(ch.play_url, pid);
+  logEvent('zap-commit', ch.name, { url: url, pid: pid });
+  player.play(url);
   // Linger: keep both the strip and the banner visible for POST_COMMIT_LINGER_MS so
   // the user has a confirmation of what they landed on. Re-render first — state.playing
   // is now the committed channel, which clears the LIVE pill from the row we just left.
@@ -1186,6 +1218,26 @@ function seekCatchup(seconds) {
   }
 }
 
+// Re-play the current channel with a freshly-generated play_id. Used after a
+// demote (user-requested switch) or a fail-feedback round-trip — both want the
+// server's candidate builder to pick a different upstream than the one this
+// client just tagged as bad. The fresh pid also means the next feedback POST
+// blames the NEW upstream, not the old one.
+function replayWithFreshPid() {
+  if (!state.playing) return;
+  var pid = newPlayId();
+  state.playing.playId = pid;
+  var ch = state.playing.channel;
+  var url;
+  if (state.playing.mode === 'catchup') {
+    var cu = state.playing.catchup || {};
+    url = appendPid(catchupUrl(ch, cu.atIso, cu.durationMin || 60), pid);
+  } else {
+    url = appendPid(ch.play_url, pid);
+  }
+  player.play(url);
+}
+
 var switchTimer = null;
 function switchSource() {
   if (!state.playing) return;
@@ -1198,10 +1250,12 @@ function switchSource() {
   switchTimer = setTimeout(function () {
     switchTimer = null;
     if (!state.playing) return;
-    // Await the POST so the server has demoted the LKG before the playlist refetch —
-    // otherwise the refresh can race the update and the server may serve the same URL.
-    demoteSource(state.playing.channel.key, 'user-requested').then(function () {
-      player.refresh();
+    // Capture pid BEFORE the await — server must blame the OLD upstream choice.
+    var oldPid = state.playing.playId || null;
+    // Await the POST so the demote lands before the new play URL re-hits the
+    // proxy, otherwise build_candidates may still rank the same URL first.
+    demoteSource(state.playing.channel.key, oldPid, 'user-requested').then(function () {
+      replayWithFreshPid();
     });
   }, 250);
 }
@@ -1349,16 +1403,18 @@ function enterCatchupAtNow(offsetSec) {
     return;
   }
   var atIso = new Date(Date.now() + offsetSec * 1000).toISOString();
-  var url = catchupUrl(ch, atIso, 60);
+  var pid = newPlayId();
+  var url = appendPid(catchupUrl(ch, atIso, 60), pid);
   state.playing = {
     channel: ch,
     mode: 'catchup',
-    catchup: { atIso: atIso, durationMin: 60 }
+    catchup: { atIso: atIso, durationMin: 60 },
+    playId: pid
   };
   updateBodyClass();
   showCatchupBadge();
   setOverlay(ch.name, '', 'CATCH-UP · rewinding…', true);
-  logEvent('catchup-rewind', ch.name, { url: url, offsetSec: offsetSec });
+  logEvent('catchup-rewind', ch.name, { url: url, offsetSec: offsetSec, pid: pid });
   player.play(url);
 }
 
@@ -1367,11 +1423,13 @@ function toggleCatchupMode() {
   cancelZap();
   var ch = state.playing.channel;
   if (state.playing.mode === 'catchup') {
-    state.playing = { channel: ch, mode: 'live' };
+    var pid = newPlayId();
+    state.playing = { channel: ch, mode: 'live', playId: pid };
     updateBodyClass();
     setOverlay(ch.name, '', 'live', true);
-    logEvent('catchup-exit', ch.name);
-    player.play(ch.play_url);
+    var url = appendPid(ch.play_url, pid);
+    logEvent('catchup-exit', ch.name, { pid: pid });
+    player.play(url);
     return;
   }
   enterCatchupAtNow(-60);
@@ -1485,10 +1543,11 @@ player.onSourceFailed = function (url, reason) {
     renderList();
     return;
   }
-  logEvent('fail', state.playing.channel.name, { url: url, reason: reason });
+  logEvent('fail', state.playing.channel.name, { url: url, reason: reason, pid: state.playing.playId });
   setOverlay(state.playing.channel.name, '', 'retrying…', true);
-  reportFailure(state.playing.channel.key, reason).then(function () {
-    player.refresh();
+  var oldPid = state.playing.playId || null;
+  reportFailure(state.playing.channel.key, oldPid, reason).then(function () {
+    replayWithFreshPid();
   });
 };
 
@@ -1707,24 +1766,35 @@ updateBodyClass();
 renderList();
 tryAutoResume();
 
-// Step 2: fetch the fresh catalog, save it, re-render.
+// Step 2: probe client capabilities (cached after first run, so this is
+// instant on every boot after the first), then fetch the fresh catalog
+// with `X-Client-Caps` set so the server can filter out channels this
+// browser can't play.
 catalogLoading = true;
 mark('channelsFetchStart');
 setHint(hintText(visibleItems().length));
-listChannels().then(function (channels) {
-  mark('channelsFetchEnd');
-  catalogLoading = false;
-  state.channels = channels;
-  saveChannelsCache(channels);
-  state.zapList = null;
-  renderList();
-  tryAutoResume();
-}).catch(function (err) {
-  catalogLoading = false;
-  if (!state.channels.length) {
-    setError('proxy fetch failed: ' + (err && err.message || err));
-  }
-});
+ensureCaps()
+  .then(function (caps) {
+    mark('capsReady');
+    setClientCaps(caps);
+    logEvent('caps', 'client capabilities', { caps: caps });
+    return listChannels();
+  })
+  .then(function (channels) {
+    mark('channelsFetchEnd');
+    catalogLoading = false;
+    state.channels = channels;
+    saveChannelsCache(channels);
+    state.zapList = null;
+    renderList();
+    tryAutoResume();
+  })
+  .catch(function (err) {
+    catalogLoading = false;
+    if (!state.channels.length) {
+      setError('proxy fetch failed: ' + (err && err.message || err));
+    }
+  });
 
 // Step 3: poll /api/status for the header host count. Just updates the .hint text —
 // no list rebuild.

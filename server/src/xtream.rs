@@ -52,7 +52,13 @@ impl XtreamClient {
 
     pub async fn all_live_streams(&self, host: &str) -> Result<Vec<LiveStream>> {
         let url = self.url(host, Some("get_live_streams"), &[]);
-        let body: Vec<LiveStream> = self.http.get(&url).send().await?.error_for_status()?.json().await?;
+        let mut body: Vec<LiveStream> = self.http.get(&url).send().await?.error_for_status()?.json().await?;
+        // Tag each stream with the host it came from so downstream catalog +
+        // candidate builders can route each (stream_id) back to the host that
+        // actually has it (some providers don't share stream_ids across hosts).
+        for s in body.iter_mut() {
+            s.origin_host = host.to_string();
+        }
         Ok(body)
     }
 
@@ -186,6 +192,13 @@ pub struct LiveStream {
     /// instances from the vendored M3U.
     #[serde(default, skip)]
     pub kind: ChannelKind,
+    /// Which alive host this stream came from. Empty for radio entries (they
+    /// carry `direct_source` and don't fan across hosts). Set by
+    /// `all_live_streams` at fetch time. Used by `build_canonical` /
+    /// `proxy::build_candidates` to route the right stream_id to the right
+    /// host on play.
+    #[serde(default, skip)]
+    pub origin_host: String,
 }
 
 impl LiveStream {

@@ -107,9 +107,21 @@ pub struct BlacklistConfig {
     pub host_ttl_secs: u64,
     #[serde(default = "default_demote_ttl")]
     pub demote_ttl_secs: u64,
+    /// Number of distinct failures (within `url_fail_window_secs`) before a
+    /// URL is hard-blacklisted. The first failure just demotes it (sent to
+    /// the back of the candidate queue, still retried). Default 3 — absorbs
+    /// network blips, slow Wi-Fi moments and one-off cross-client misblame.
+    #[serde(default = "default_url_fail_threshold")]
+    pub url_fail_threshold: u32,
+    /// Sliding window for the threshold above. Failures outside the window
+    /// reset the counter to 1. Default 300 s (5 min).
+    #[serde(default = "default_url_fail_window")]
+    pub url_fail_window_secs: u64,
 }
 
 fn default_demote_ttl() -> u64 { 10800 }
+fn default_url_fail_threshold() -> u32 { 3 }
+fn default_url_fail_window() -> u64 { 300 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
@@ -127,10 +139,16 @@ pub struct ProxyConfig {
 }
 
 fn default_segment_buffer() -> usize { 65536 }
-fn default_play_budget() -> u64 { 10 }
+// Generous enough to exhaust ~12 attempts at the default per-attempt cap.
+// Practical candidate counts (alive hosts × variants × demoted bucket) sit well
+// below this; the budget is just a final safety net against pathological loops.
+fn default_play_budget() -> u64 { 60 }
 fn default_per_attempt() -> u64 { 5 }
 fn default_validate_count() -> usize { 2 }
-fn default_validate_timeout() -> u64 { 4 }
+// Match `per_attempt_timeout_secs` plus a small margin: validation runs in
+// background and we don't want it to flag slow-but-working URLs that an actual
+// play would still tolerate.
+fn default_validate_timeout() -> u64 { 6 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {

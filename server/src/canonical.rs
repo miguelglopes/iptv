@@ -222,6 +222,13 @@ pub struct CanonicalSource {
     /// See `proxy::build_candidates`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct_source: Option<String>,
+    /// Host this source's `stream_id` was discovered on. Empty for
+    /// direct-source channels (radio). `proxy::build_candidates` uses this
+    /// to emit the primary candidate (`origin_host` × `stream_id`) before
+    /// falling back to speculative cross-host fan-out (which only helps
+    /// when the provider replicates stream_ids across hosts).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_host: String,
 }
 
 pub fn quality_tier(name: &str) -> Option<&'static str> {
@@ -294,11 +301,27 @@ pub fn build_canonical(streams: &[LiveStream], curation: &Curation) -> Vec<Canon
             tv_archive,
             tv_archive_duration,
             direct_source,
+            origin_host: st.origin_host.clone(),
         });
     }
 
     let mut list: Vec<CanonicalChannel> = groups.into_values().collect();
     for ch in &mut list {
+        // Dedup sources within a channel: a multi-host catalog fetch can return
+        // the same (variant, stream_id) from several hosts. Keep one per
+        // (stream_id, origin_host) pair — they correspond to distinct
+        // candidates downstream — and within identical (stream_id, host)
+        // entries, prefer the highest-scored copy (mojibake repair / longer
+        // name).
+        ch.sources.sort_by(|a, b| {
+            (a.stream_id, a.origin_host.as_str(), -a.score)
+                .cmp(&(b.stream_id, b.origin_host.as_str(), -b.score))
+        });
+        ch.sources.dedup_by(|next, prev| {
+            next.stream_id == prev.stream_id && next.origin_host == prev.origin_host
+        });
+        // Final ordering: score descending so highest-quality variants are
+        // tried first by build_candidates.
         ch.sources.sort_by(|a, b| b.score.cmp(&a.score));
         if let Some(override_name) = curation.display_overrides.get(&ch.key) {
             ch.name = override_name.clone();

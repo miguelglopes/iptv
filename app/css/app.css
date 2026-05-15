@@ -316,17 +316,20 @@ body.mini.panel-player .top-slot {
    so failing URLs (some Bauer/IOL logos time out) silently fall back to
    text-only. Same template for TV and radio — TV's `ChannelDto.logo` was
    already populated by the server, this just renders it.
-   max-width + height:auto preserve each logo's natural aspect ratio: horizontal
-   banners (RTP 2000×568) render wide, square logos (Cidade FM) render at their
-   natural square within the cap. No fixed box → no letterboxing artefacts. */
+
+   Aspect-ratio handling: fix the height, let the width derive from the image's
+   intrinsic ratio, then cap with max-width. In a flex parent, an <img> without
+   an explicit height can get stretched along the cross-axis; pinning height +
+   width:auto + max-width is the combination that survives flex layout. */
 .list-item img.logo {
-  height: auto;
+  display: block;
+  height: 32px;
   width: auto;
-  max-height: 36px;
-  max-width: 72px;
+  max-width: 96px;
   object-fit: contain;
   margin-right: 14px;
   flex-shrink: 0;
+  align-self: center;
 }
 
 /* EPG / Guide panel — sits inside the same right aside the settings shares. */
