@@ -10,6 +10,11 @@ services:
       - "8080:8080"
     volumes:
       - ./server/config.toml:/srv/iptv-proxy/config.toml:ro
+      # Vendored radio M3U. config.toml's `[radio] m3u_path = "radios.m3u"`
+      # resolves relative to the binary's CWD inside the container, so we
+      # bind-mount the file alongside config.toml. Read-only — radio source
+      # list is curated in the repo, not on the deploy target.
+      - ./server/radios.m3u:/srv/iptv-proxy/radios.m3u:ro
       - ./app:/srv/app:ro
       # Override the gitignored app/js/config.js (which carries the LAN URL the
       # TV uses) with a same-origin config so the browser UI talks to this very
