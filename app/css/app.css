@@ -25,9 +25,13 @@ body.no-cursor, body.no-cursor * { cursor: none !important; }
 body.pointer-active { cursor: auto !important; }
 
 body {
+  /* `background-attachment: fixed` is gone here intentionally — body has
+     overflow:clip so it never scrolls; `fixed` only added compositor cost
+     on the TV when scrollable inner panels (.list, .bottom-slot) repainted
+     over a fixed background layer. The visual is identical. */
   background:
     linear-gradient(90deg, rgba(10, 10, 20, 0.72) 0%, rgba(10, 10, 20, 0.42) 55%, rgba(10, 10, 20, 0.18) 100%),
-    url('../bg.jpg') center/cover no-repeat fixed;
+    url('../bg.jpg') center/cover no-repeat;
 }
 
 /* The video element. Default = fullscreen overlay (player just created it on body).
@@ -129,15 +133,14 @@ h1 {
   font-family: ui-monospace, monospace;
 }
 
-@keyframes pulse {
-  0%, 100% { opacity: 0.35; }
-  50%      { opacity: 1; }
-}
-
 .hint .spin {
   display: inline-block;
-  color: #ffcc66;
-  animation: pulse 0.9s ease-in-out infinite;
+  /* Dimmer/desaturated gold conveys "in-flight / waiting" passively — paired
+     with the text ("contacting proxy…" / "probing N hosts") it's still
+     unambiguous, and ditching the opacity-pulse animation lets the compositor
+     idle when nothing else is moving. The ✓-state below is a brighter green
+     to keep the success ↔ pending contrast obvious. */
+  color: rgba(255, 204, 102, 0.55);
   margin-right: 6px;
 }
 
@@ -324,8 +327,11 @@ body.mini.panel-player .top-slot {
 .list-item img.logo {
   display: block;
   height: 32px;
-  width: auto;
-  max-width: 96px;
+  /* Fixed width (was `width:auto; max-width:96px`) so each row reserves a
+     consistent 96×32 slot before its lazy-loaded image arrives — eliminates
+     the per-row reflow that used to ripple as logos faded in during scroll.
+     object-fit:contain keeps every logo correctly proportioned inside the box. */
+  width: 96px;
   object-fit: contain;
   margin-right: 14px;
   flex-shrink: 0;
@@ -384,11 +390,9 @@ body.mini.panel-player .top-slot {
 }
 .epg-now-badge::before {
   content: '● ';
-  animation: nowPulse 1.4s ease-in-out infinite;
-}
-@keyframes nowPulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
+  /* Static red glow replaces the opacity-pulse — same "this is live" cue
+     without keeping a compositor layer awake forever. */
+  text-shadow: 0 0 8px rgba(255, 85, 85, 0.7);
 }
 .epg-time {
   font-family: ui-monospace, monospace;
@@ -678,7 +682,7 @@ body.playing #zap-banner { display: block; }
 }
 .zb-live::before {
   content: '● ';
-  animation: nowPulse 1.4s ease-in-out infinite;
+  text-shadow: 0 0 8px rgba(255, 85, 85, 0.7);
 }
 .zb-catchup {
   font-size: 11px;
@@ -849,8 +853,10 @@ body.playing #zap-banner { display: block; }
   border-color: #ffcc66;
   background: rgba(40, 34, 58, 0.92);
   color: #ffffff;
-  transform: scale(1.01);
-  transform-origin: left center;
+  /* Was `transform: scale(1.01)` — that promoted every focused row to its
+     own compositor layer on each focus change, which churned during fast
+     △▽ hold-to-repeat scroll. The amber border + box-shadow already convey
+     focus; the 1% scale was visually imperceptible. */
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 
