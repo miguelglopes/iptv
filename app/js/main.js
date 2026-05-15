@@ -200,12 +200,14 @@ function reprobeAction() {
 
 function clearSearchHistoryAction() {
   clearSearchHistory();
+  bumpVisibleItemsEpoch();
   notifyCleared('Search history');
   if (state.search != null) renderList();
 }
 
 function clearRecentChannelsAction() {
   clearRecentChannels();
+  bumpVisibleItemsEpoch();
   notifyCleared('Recent channels');
   renderList();
 }
@@ -535,6 +537,27 @@ function visibleChannels() {
   return base.filter(function (c) { return c.name.toLowerCase().indexOf(s) >= 0; });
 }
 
+// Bumped on any mutation that visibleItems() can't infer from state.mode /
+// state.search alone — channel-set swaps, recents push/remove, search-history
+// writes. The memo key includes this so a stale cached array doesn't survive
+// an underlying change. Call sites: catalog set, pushRecentChannel,
+// removeRecentChannel, clearRecentChannels, pushSearchHistory, clearSearchHistoryAction.
+var visibleItemsEpoch = 0;
+function bumpVisibleItemsEpoch() { visibleItemsEpoch++; _viCache.key = null; }
+var _viCache = { key: null, value: null };
+
+// Per-mode channel counts, cached at catalog set-time. updateModeTabs used to
+// re-walk all 400 channels on every renderList; the counts only change when
+// state.channels itself changes, so we precompute and cache here.
+var modeCounts = { tv: 0, radio: 0 };
+function recomputeModeCounts() {
+  modeCounts = { tv: 0, radio: 0 };
+  for (var i = 0; i < state.channels.length; i++) {
+    var k = state.channels[i].kind || 'tv';
+    modeCounts[k] = (modeCounts[k] || 0) + 1;
+  }
+}
+
 // Switch mode tab. Resets focus to the top of the new list (otherwise focusIdx
 // would point at an arbitrary row of the previously-active list). Persists the
 // new mode so the next boot resumes into it. Closes any open search (the
@@ -559,20 +582,27 @@ function setMode(newMode) {
 // with state.channels.
 function updateModeTabs() {
   var tabs = document.querySelectorAll('.mode-tabs .tab');
-  var counts = { tv: 0, radio: 0 };
-  for (var i = 0; i < state.channels.length; i++) {
-    var k = state.channels[i].kind || 'tv';
-    counts[k] = (counts[k] || 0) + 1;
-  }
   for (var t = 0; t < tabs.length; t++) {
     var m = tabs[t].getAttribute('data-mode');
     tabs[t].classList.toggle('active', m === state.mode);
     var cspan = tabs[t].querySelector('.count');
-    if (cspan) cspan.textContent = counts[m] ? '(' + counts[m] + ')' : '';
+    if (cspan) cspan.textContent = modeCounts[m] ? '(' + modeCounts[m] + ')' : '';
   }
 }
 
 function visibleItems() {
+  // Single-slot memo. Fast △▽ scroll calls this once per key, and the 15 s
+  // status poll re-calls it just to count rows — re-entry within the same
+  // epoch + same mode/search returns the cached array, no allocations.
+  var key = state.mode + '|' + (state.search == null ? '!N' : state.search) + '|' + visibleItemsEpoch;
+  if (_viCache.key === key) return _viCache.value;
+  var items = _computeVisibleItems();
+  _viCache.key = key;
+  _viCache.value = items;
+  return items;
+}
+
+function _computeVisibleItems() {
   if (state.search === '') {
     var h = loadSearchHistory();
     if (h.length) return h.map(function (t) { return { kind: 'recent', text: t }; });
@@ -889,6 +919,7 @@ function play(channel) {
   if (state.search) pushSearchHistory(state.search);
   captureZapList();
   pushRecentChannel(channel.key, state.mode);
+  bumpVisibleItemsEpoch();
   // The recents section was just bumped — re-anchor focus on this channel so it lines
   // up in the list when we come back to mini. Without this, state.focusIdx points to
   // wherever the click happened and now refers to a different row (the recents header
@@ -949,6 +980,7 @@ function playCatchup(channel, program) {
   }
   captureZapList();
   pushRecentChannel(channel.key, state.mode);
+  bumpVisibleItemsEpoch();
   state.focusIdx = focusIdxForChannel(channel.key);
   var atIso = program.start.toISOString();
   var durationMin = Math.ceil((program.end.getTime() - program.start.getTime()) / 60000) + 5;
@@ -1029,6 +1061,7 @@ function commitZap() {
   // new recents-section row at the top and anchors there. If we snapped first, the
   // recents list would grow underneath us and state.focusIdx would point one row off.
   pushRecentChannel(ch.key, state.mode);
+  bumpVisibleItemsEpoch();
   state.focusIdx = focusIdxForChannel(ch.key);
   updateBodyClass();
   // No setOverlay here — the bottom-centre banner already carries channel name + LIVE,
@@ -1442,6 +1475,7 @@ function unrecent() {
   if (!it || it.kind !== 'channel' || !it.played) return;
   var ch = it.channel;
   if (!removeRecentChannel(ch.key, state.mode)) return;
+  bumpVisibleItemsEpoch();
   // Stay anchored on the same conceptual channel — focusIdxForChannel falls back to
   // its all-channels row when the recents-section copy disappears.
   state.focusIdx = focusIdxForChannel(ch.key);
@@ -1581,28 +1615,36 @@ setRemoteHandlers({
     showCatchupBadge();
     // Cursor hide-on-key: keyboard activity hides the cursor; mousemove restores it.
     // Mutually exclusive with .pointer-active so the two handlers don't fight.
+    // Guard the toggles so we only invalidate style on actual transitions.
     var c = document.body.classList;
-    c.add('no-cursor');
-    c.remove('pointer-active');
-  },
-  release: function () {
-    // Intentionally a no-op for now. Earlier this committed an in-progress zap on
-    // every keyup, but that meant a single tap → immediate channel change, which
-    // made rapid tap-tap-tap thrash the player. ZAP_COMMIT_MS (500 ms idle) is now
-    // the only commit path, so consecutive taps keep scrolling the preview and only
-    // the final pause swaps the video.
+    if (!c.contains('no-cursor')) c.add('no-cursor');
+    if (c.contains('pointer-active')) c.remove('pointer-active');
   }
+  // (release intentionally not wired — remote.js short-circuits when undefined.
+  // Earlier it committed an in-progress zap on every keyup, which made rapid
+  // tap-tap-tap thrash the player; ZAP_COMMIT_MS idle is now the only commit path.)
 });
 
 // Wire the search input once. The element is always in the DOM (hidden via
 // body:not(.searching)) — only the value and visibility change.
+//
+// Debounced: rebuilding a 400-row list on every keystroke is wasted work
+// when the user is mid-type. 60 ms is below the threshold a human notices
+// as a delay; on fast typing it collapses multiple keystrokes into a
+// single render. The <input> element's own value updates synchronously
+// (browser-handled), so the user sees their text appear instantly.
 (function () {
   var inp = document.getElementById('search');
   if (!inp) return;
+  var searchDebounce = null;
   inp.addEventListener('input', function () {
-    state.search = inp.value;
-    state.focusIdx = 0;
-    renderList();
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(function () {
+      searchDebounce = null;
+      state.search = inp.value;
+      state.focusIdx = 0;
+      renderList();
+    }, 60);
   });
 })();
 
@@ -1690,9 +1732,11 @@ document.addEventListener('click', function (e) {
 var lastHoverTarget = null;
 document.addEventListener('mousemove', function (e) {
   // Cursor reveal: pointer activity shows the cursor (overrides .no-cursor + TV default).
+  // Guard each toggle so we only mutate / invalidate style on actual transitions —
+  // mousemove fires hundreds of times per second on laptop dev otherwise.
   var c = document.body.classList;
-  c.remove('no-cursor');
-  c.add('pointer-active');
+  if (c.contains('no-cursor')) c.remove('no-cursor');
+  if (!c.contains('pointer-active')) c.add('pointer-active');
   // Fullscreen playback: shell is hidden, nothing to hover.
   if (state.playing && !state.mini) return;
   var t = e.target.closest('#list .list-item, .settings-grid .settings-item, .epg-row');
@@ -1760,6 +1804,8 @@ document.addEventListener('mousemove', function (e) {
 var cachedChannels = loadChannelsCache();
 if (cachedChannels && cachedChannels.length) {
   state.channels = cachedChannels;
+  recomputeModeCounts();
+  bumpVisibleItemsEpoch();
   mark('cachedRender');
 }
 updateBodyClass();
@@ -1784,6 +1830,8 @@ ensureCaps()
     mark('channelsFetchEnd');
     catalogLoading = false;
     state.channels = channels;
+    recomputeModeCounts();
+    bumpVisibleItemsEpoch();
     saveChannelsCache(channels);
     state.zapList = null;
     renderList();
