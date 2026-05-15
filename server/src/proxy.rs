@@ -517,12 +517,15 @@ fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candida
 //   0. measured marker (1 if we have a measurement, 0 otherwise)
 //   1. success_bucket  — history-aware reliability for this (stream_id, host)
 //   2. hdr_rank        — HDR ahead of bpp (TV is OLED)
-//   3. bpp_bucket      — bitrate-per-pixel ahead of raw resolution (starved
-//                        1080p loses to well-fed 720p)
+//   3. bpp_bucket      — bitrate-per-pixel coarse bucket (starved 1080p
+//                        loses to well-fed 720p; same-quality streams tie)
 //   4. pixels          — resolution as in-bucket tiebreaker
 //   5. codec_rank      — av1 > hevc > h264 > mpeg2
 //   6. fps_rank        — 50/60 > 25/30
-type RankKey = (i32, i32, i32, i32, i64, i32, i32);
+//   7. raw_kbps        — fine-grained bitrate tiebreaker so two equally-
+//                        encoded streams on different hosts don't fall back
+//                        to stable-sort / catalog order
+type RankKey = (i32, i32, i32, i32, i64, i32, i32, i32);
 
 fn hdr_rank(pix_fmt: Option<&str>, transfer: Option<&str>) -> i32 {
     let ten_bit = matches!(pix_fmt, Some(p) if p.contains("10"));
@@ -634,9 +637,10 @@ fn source_rank_key(
                 (q.width as u64 * q.height as u64) as i64,
                 codec_rank(q.codec.as_deref()),
                 fps_rank(q.framerate),
+                q.bitrate_kbps.unwrap_or(0) as i32,
             )
         }
-        None => (0, success, 0, 0, 0, 0, 0),
+        None => (0, success, 0, 0, 0, 0, 0, 0),
     }
 }
 
