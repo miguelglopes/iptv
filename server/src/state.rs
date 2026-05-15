@@ -2,6 +2,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use anyhow::Context;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -49,6 +50,11 @@ pub struct AppState {
     /// `authenticate()`. 0 means "not yet discovered" — sweep falls back
     /// to a conservative default until set.
     pub max_connections: Arc<AtomicU32>,
+    /// `index.html` body read once at startup. Avoids a sync `std::fs::read_to_string`
+    /// on every `/` and `/index.html` hit (which would block the tokio runtime
+    /// thread). The file is static for the lifetime of the process; a server
+    /// restart picks up edits.
+    pub index_html: Arc<String>,
 }
 
 impl AppState {
@@ -80,6 +86,13 @@ impl AppState {
         let measured_path = std::path::PathBuf::from("data/measured_quality.json");
         let measured = Arc::new(MeasuredStore::load_or_empty(measured_path));
 
+        // Cache index.html at startup so serve_index never has to do disk I/O
+        // on the request path.
+        let index_path = config.ui_dir.join("index.html");
+        let index_html = Arc::new(std::fs::read_to_string(&index_path).with_context(|| {
+            format!("reading index.html from {}", index_path.display())
+        })?);
+
         Ok(Arc::new(Self {
             config: Arc::new(config),
             curation,
@@ -97,6 +110,7 @@ impl AppState {
             per_play: Arc::new(PerPlayAccumulator::new()),
             active_plays: Arc::new(AtomicUsize::new(0)),
             max_connections: Arc::new(AtomicU32::new(0)),
+            index_html,
         }))
     }
 }

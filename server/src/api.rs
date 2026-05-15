@@ -643,9 +643,10 @@ pub async fn serve_index(
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::http::HeaderValue;
-    let path = state.config.ui_dir.join("index.html");
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read index: {e}")))?;
+    // index.html body is cached at startup (state.index_html). Avoids a
+    // sync std::fs read on every request, which would block the runtime
+    // thread for as long as the OS takes to satisfy the read.
+    let body = state.index_html.as_str();
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -658,7 +659,11 @@ pub async fn serve_index(
         // boot fast on TV.
         ""
     } else {
-        r#"<script src="lib/hls.min.js"></script>"#
+        // `defer` so the (~400 KB) hls.min.js download doesn't block the HTML
+        // parser. The module script that imports it runs after DOMContentLoaded
+        // anyway, and deferred classic scripts execute before module scripts,
+        // so `window.Hls` is guaranteed defined by the time caps.js probes it.
+        r#"<script src="lib/hls.min.js" defer></script>"#
     };
     let rendered = body.replace("<!--PLAYER_BUNDLE_MARKER-->", injection);
     let mut resp = Html(rendered).into_response();
