@@ -244,7 +244,7 @@ async fn walk_all_in_parallel(
             priority_remaining = priority_remaining.saturating_sub(1);
         }
         let (score, span, count) = score_epg(&programs);
-        let prefer = (cand_priority, score) > (best_priority, best_score);
+        let prefer = prefer(cand_priority, score, best_priority, best_score);
         if prefer {
             best_score = score;
             best_priority = cand_priority;
@@ -432,6 +432,12 @@ fn rtp_decode(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+fn prefer(cand_priority: u8, score: i64, best_priority: u8, best_score: i64) -> bool {
+    if score == 0 { false }
+    else if best_score == 0 { true }
+    else { (cand_priority, score) > (best_priority, best_score) }
+}
+
 fn score_epg(programs: &[EpgProgram]) -> (i64, i64, usize) {
     if programs.is_empty() {
         return (0, 0, 0);
@@ -483,4 +489,33 @@ pub fn dedupe_programs(mut programs: Vec<EpgProgram>) -> Vec<EpgProgram> {
         }
     }
     kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefer;
+
+    #[test]
+    fn prefer_initial_empty_p1_does_not_replace() {
+        // cand: priority=1, score=0 (empty); best: initial (priority=0, score=0)
+        assert!(!prefer(1, 0, 0, 0));
+    }
+
+    #[test]
+    fn prefer_initial_rich_p0_replaces() {
+        // cand: priority=0, score=42 (rich); best: initial
+        assert!(prefer(0, 42, 0, 0));
+    }
+
+    #[test]
+    fn prefer_empty_p1_does_not_beat_rich_p0_best() {
+        // cand: priority=1, score=0; best: priority=0, score=42
+        assert!(!prefer(1, 0, 0, 42));
+    }
+
+    #[test]
+    fn prefer_rich_p1_beats_rich_p0_best() {
+        // cand: priority=1, score=42; best: priority=0, score=42
+        assert!(prefer(1, 42, 0, 42));
+    }
 }

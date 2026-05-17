@@ -104,6 +104,15 @@ provider_boosts = [
 # [parent.child] header ends the parent table's scope.
 [curation.aliases]
 # btv = "benfica"            # example: host shortens "Benfica TV" to "BTV"
+# National Geographic — host feeds sometimes use "Nat Geographic" / "National Geo"
+# natgeographic = "nationalgeographic"
+# nationalgeo = "nationalgeographic"
+# natgeowild = "nationalgeographicwild"
+# nationalgeowild = "nationalgeographicwild"
+# Discovery — host feeds sometimes label as "Discovery Channel"
+# discoverychannel = "discovery"
+# Canal Hollywood — Portuguese feeds drop the "Canal " prefix
+# canalhollywood = "hollywood"
 
 # Pretty display name override, keyed by canonical key. Without this, the longer /
 # more accented variant name wins.
