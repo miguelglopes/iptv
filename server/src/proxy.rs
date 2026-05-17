@@ -136,7 +136,13 @@ pub async fn play_playlist(
     Query(params): Query<PlayParams>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let key = name.trim_end_matches(".m3u8").trim_end_matches(".ts");
+    // Trim known route suffixes. `.audio` is the non-HLS radio route emitted
+    // by `api::list_channels` for Mp3/Aac/Icecast/Playlist sources; it falls
+    // through to `play_audio` once the channel is looked up.
+    let key = name
+        .trim_end_matches(".m3u8")
+        .trim_end_matches(".ts")
+        .trim_end_matches(".audio");
     let probe_request = params.probe;
     // Track active real plays so the bootstrap sweep can yield to user
     // requests for the provider's connection slots. The probe-mode requests
@@ -175,6 +181,21 @@ pub async fn play_playlist(
 
     if let Some(req) = catchup_request {
         return catchup_play(state, channel, req, &public_base, &play_id, client_pid.as_deref()).await;
+    }
+
+    // Non-HLS radio dispatch. The new `.audio` route also lands here (we
+    // accept `.m3u8` for backwards compatibility); we pick the path by the
+    // channel's first source format, not by the URL extension, so a stale
+    // client URL still routes correctly when the catalogue's format flips.
+    if matches!(channel.kind, crate::xtream::ChannelKind::Radio) {
+        let fmt = channel
+            .sources
+            .iter()
+            .find_map(|s| s.radio_format)
+            .unwrap_or(crate::radio::RadioFormat::Hls);
+        if !matches!(fmt, crate::radio::RadioFormat::Hls) {
+            return play_audio(state, channel, fmt, public_base, play_id, client_pid).await;
+        }
     }
 
     let candidates = build_candidates(&state, &channel);
@@ -745,6 +766,276 @@ async fn fetch_and_rewrite_playlist(
         "upstream did not return a playlist (content-type={content_type}, first bytes={:?})",
         &bytes.get(..16)
     )
+}
+
+/// Non-HLS radio playback: stream raw audio bytes from a working upstream.
+/// Mirrors `play_playlist`'s candidate-iteration + per-attempt-timeout +
+/// blacklist/play_log accounting, but the success criterion is "got a 2xx
+/// response with an audio content-type" rather than "parseable EXTM3U body".
+/// On success, the response body is the upstream's bytes_stream — the client
+/// element (`<video src>` on webOS / desktop) decodes it natively.
+async fn play_audio(
+    state: Arc<AppState>,
+    channel: CanonicalChannel,
+    fmt: crate::radio::RadioFormat,
+    _public_base: String,
+    play_id: String,
+    client_pid: Option<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let _active_play_guard = ActivePlayGuard::new(&state.active_plays);
+    let candidates = build_candidates(&state, &channel);
+    if candidates.is_empty() {
+        warn!(play = %play_id, channel = %channel.key, "no candidate sources for radio");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
+    }
+
+    let per_attempt = Duration::from_secs(state.config.proxy.per_attempt_timeout_secs);
+    let budget = Duration::from_secs(state.config.proxy.play_budget_secs);
+    let started = Instant::now();
+    let started_wall = OffsetDateTime::now_utc();
+    let mut attempts: Vec<PlayAttempt> = Vec::new();
+    let mut last_err: Option<String> = None;
+    let mut tried = 0usize;
+
+    info!(
+        play = %play_id,
+        channel = %channel.key,
+        candidates = candidates.len(),
+        format = ?fmt,
+        "audio play start",
+    );
+
+    for (idx, cand) in candidates.iter().enumerate() {
+        let _ = idx;
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            warn!(play = %play_id, channel = %channel.key, "audio play budget exhausted");
+            break;
+        }
+        let attempt_timeout = per_attempt.min(budget.saturating_sub(elapsed));
+        tried += 1;
+        let attempt_start = Instant::now();
+        match tokio::time::timeout(
+            attempt_timeout,
+            attach_audio_upstream(&state, &cand.url, fmt),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                state.blacklist.note_url_succeeded(&channel.key, &cand.url);
+                if let Some(pid) = client_pid.as_deref() {
+                    state.play_sessions.note(pid, &channel.key, &cand.url);
+                }
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Ok,
+                });
+                info!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    attempt = tried,
+                    elapsed_ms,
+                    "audio play ok",
+                );
+                state.play_log.record(PlayEvent {
+                    id: play_id.clone(),
+                    started: started_wall,
+                    channel: channel.key.clone(),
+                    catchup: false,
+                    total_ms: started.elapsed().as_millis() as u64,
+                    candidates_total: candidates.len(),
+                    succeeded: true,
+                    error: None,
+                    attempts,
+                });
+                return Ok(stream_audio_response(resp, &cand.url));
+            }
+            Ok(Err(e)) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                let reason = e.to_string();
+                warn!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    url = %cand.url,
+                    elapsed_ms,
+                    error = %reason,
+                    "audio upstream failed",
+                );
+                state.blacklist.mark_failed(&cand.url);
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Err { reason: reason.clone() },
+                });
+                last_err = Some(reason);
+                continue;
+            }
+            Err(_) => {
+                let elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+                warn!(
+                    play = %play_id,
+                    channel = %channel.key,
+                    host = %cand.host,
+                    url = %cand.url,
+                    elapsed_ms,
+                    "audio upstream timed out",
+                );
+                state.blacklist.mark_failed(&cand.url);
+                attempts.push(PlayAttempt {
+                    host: cand.host.clone(),
+                    url: cand.url.clone(),
+                    elapsed_ms,
+                    outcome: AttemptOutcome::Timeout,
+                });
+                last_err = Some(format!("timeout after {attempt_timeout:?}"));
+                continue;
+            }
+        }
+    }
+
+    let err_text = format!(
+        "all {tried}/{total} audio candidates failed for {channel} (last: {err})",
+        total = candidates.len(),
+        channel = channel.key,
+        err = last_err.as_deref().unwrap_or("budget exhausted"),
+    );
+    state.play_log.record(PlayEvent {
+        id: play_id.clone(),
+        started: started_wall,
+        channel: channel.key.clone(),
+        catchup: false,
+        total_ms: started.elapsed().as_millis() as u64,
+        candidates_total: candidates.len(),
+        succeeded: false,
+        error: Some(last_err.unwrap_or_else(|| "budget exhausted".into())),
+        attempts,
+    });
+    Err((StatusCode::BAD_GATEWAY, err_text))
+}
+
+async fn attach_audio_upstream(
+    state: &AppState,
+    url: &str,
+    fmt: crate::radio::RadioFormat,
+) -> anyhow::Result<reqwest::Response> {
+    let final_url = if matches!(fmt, crate::radio::RadioFormat::Playlist) {
+        resolve_playlist_indirection(state, url).await?
+    } else {
+        url.to_string()
+    };
+    let resp = state
+        .upstream_http
+        .get(&final_url)
+        // Tell Icecast/Shoutcast we want raw audio, not metadata. Without this,
+        // some servers return audio interleaved with `StreamTitle='...'` blocks
+        // every N bytes that the browser/webOS demuxer can't handle.
+        .header("Icy-MetaData", "0")
+        .header(reqwest::header::ACCEPT, "audio/*, */*;q=0.5")
+        .send()
+        .await?
+        .error_for_status()?;
+    let landed = resp.url().clone();
+    if is_abuse_url(&landed) {
+        anyhow::bail!("upstream redirected to abuse page: {}", landed);
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    // Accept anything plausibly audio. Some Shoutcast servers return empty or
+    // `application/octet-stream`; trust the RadioFormat hint there.
+    let looks_audio = ct.starts_with("audio/")
+        || ct.contains("mpeg")
+        || ct.contains("aacp")
+        || ct.contains("aac")
+        || ct == "application/ogg"
+        || ct.is_empty()
+        || ct == "application/octet-stream";
+    if !looks_audio {
+        anyhow::bail!("non-audio content-type: {ct}");
+    }
+    Ok(resp)
+}
+
+/// Resolve a `.pls`/`.m3u` indirection to the underlying audio URL. Cached
+/// per source URL for 1 hour — the indirection rarely changes, and resolving
+/// on every play attempt would double the upstream load for those entries.
+async fn resolve_playlist_indirection(state: &AppState, url: &str) -> anyhow::Result<String> {
+    const TTL: Duration = Duration::from_secs(3600);
+    if let Some(entry) = state.playlist_resolver_cache.get(url) {
+        let (cached, at) = entry.value();
+        if at.elapsed() < TTL {
+            return Ok(cached.clone());
+        }
+    }
+    let resp = tokio::time::timeout(
+        Duration::from_secs(state.config.proxy.per_attempt_timeout_secs),
+        state.upstream_http.get(url).send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out fetching playlist indirection"))??
+    .error_for_status()?;
+    let body = resp.text().await?;
+    let resolved = parse_pls_or_m3u(&body)
+        .ok_or_else(|| anyhow::anyhow!("no usable audio URL in .pls/.m3u body"))?;
+    state
+        .playlist_resolver_cache
+        .insert(url.to_string(), (resolved.clone(), Instant::now()));
+    Ok(resolved)
+}
+
+/// Parse the first usable audio URL out of a `.pls` / `.m3u` body. `.pls`
+/// gives `^File\d+=<url>$`; non-HLS `.m3u` is a list of bare URLs, one per
+/// line, optionally with `#`-comments. We return the first `http(s)://...`
+/// match. Caller validates by attempting the audio fetch.
+fn parse_pls_or_m3u(body: &str) -> Option<String> {
+    static PLS_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?i)^file\d+\s*=\s*(.+)$").unwrap());
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(c) = PLS_RE.captures(t) {
+            let u = c.get(1)?.as_str().trim().to_string();
+            if u.starts_with("http") {
+                return Some(u);
+            }
+        }
+    }
+    for line in body.lines() {
+        let t = line.trim();
+        if !t.is_empty() && !t.starts_with('#') && t.starts_with("http") {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+fn stream_audio_response(resp: reqwest::Response, upstream_url: &str) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let ct_value = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(HeaderValue::try_from)
+        .and_then(Result::ok)
+        .unwrap_or_else(|| HeaderValue::from_static("audio/mpeg"));
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, ct_value)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(resp.bytes_stream()))
+        .unwrap();
+    if let Ok(v) = HeaderValue::from_str(upstream_url) {
+        response.headers_mut().insert("x-upstream", v);
+    }
+    response
 }
 
 fn rewrite_playlist(
@@ -1807,6 +2098,29 @@ mod tests {
     use super::*;
     use crate::xtream::{format_timeshift_start, XtreamClient};
 
+    #[test]
+    fn parse_pls_extracts_first_file_entry() {
+        let body = "[playlist]\nNumberOfEntries=1\nFile1=http://stream.example/audio.mp3\nLength1=-1\nVersion=2\n";
+        assert_eq!(
+            parse_pls_or_m3u(body).as_deref(),
+            Some("http://stream.example/audio.mp3"),
+        );
+    }
+
+    #[test]
+    fn parse_m3u_extracts_first_http_url() {
+        let body = "#EXTM3U\n# comment\nhttp://stream.example/audio.aac\nhttp://second/url\n";
+        assert_eq!(
+            parse_pls_or_m3u(body).as_deref(),
+            Some("http://stream.example/audio.aac"),
+        );
+    }
+
+    #[test]
+    fn parse_pls_returns_none_on_garbage() {
+        assert!(parse_pls_or_m3u("hello world\n").is_none());
+    }
+
     fn p(at: Option<&str>, from: Option<&str>, dur: Option<&str>) -> PlayParams {
         PlayParams {
             at: at.map(str::to_string),
@@ -1989,6 +2303,7 @@ mod tests {
                     tv_archive_duration: Some(3),
                     direct_source: None,
                     origin_host: String::new(),
+                    radio_format: None,
                 },
                 CanonicalSource {
                     stream_id: 2,
@@ -1999,6 +2314,7 @@ mod tests {
                     tv_archive_duration: Some(3),
                     direct_source: None,
                     origin_host: String::new(),
+                    radio_format: None,
                 },
                 CanonicalSource {
                     stream_id: 3,
@@ -2009,6 +2325,7 @@ mod tests {
                     tv_archive_duration: None,
                     direct_source: None,
                     origin_host: String::new(),
+                    radio_format: None,
                 },
             ],
         };
@@ -2034,6 +2351,7 @@ mod tests {
                 tv_archive_duration: None,
                 direct_source: None,
                 origin_host: String::new(),
+                radio_format: None,
             }],
         };
         assert!(ch.pick_archive_source().is_none());

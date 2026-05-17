@@ -210,6 +210,11 @@ pub struct LiveStream {
     /// host on play.
     #[serde(default, skip)]
     pub origin_host: String,
+    /// Audio container/transport for radio entries (set by `radio.rs`). None
+    /// for TV streams. Drives `caps_required` + the proxy's HLS-vs-audio
+    /// dispatch.
+    #[serde(default, skip)]
+    pub radio_format: Option<crate::radio::RadioFormat>,
 }
 
 impl LiveStream {

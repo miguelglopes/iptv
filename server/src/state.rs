@@ -1,8 +1,10 @@
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
+use dashmap::DashMap;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -55,6 +57,10 @@ pub struct AppState {
     /// thread). The file is static for the lifetime of the process; a server
     /// restart picks up edits.
     pub index_html: Arc<String>,
+    /// Per-URL one-hop indirection cache for `.pls`/`.m3u` radio sources.
+    /// Map `pls_url → (resolved_audio_url, resolved_at)`. TTL enforced at
+    /// lookup time (1 h). Memory bounded by entry count (a few dozen).
+    pub playlist_resolver_cache: Arc<DashMap<String, (String, Instant)>>,
 }
 
 impl AppState {
@@ -111,6 +117,7 @@ impl AppState {
             active_plays: Arc::new(AtomicUsize::new(0)),
             max_connections: Arc::new(AtomicU32::new(0)),
             index_html,
+            playlist_resolver_cache: Arc::new(DashMap::new()),
         }))
     }
 }

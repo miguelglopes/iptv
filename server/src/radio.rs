@@ -2,17 +2,10 @@
 //!
 //! Parses a vendored M3U file (e.g. `radios.m3u` from activistpt/IPTV) into
 //! `LiveStream` entries tagged `ChannelKind::Radio` and with `direct_source`
-//! pointing at the upstream HLS URL. From there, everything downstream —
-//! canonicalisation, dedup, proxy candidate selection, blacklist accounting,
-//! playlist rewriting, segment proxy — runs on the radio entries identically
-//! to TV. The `direct_source` field is the *only* discriminator the proxy
-//! candidate builder branches on; everything else is shared code.
-//!
-//! v1 keeps only HLS (`.m3u8`) entries. Raw Icecast / MP3 streams need a
-//! content-type-aware pass-through path in `proxy.rs` (the current
-//! `fetch_and_rewrite_playlist` bails out on non-EXTM3U content). Adding
-//! that is a follow-up; for v1 we drop the ~30 long-tail regionals and keep
-//! the ~31 well-known HLS stations.
+//! pointing at the upstream URL. Each entry is tagged with a [`RadioFormat`]
+//! derived from the URL shape. The proxy dispatches on the format at play
+//! time: HLS goes through the existing manifest-rewriting pipeline; the rest
+//! goes through `proxy::play_audio`, which streams upstream bytes directly.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -22,9 +15,63 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::xtream::{ChannelKind, LiveStream};
+
+/// Audio container/transport format for a radio source. Derived purely from
+/// the URL shape at parse time. Drives two decisions downstream:
+///   * `api::caps_required(..)` returns format-appropriate caps so a client
+///     without `mp3` capability doesn't see a pure-MP3 channel.
+///   * `proxy::play_playlist` dispatches `Hls` to the existing playlist
+///     rewriter and the rest to `play_audio` (raw bytes pump).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RadioFormat {
+    Hls,
+    Mp3,
+    Aac,
+    /// Audio over HTTP, no extension hint (Icecast/Shoutcast on numbered
+    /// ports). Trusted at fetch time via Content-Type.
+    Icecast,
+    /// `.pls` / `.m3u` indirection — server resolves one hop to the audio
+    /// URL before streaming.
+    Playlist,
+}
+
+/// Classify a radio source URL by its shape alone. Order matters: HLS wins
+/// first (`.m3u8` substring), then explicit `.mp3` / `.aac` extensions on
+/// the *final filename segment* (so Shoutcast `;listen.pls` metadata flags
+/// don't false-trigger Playlist), then `.pls` / `.m3u` playlist files (real
+/// indirections), then a permissive `aac` substring catch for streamtheworld
+/// (`RFMAAC` carries no extension), and finally `Icecast`.
+pub fn classify_url(u: &str) -> RadioFormat {
+    let lo = u.to_lowercase();
+    if lo.contains(".m3u8") {
+        return RadioFormat::Hls;
+    }
+    let path = lo.split('?').next().unwrap_or(&lo);
+    // Only look at the *last filename segment* (after the last `/`). Avoids
+    // misclassifying Shoutcast `;listen.pls`-style metadata flags as playlist
+    // files (those are audio streams, not .pls indirections).
+    let last_seg = path.rsplit('/').next().unwrap_or("");
+    // Strip Shoutcast metadata flags (`;stream`, `;listen.pls`, `;stream.nsv`, …)
+    // for extension testing. Anything after a `;` is metadata, not the filename.
+    let last_seg_pure = last_seg.split(';').next().unwrap_or(last_seg);
+    if last_seg_pure.ends_with(".mp3") {
+        return RadioFormat::Mp3;
+    }
+    if last_seg_pure.ends_with(".aac") {
+        return RadioFormat::Aac;
+    }
+    if last_seg_pure.ends_with(".pls") || last_seg_pure.ends_with(".m3u") {
+        return RadioFormat::Playlist;
+    }
+    if path.contains("_aac") || path.contains("aac") {
+        return RadioFormat::Aac;
+    }
+    RadioFormat::Icecast
+}
 
 /// Mask reserved for synthetic radio stream IDs. Xtream's real stream IDs are
 /// 6-7-digit decimals (well below 2^47), so any ID with the high bit set is
@@ -44,28 +91,33 @@ static EXTINF_ATTRS_RE: Lazy<Regex> =
 static RADIO_PREFIX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^r[áa]dio\s+").unwrap());
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
-/// Load + parse the bundled M3U.
+/// Load + parse the bundled M3U. Every entry is kept; format classification
+/// drives downstream playback dispatch via [`RadioFormat`].
 pub fn load_radio_streams(path: &Path) -> Result<Vec<LiveStream>> {
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading radio M3U at {}", path.display()))?;
     let parsed = parse_m3u(&body);
-    let total = parsed.len();
-    let kept: Vec<_> = parsed.into_iter().filter(is_hls).collect();
-    info!(
-        "radio M3U: {} entries parsed, {} kept (HLS), {} dropped (non-HLS)",
-        total,
-        kept.len(),
-        total - kept.len(),
+    let mut counts = [0usize; 5];
+    for s in &parsed {
+        let idx = match s.radio_format.unwrap_or(RadioFormat::Hls) {
+            RadioFormat::Hls => 0,
+            RadioFormat::Mp3 => 1,
+            RadioFormat::Aac => 2,
+            RadioFormat::Icecast => 3,
+            RadioFormat::Playlist => 4,
+        };
+        counts[idx] += 1;
+    }
+    tracing::info!(
+        "radio M3U: {} entries parsed (hls={}, mp3={}, aac={}, icecast={}, playlist={})",
+        parsed.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
     );
-    Ok(kept)
-}
-
-fn is_hls(stream: &LiveStream) -> bool {
-    stream
-        .direct_source
-        .as_deref()
-        .map(|u| u.to_lowercase().contains(".m3u8"))
-        .unwrap_or(false)
+    Ok(parsed)
 }
 
 pub fn parse_m3u(body: &str) -> Vec<LiveStream> {
@@ -116,6 +168,7 @@ fn entry_from(extinf_line: &str, url: &str) -> Option<LiveStream> {
         stream_icon,
         direct_source: Some(url.to_string()),
         kind: ChannelKind::Radio,
+        radio_format: Some(classify_url(url)),
         ..Default::default()
     })
 }
@@ -201,19 +254,53 @@ https://streaming-live.rtp.pt/liveradio/antena380a/playlist.m3u8
     }
 
     #[test]
-    fn hls_filter_drops_icecast_and_mp3() {
+    fn parser_keeps_all_entries_and_tags_format() {
         let m3u = r#"#EXTINF:-1,Rádio HLS
 https://example.com/stream.m3u8
 #EXTINF:-1,Rádio MP3
 http://example.com/stream.mp3
+#EXTINF:-1,Rádio AAC
+http://example.com/stream.aac
+#EXTINF:-1,Rádio Pls
+http://example.com/playlist.pls
 #EXTINF:-1,Rádio Icecast
 http://example.com:9000/stream
 "#;
         let parsed = parse_m3u(m3u);
-        assert_eq!(parsed.len(), 3, "parser keeps all 3");
-        let kept: Vec<_> = parsed.into_iter().filter(is_hls).collect();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].name, "HLS");
+        assert_eq!(parsed.len(), 5, "parser keeps all 5");
+        assert_eq!(parsed[0].radio_format, Some(RadioFormat::Hls));
+        assert_eq!(parsed[1].radio_format, Some(RadioFormat::Mp3));
+        assert_eq!(parsed[2].radio_format, Some(RadioFormat::Aac));
+        assert_eq!(parsed[3].radio_format, Some(RadioFormat::Playlist));
+        assert_eq!(parsed[4].radio_format, Some(RadioFormat::Icecast));
+    }
+
+    #[test]
+    fn classify_url_table() {
+        assert_eq!(classify_url("https://x/stream.m3u8"), RadioFormat::Hls);
+        assert_eq!(classify_url("https://x/stream.M3U8?token=1"), RadioFormat::Hls);
+        assert_eq!(classify_url("http://x/audio.mp3"), RadioFormat::Mp3);
+        assert_eq!(classify_url("http://x/audio.aac"), RadioFormat::Aac);
+        // Real .pls indirection (no Shoutcast `;` metadata flag).
+        assert_eq!(classify_url("http://x/playlist.pls"), RadioFormat::Playlist);
+        assert_eq!(classify_url("http://x/stream.m3u"), RadioFormat::Playlist);
+        // Shoutcast metadata flags must not classify as Playlist — those URLs
+        // serve audio bytes, not playlist files.
+        assert_eq!(
+            classify_url("http://centova.radios.pt:8495/;listen.pls"),
+            RadioFormat::Icecast,
+        );
+        assert_eq!(
+            classify_url("http://x:8000/;stream.nsv"),
+            RadioFormat::Icecast,
+        );
+        // Streamtheworld redirect: no extension, but path contains `AAC` ⇒ Aac.
+        assert_eq!(
+            classify_url("https://21313.live.streamtheworld.com/RFMAAC"),
+            RadioFormat::Aac,
+        );
+        // Plain port-based icecast — falls through to Icecast.
+        assert_eq!(classify_url("http://centova.radios.pt:9476/"), RadioFormat::Icecast);
     }
 
     #[test]

@@ -229,6 +229,11 @@ pub struct CanonicalSource {
     /// when the provider replicates stream_ids across hosts).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_host: String,
+    /// Audio container/transport for radio entries. None for TV. Propagated
+    /// from `LiveStream::radio_format`; consumed by `api::caps_required` and
+    /// `proxy::play_playlist` HLS-vs-audio dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_format: Option<crate::radio::RadioFormat>,
 }
 
 pub fn quality_tier(name: &str) -> Option<&'static str> {
@@ -302,6 +307,7 @@ pub fn build_canonical(streams: &[LiveStream], curation: &Curation) -> Vec<Canon
             tv_archive_duration,
             direct_source,
             origin_host: st.origin_host.clone(),
+            radio_format: st.radio_format,
         });
     }
 
