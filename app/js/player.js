@@ -59,6 +59,17 @@ Player.prototype._makeVideo = function () {
   v.addEventListener('loadeddata', function () {
     self._clearWatchdog();
   });
+  // webOS pauses the media element when the user hits Screen Off (panel-off /
+  // audio-only mode) — and the app has no pause UI of its own, so any pause we
+  // observe is platform-driven. Re-issue play() so audio keeps streaming in the
+  // background. The `self.video === v` guard skips stale events from the
+  // previous element being torn down inside play()/stop().
+  v.addEventListener('pause', function () {
+    if (self.video !== v) return;
+    if (!self.url) return;
+    var p = v.play();
+    if (p && p.catch) p.catch(function () {});
+  });
   return v;
 };
 
