@@ -6,7 +6,7 @@ set -euo pipefail
 : "${TV_PORT:=9922}"
 : "${TV_USER:=prisoner}"
 : "${TV_KEY:=$HOME/.ssh/lgtv_dev}"
-: "${APP_ID:=com.mgl.xtream}"
+: "${APP_ID:=com.mgl.fourier}"
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC="$REPO_ROOT/app"
