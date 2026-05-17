@@ -30,8 +30,8 @@ def pick_target(targets, match: str):
     return None
 
 
-def evaluate(ws_url: str, expr: str, await_promise: bool):
-    ws = create_connection(ws_url, timeout=15)
+def evaluate(ws_url: str, expr: str, await_promise: bool, timeout: float = 600.0):
+    ws = create_connection(ws_url, timeout=timeout)
     try:
         ws.send(json.dumps({
             'id': 1,
