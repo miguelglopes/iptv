@@ -364,6 +364,7 @@ mod tests {
             dvb_unsafe,
             sample_rate_hz: None,
             audio_channels: None,
+            h264_excess_refs: None,
         }
     }
 

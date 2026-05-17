@@ -19,8 +19,11 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info};
 use url::Url;
 
-use crate::codec::{classify_aac_chunk, classify_ts_chunk};
+use crate::codec::{classify_aac_chunk, classify_ts_chunk, extract_h264_elementary_stream};
 use crate::measured::{MeasuredStore, Sample, SampleSource};
+use crate::pps::find_pps_nals;
+use crate::slice::h264_excess_refs as walk_h264_excess_refs;
+use crate::sps::{find_sps_nal, parse_h264_sps, SpsCodec};
 use crate::state::AppState;
 use crate::xtream::ChannelKind;
 
@@ -177,6 +180,16 @@ pub async fn measure_once_tv(client: &Client, manifest_url: &str) -> Option<Samp
         return None;
     }
 
+    // Phase 0: run the slice-header walker on H.264 elementary streams.
+    // `None` for non-H.264 (HEVC etc.) and for any segment we can't get a
+    // SPS/PPS for — the stability gate downstream interprets `None` as
+    // "no decisive vote this sample".
+    let h264_excess = if codec == "h264" {
+        h264_excess_refs_from_ts(&bytes)
+    } else {
+        None
+    };
+
     Some(Sample {
         at: time::OffsetDateTime::now_utc(),
         source: SampleSource::Sweep,
@@ -190,7 +203,24 @@ pub async fn measure_once_tv(client: &Client, manifest_url: &str) -> Option<Samp
         dvb_unsafe: Some(cls.dvb_unsafe),
         sample_rate_hz: None,
         audio_channels: None,
+        h264_excess_refs: h264_excess,
     })
+}
+
+/// Phase 0 slice-header walker entry point: from raw TS bytes, extract the
+/// H.264 elementary stream, parse SPS + every PPS, then walk slices to
+/// determine whether any slice references more frames than the SPS
+/// declared. `None` means "predicate inapplicable for this chunk" — see
+/// `slice::h264_excess_refs`.
+pub fn h264_excess_refs_from_ts(ts_bytes: &[u8]) -> Option<bool> {
+    let es = extract_h264_elementary_stream(ts_bytes)?;
+    let sps_rbsp = find_sps_nal(&es, SpsCodec::H264)?;
+    let sps = parse_h264_sps(&sps_rbsp)?;
+    let pps_set = find_pps_nals(&es);
+    if pps_set.is_empty() {
+        return None;
+    }
+    walk_h264_excess_refs(&es, &sps, &pps_set)
 }
 
 /// Audio (radio) counterpart to `measure_once_tv`. Same shape:
@@ -284,6 +314,7 @@ pub async fn measure_once_audio(client: &Client, manifest_url: &str) -> Option<S
         dvb_unsafe: None,
         sample_rate_hz: cls.sample_rate_hz,
         audio_channels: cls.audio_channels,
+        h264_excess_refs: None,
     })
 }
 

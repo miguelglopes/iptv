@@ -67,6 +67,11 @@ pub struct Sample {
     /// for TV samples and for radio samples pre-dating Phase 8.
     #[serde(default)]
     pub audio_channels: Option<u8>,
+    /// Phase 0 slice-header walker result. `Some(true)` iff at least one
+    /// slice referenced more frames than the SPS declared; `Some(false)`
+    /// iff every slice fit; `None` if the segment isn't parsable H.264.
+    #[serde(default)]
+    pub h264_excess_refs: Option<bool>,
 }
 
 /// What the ranker sees — the aggregate of a buffer's samples.
@@ -87,9 +92,32 @@ pub struct MeasuredQuality {
     pub sample_rate_hz: Option<u32>,
     /// Radio channel count from ADTS — Step 10. `None` for TV.
     pub audio_channels: Option<u8>,
+    /// Stability-gated H.264 excess-refs state for the variant on this
+    /// host. Computed from the rolling sample window per the gate in the
+    /// per-variant caps plan: ON (≥1 positive), OFF (≥2 negatives), else
+    /// UNKNOWN.
+    pub h264_excess_refs_state: ExcessRefsState,
+    /// Phase 1: per-variant caps_required materialised from the rolling
+    /// window's last decisive sample. Mirrors today's per-kind baseline +
+    /// the variant-specific tags from `derive_variant_caps`.
+    pub caps_required: Vec<String>,
     pub samples_count: usize,
     #[serde(with = "time::serde::rfc3339")]
     pub measured_at: time::OffsetDateTime,
+}
+
+/// Stability-gate result for `h264_excess_refs` per (variant, host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExcessRefsState {
+    /// Variant codec is outside the tag's domain (e.g. HEVC). Vacuously decisive.
+    NotApplicable,
+    /// At least one positive sample in the window.
+    On,
+    /// Two most-recent decisive samples are negative.
+    Off,
+    /// Not enough decisive samples to commit yet — fail-closed.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -116,6 +144,9 @@ impl MeasuredEntry {
             .collect();
         bitrates.sort_unstable();
         let bitrate_kbps = bitrates.get(bitrates.len() / 2).copied();
+        let h264_excess_refs_state = excess_refs_state(&self.samples, last.codec.as_deref());
+        let caps_required =
+            derive_variant_caps(last, h264_excess_refs_state);
         Some(MeasuredQuality {
             width: last.width,
             height: last.height,
@@ -127,10 +158,95 @@ impl MeasuredEntry {
             dvb_unsafe: last.dvb_unsafe,
             sample_rate_hz: last.sample_rate_hz,
             audio_channels: last.audio_channels,
+            h264_excess_refs_state,
+            caps_required,
             samples_count: self.samples.len(),
             measured_at: last.at,
         })
     }
+}
+
+/// Apply the asymmetric stability gate from the per-variant plan:
+/// - N/A if the variant's codec is outside the tag's domain.
+/// - ON if any sample in the window is `Some(true)`.
+/// - OFF if the two most-recent non-`null` samples are both `Some(false)`.
+/// - UNKNOWN otherwise.
+pub fn excess_refs_state(
+    samples: &VecDeque<Sample>,
+    last_codec: Option<&str>,
+) -> ExcessRefsState {
+    // N/A — variant isn't H.264.
+    if let Some(c) = last_codec {
+        if c != "h264" {
+            return ExcessRefsState::NotApplicable;
+        }
+    } else {
+        // No codec known; fall back to UNKNOWN.
+        return ExcessRefsState::Unknown;
+    }
+    let mut negatives_seen = 0usize;
+    for s in samples.iter().rev() {
+        match s.h264_excess_refs {
+            Some(true) => return ExcessRefsState::On,
+            Some(false) => {
+                negatives_seen += 1;
+                if negatives_seen >= 2 {
+                    return ExcessRefsState::Off;
+                }
+            }
+            None => {
+                // null vote — skip.
+                continue;
+            }
+        }
+    }
+    ExcessRefsState::Unknown
+}
+
+/// Per-sample variant caps derivation.
+///
+/// Universal per kind (TV vs Radio) baseline, plus per-variant video codec
+/// and decoder-tolerance / DVB-stress tags. The TV baseline preserves
+/// `aac` so a single-audio-codec strict client doesn't lose access to TV.
+pub fn derive_variant_caps(
+    sample: &Sample,
+    excess_state: ExcessRefsState,
+) -> Vec<String> {
+    let is_radio = sample.sample_rate_hz.is_some()
+        || matches!(sample.codec.as_deref(), Some("aac")) && sample.width == 0;
+    let mut caps: Vec<String> = if is_radio {
+        vec!["hls".into(), "live_audio_only_hls".into()]
+    } else {
+        vec!["hls".into(), "live_video_hls".into(), "aac".into()]
+    };
+    // Per-variant video codec for TV samples.
+    if !is_radio {
+        match sample.codec.as_deref() {
+            Some("h264") => caps.push("h264".into()),
+            Some("hevc") | Some("h265") => {
+                caps.push("hevc".into());
+                if sample
+                    .pix_fmt
+                    .as_deref()
+                    .map(|p| p.contains("10"))
+                    .unwrap_or(false)
+                {
+                    caps.push("hevc_main10".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    if matches!(excess_state, ExcessRefsState::On) {
+        caps.push("h264_excess_refs".into());
+    }
+    if sample.dvb_unsafe == Some(true) {
+        caps.push("dvb_safe".into());
+    }
+    // Deduplicate & sort for stable output.
+    caps.sort();
+    caps.dedup();
+    caps
 }
 
 /// Cache key: (upstream stream_id, normalised host root).
@@ -318,6 +434,12 @@ pub struct InProgress {
     /// the radio play path; remain `None` for TV plays.
     pub sample_rate_hz: Option<u32>,
     pub audio_channels: Option<u8>,
+    /// Phase 0: slice-header walker result accumulated per play. Per-play
+    /// samples currently never observe the slice walker (the per-segment
+    /// hot path skips it — Phase 0 confines the walker to the sweep paths),
+    /// but the field is plumbed so future phases can promote it if
+    /// motivation arises. Stays `None` for now.
+    pub h264_excess_refs: Option<bool>,
     pub last_activity: Option<Instant>,
 }
 
@@ -350,6 +472,7 @@ impl InProgress {
             dvb_unsafe: self.dvb_unsafe,
             sample_rate_hz: self.sample_rate_hz,
             audio_channels: self.audio_channels,
+            h264_excess_refs: self.h264_excess_refs,
         })
     }
 }
@@ -513,6 +636,7 @@ mod tests {
             dvb_unsafe: None,
             sample_rate_hz: None,
             audio_channels: None,
+            h264_excess_refs: None,
         }
     }
 
@@ -623,6 +747,7 @@ mod tests {
             dvb_unsafe: Some(false),
             sample_rate_hz: None,
             audio_channels: None,
+            h264_excess_refs: None,
             last_activity: Some(Instant::now()),
         };
         let s = ip.into_sample().unwrap();
@@ -658,6 +783,111 @@ mod tests {
         // 0.3*6000+0.7*4300=4810.
         let v = ip.bitrate_ewma_kbps.unwrap();
         assert!((v - 4810.0).abs() < 1.0, "got {v}");
+    }
+
+    fn sample_excess(codec: &str, h264_excess: Option<bool>) -> Sample {
+        Sample {
+            at: time::OffsetDateTime::now_utc(),
+            source: SampleSource::Sweep,
+            width: 1920,
+            height: 1080,
+            codec: Some(codec.into()),
+            pix_fmt: Some("yuv420p".into()),
+            color_transfer: None,
+            framerate: None,
+            bitrate_kbps: Some(4000),
+            dvb_unsafe: Some(false),
+            sample_rate_hz: None,
+            audio_channels: None,
+            h264_excess_refs: h264_excess,
+        }
+    }
+
+    #[test]
+    fn stability_gate_on_for_one_positive() {
+        let mut e = MeasuredEntry::default();
+        e.push(sample_excess("h264", Some(true)));
+        let agg = e.aggregate().unwrap();
+        assert_eq!(agg.h264_excess_refs_state, ExcessRefsState::On);
+        assert!(agg.caps_required.iter().any(|c| c == "h264_excess_refs"));
+    }
+
+    #[test]
+    fn stability_gate_off_after_two_negatives() {
+        let mut e = MeasuredEntry::default();
+        e.push(sample_excess("h264", Some(false)));
+        e.push(sample_excess("h264", Some(false)));
+        let agg = e.aggregate().unwrap();
+        assert_eq!(agg.h264_excess_refs_state, ExcessRefsState::Off);
+        assert!(!agg.caps_required.iter().any(|c| c == "h264_excess_refs"));
+    }
+
+    #[test]
+    fn stability_gate_unknown_with_one_negative() {
+        let mut e = MeasuredEntry::default();
+        e.push(sample_excess("h264", Some(false)));
+        let agg = e.aggregate().unwrap();
+        assert_eq!(agg.h264_excess_refs_state, ExcessRefsState::Unknown);
+    }
+
+    #[test]
+    fn stability_gate_na_for_hevc() {
+        let mut e = MeasuredEntry::default();
+        e.push(sample_excess("hevc", None));
+        let agg = e.aggregate().unwrap();
+        assert_eq!(agg.h264_excess_refs_state, ExcessRefsState::NotApplicable);
+        assert!(!agg.caps_required.iter().any(|c| c == "h264_excess_refs"));
+    }
+
+    #[test]
+    fn derive_variant_caps_tv_baseline_preserves_aac() {
+        let s = sample_excess("h264", None);
+        let caps = derive_variant_caps(&s, ExcessRefsState::Off);
+        assert!(caps.iter().any(|c| c == "aac"));
+        assert!(caps.iter().any(|c| c == "live_video_hls"));
+        assert!(caps.iter().any(|c| c == "h264"));
+        assert!(caps.iter().any(|c| c == "hls"));
+    }
+
+    #[test]
+    fn derive_variant_caps_radio_baseline() {
+        let s = Sample {
+            at: time::OffsetDateTime::now_utc(),
+            source: SampleSource::Sweep,
+            width: 0,
+            height: 0,
+            codec: Some("aac".into()),
+            pix_fmt: None,
+            color_transfer: None,
+            framerate: None,
+            bitrate_kbps: Some(128),
+            dvb_unsafe: None,
+            sample_rate_hz: Some(48000),
+            audio_channels: Some(2),
+            h264_excess_refs: None,
+        };
+        let caps = derive_variant_caps(&s, ExcessRefsState::NotApplicable);
+        assert!(caps.iter().any(|c| c == "hls"));
+        assert!(caps.iter().any(|c| c == "live_audio_only_hls"));
+        assert!(!caps.iter().any(|c| c == "live_video_hls"));
+        assert!(!caps.iter().any(|c| c == "aac"));
+    }
+
+    #[test]
+    fn derive_variant_caps_hevc_main10() {
+        let mut s = sample_excess("hevc", None);
+        s.pix_fmt = Some("yuv420p10le".into());
+        let caps = derive_variant_caps(&s, ExcessRefsState::NotApplicable);
+        assert!(caps.iter().any(|c| c == "hevc"));
+        assert!(caps.iter().any(|c| c == "hevc_main10"));
+    }
+
+    #[test]
+    fn derive_variant_caps_dvb_safe() {
+        let mut s = sample_excess("h264", None);
+        s.dvb_unsafe = Some(true);
+        let caps = derive_variant_caps(&s, ExcessRefsState::Off);
+        assert!(caps.iter().any(|c| c == "dvb_safe"));
     }
 
     /// Get a unique temp dir, or skip the test if /tmp isn't writable.

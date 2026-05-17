@@ -2817,6 +2817,7 @@ mod tests {
             dvb_unsafe: None,
             sample_rate_hz: Some(44100),
             audio_channels: Some(2),
+            h264_excess_refs: None,
         };
         m.push(1, "http://lo", mk(96));
         m.push(2, "http://mid", mk(192));

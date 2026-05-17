@@ -279,6 +279,20 @@ fn has_subtitling_descriptor(descriptors: &[u8]) -> bool {
 /// Classify a TS chunk by parsing its PAT and PMT, then (if a video PID is
 /// known and the codec is H.264 or HEVC) walking that PID's PES payload to
 /// extract SPS-level resolution / colour / framerate.
+/// Return the H.264 elementary-stream bytes from a TS chunk, paired with
+/// the resolved video PID. Used by the Phase 0 slice-header walker to
+/// decide whether to run the `h264_excess_refs` predicate. Reuses the
+/// internal helper that powers `classify_ts_chunk`.
+pub fn extract_h264_elementary_stream(bytes: &[u8]) -> Option<Vec<u8>> {
+    let cls = classify_ts_chunk(bytes)?;
+    if cls.video_codec != Some(VideoCodec::H264) {
+        return None;
+    }
+    let vpid = cls.video_pid?;
+    let start = ts_alignment(bytes)?;
+    collect_video_es(bytes, start, vpid)
+}
+
 pub fn classify_ts_chunk(bytes: &[u8]) -> Option<Classification> {
     let start = ts_alignment(bytes)?;
     let mut pmt_pid: Option<u16> = None;

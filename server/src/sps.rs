@@ -32,6 +32,16 @@ pub struct SpsInfo {
     ///   16 → "smpte2084"  (HDR10 / PQ)
     ///   18 → "arib-std-b67" (HLG)
     pub color_transfer: Option<String>,
+    /// H.264 only. Phase 0 field promotion for the slice-header walker
+    /// that flags excess-refs decoder-quirk variants.
+    pub seq_parameter_set_id: Option<u64>,
+    pub num_ref_frames: Option<u64>,
+    pub log2_max_frame_num_minus4: Option<u64>,
+    pub pic_order_cnt_type: Option<u64>,
+    pub log2_max_pic_order_cnt_lsb_minus4: Option<u64>,
+    pub delta_pic_order_always_zero_flag: Option<u8>,
+    pub frame_mbs_only_flag: Option<u8>,
+    pub separate_colour_plane_flag: Option<u8>,
 }
 
 pub enum SpsCodec {
@@ -140,17 +150,17 @@ fn rbsp_unescape(escaped: &[u8]) -> Vec<u8> {
 
 // --- Bit reader -------------------------------------------------------------
 
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     bytes: &'a [u8],
     bit_pos: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, bit_pos: 0 }
     }
 
-    fn read_bit(&mut self) -> Option<u8> {
+    pub(crate) fn read_bit(&mut self) -> Option<u8> {
         let byte = self.bit_pos / 8;
         let bit = 7 - (self.bit_pos % 8);
         if byte >= self.bytes.len() {
@@ -160,7 +170,7 @@ impl<'a> BitReader<'a> {
         Some((self.bytes[byte] >> bit) & 1)
     }
 
-    fn read_bits(&mut self, n: usize) -> Option<u64> {
+    pub(crate) fn read_bits(&mut self, n: usize) -> Option<u64> {
         if n > 64 {
             return None;
         }
@@ -173,7 +183,7 @@ impl<'a> BitReader<'a> {
 
     /// Unsigned Exp-Golomb code. Counts leading zeros, then reads (zeros+1)
     /// bits, value = 2^zeros + read - 1.
-    fn read_ue(&mut self) -> Option<u64> {
+    pub(crate) fn read_ue(&mut self) -> Option<u64> {
         let mut zeros = 0;
         loop {
             let b = self.read_bit()?;
@@ -193,7 +203,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Signed Exp-Golomb code: decode ue, then map odd → positive, even → negative.
-    fn read_se(&mut self) -> Option<i64> {
+    pub(crate) fn read_se(&mut self) -> Option<i64> {
         let k = self.read_ue()?;
         if k % 2 == 1 {
             Some((k as i64 / 2) + 1)
@@ -201,6 +211,21 @@ impl<'a> BitReader<'a> {
             Some(-(k as i64 / 2))
         }
     }
+}
+
+/// Walk an Annex-B elementary stream and yield (start, end) byte offsets of
+/// each NAL unit. `start` points at the NAL header byte (right after the
+/// start code), `end` at the byte after the last RBSP byte. Public to
+/// `crate` so the slice-header walker and the PPS parser can share the
+/// same NAL-scan logic.
+pub(crate) fn nal_unit_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+    nal_units(bytes)
+}
+
+/// Strip emulation-prevention bytes. Exposed to other modules in the
+/// crate so the slice walker can decode NAL payloads it pulls out.
+pub(crate) fn rbsp_unescape_bytes(escaped: &[u8]) -> Vec<u8> {
+    rbsp_unescape(escaped)
 }
 
 // --- H.264 SPS parser -------------------------------------------------------
@@ -215,14 +240,15 @@ pub fn parse_h264_sps(rbsp: &[u8]) -> Option<SpsInfo> {
     let profile_idc = r.read_bits(8)? as u8;
     let _constraint_flags = r.read_bits(8)?;
     let _level_idc = r.read_bits(8)?;
-    let _seq_parameter_set_id = r.read_ue()?;
+    let seq_parameter_set_id = r.read_ue()?;
 
     let mut chroma_format_idc: u64 = 1; // baseline / main default = 4:2:0
     let mut bit_depth_luma_minus8: u64 = 0;
+    let mut separate_colour_plane_flag: u8 = 0;
     if H264_EXTENDED_PROFILES.contains(&profile_idc) {
         chroma_format_idc = r.read_ue()?;
         if chroma_format_idc == 3 {
-            let _separate_colour_plane = r.read_bit()?;
+            separate_colour_plane_flag = r.read_bit()?;
         }
         bit_depth_luma_minus8 = r.read_ue()?;
         let _bit_depth_chroma_minus8 = r.read_ue()?;
@@ -249,12 +275,14 @@ pub fn parse_h264_sps(rbsp: &[u8]) -> Option<SpsInfo> {
             }
         }
     }
-    let _log2_max_frame_num_minus4 = r.read_ue()?;
+    let log2_max_frame_num_minus4 = r.read_ue()?;
     let pic_order_cnt_type = r.read_ue()?;
+    let mut log2_max_pic_order_cnt_lsb_minus4: Option<u64> = None;
+    let mut delta_pic_order_always_zero_flag: Option<u8> = None;
     if pic_order_cnt_type == 0 {
-        let _log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()?;
+        log2_max_pic_order_cnt_lsb_minus4 = Some(r.read_ue()?);
     } else if pic_order_cnt_type == 1 {
-        let _delta_pic_order_always_zero_flag = r.read_bit()?;
+        delta_pic_order_always_zero_flag = Some(r.read_bit()?);
         let _offset_for_non_ref_pic = r.read_se()?;
         let _offset_for_top_to_bottom_field = r.read_se()?;
         let num_ref_frames_in_cycle = r.read_ue()?;
@@ -262,7 +290,7 @@ pub fn parse_h264_sps(rbsp: &[u8]) -> Option<SpsInfo> {
             let _offset_for_ref_frame = r.read_se()?;
         }
     }
-    let _max_num_ref_frames = r.read_ue()?;
+    let max_num_ref_frames = r.read_ue()?;
     let _gaps_allowed = r.read_bit()?;
     let pic_width_in_mbs_minus1 = r.read_ue()?;
     let pic_height_in_map_units_minus1 = r.read_ue()?;
@@ -309,6 +337,14 @@ pub fn parse_h264_sps(rbsp: &[u8]) -> Option<SpsInfo> {
         framerate: fps,
         pix_fmt: Some(map_pix_fmt(chroma_format_idc, bit_depth_luma_minus8 + 8)),
         color_transfer: transfer,
+        seq_parameter_set_id: Some(seq_parameter_set_id),
+        num_ref_frames: Some(max_num_ref_frames),
+        log2_max_frame_num_minus4: Some(log2_max_frame_num_minus4),
+        pic_order_cnt_type: Some(pic_order_cnt_type),
+        log2_max_pic_order_cnt_lsb_minus4,
+        delta_pic_order_always_zero_flag,
+        frame_mbs_only_flag: Some(frame_mbs_only_flag),
+        separate_colour_plane_flag: Some(separate_colour_plane_flag),
     })
 }
 
@@ -438,6 +474,14 @@ pub fn parse_hevc_sps(rbsp: &[u8]) -> Option<SpsInfo> {
         framerate: fps,
         pix_fmt: Some(map_pix_fmt(chroma_format_idc, bit_depth_luma_minus8 + 8)),
         color_transfer: transfer,
+        seq_parameter_set_id: None,
+        num_ref_frames: None,
+        log2_max_frame_num_minus4: None,
+        pic_order_cnt_type: None,
+        log2_max_pic_order_cnt_lsb_minus4: None,
+        delta_pic_order_always_zero_flag: None,
+        frame_mbs_only_flag: None,
+        separate_colour_plane_flag: None,
     })
 }
 
