@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen_addr: String,
     // Optional fallback URL prefix for absolute links the server emits (play_url,
@@ -39,6 +40,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RadioConfig {
     /// If false (default), no radio is loaded and the kind=Radio channel
     /// list is empty. Lets us land the code with the feature dark.
@@ -53,6 +55,7 @@ pub struct RadioConfig {
 fn default_radio_m3u_path() -> PathBuf { PathBuf::from("radios.m3u") }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CurationConfig {
     #[serde(default)]
     pub order: Vec<String>,
@@ -71,6 +74,7 @@ pub struct CurationConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderBoost {
     pub pattern: String,
     pub score: i32,
@@ -79,6 +83,7 @@ pub struct ProviderBoost {
 fn default_ui_dir() -> PathBuf { PathBuf::from("../app") }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct XtreamConfig {
     pub username: String,
     pub password: String,
@@ -86,6 +91,7 @@ pub struct XtreamConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeConfig {
     pub interval_secs: u64,
     pub timeout_ms: u64,
@@ -114,17 +120,20 @@ fn default_parallelism() -> usize { 4 }
 fn default_freshness_ttl() -> u64 { 3600 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
     pub refresh_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpgConfig {
     pub ttl_secs: u64,
     pub fetch_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlacklistConfig {
     pub host_fail_threshold: usize,
     pub host_ttl_secs: u64,
@@ -154,6 +163,7 @@ fn default_heartbeat_window() -> u64 { 60 }
 fn default_clean_play_reset() -> u64 { 300 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub upstream_timeout_secs: u64,
     /// Reserved for a future per-segment buffer-tuning consumer. Kept in
