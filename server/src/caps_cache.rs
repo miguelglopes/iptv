@@ -531,21 +531,10 @@ impl CapsRequiredCache {
         Self::default()
     }
 
-    /// Rebuild if any of (catalog refreshed timestamp, measured generation,
-    /// alive-hosts set) changed; otherwise return the existing snapshot.
-    pub fn ensure(
-        &self,
-        snap: &CatalogSnapshot,
-        measured: &MeasuredStore,
-        alive_hosts: &[String],
-        tv_curation: &Curation,
-    ) -> CapsSnapshot {
-        // Legacy 4-arg path: no v2 inputs, used by tests + by older callsites.
-        self.ensure_with_v2(snap, measured, alive_hosts, tv_curation, None, 0, false)
-    }
-
-    /// Like `ensure` but also folds in the v2 scope inputs (blacklist +
-    /// stale_secs + v2 flag) so the matrix-version digest factors them.
+    /// Like the legacy `ensure` but also folds in the v2 scope inputs
+    /// (blacklist + stale_secs + v2 flag) so the matrix-version digest
+    /// factors them. Old `ensure(...)` callsite removed — v2 inputs
+    /// default to (None, 0, false) for callers that don't care.
     pub fn ensure_with_v2(
         &self,
         snap: &CatalogSnapshot,
@@ -739,9 +728,9 @@ mod tests {
         let cache = CapsRequiredCache::new();
         let hosts = vec!["http://host.a".to_string()];
 
-        let v1 = cache.ensure(&snap, &m, &hosts, &curation).version;
+        let v1 = cache.ensure_with_v2(&snap, &m, &hosts, &curation, None, 0, false).version;
         m.push(1, "http://host.a", sample("hevc", Some("yuv420p10le"), Some(true)));
-        let snap2 = cache.ensure(&snap, &m, &hosts, &curation);
+        let snap2 = cache.ensure_with_v2(&snap, &m, &hosts, &curation, None, 0, false);
         assert!(snap2.per_channel.get("rtp1").unwrap().contains(&"hevc"));
         assert!(snap2.per_channel.get("rtp1").unwrap().contains(&"hevc_main10"));
         assert!(snap2.per_channel.get("rtp1").unwrap().contains(&"dvb_safe"));
@@ -758,8 +747,8 @@ mod tests {
         let curation = Curation::default();
         let cache = CapsRequiredCache::new();
         let hosts = vec!["http://host.a".to_string()];
-        let v1 = cache.ensure(&snap, &m, &hosts, &curation).version;
-        let v2 = cache.ensure(&snap, &m, &hosts, &curation).version;
+        let v1 = cache.ensure_with_v2(&snap, &m, &hosts, &curation, None, 0, false).version;
+        let v2 = cache.ensure_with_v2(&snap, &m, &hosts, &curation, None, 0, false).version;
         assert_eq!(v1, v2);
     }
 
