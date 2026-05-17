@@ -170,24 +170,67 @@ export function markCapSuccess(tag) {
 
 // Resolve to an array of capability tags. Uses cache when present so the
 // header can ship on the first request after boot. On cache miss, probes once,
-// caches, and resolves.
+// caches in memory, and resolves.
 //
-// Cache guard: a probe result with *neither* play-test cap is almost always
-// the symptom of a transient failure (catalog not yet ready, network blip,
-// CORS hiccup) rather than a genuine "can't play anything" platform. We
-// surface those caps for *this* boot so the server can still filter sanely
-// (in practice it filters everything out and the user sees an empty list)
-// but we don't persist them — next boot reprobes. With both play tests
-// passing nothing is wasted; with only one passing we still cache (it's a
-// real result).
+// Phase 4 deferred-write boot order: cache is NOT written to localStorage
+// at probe time. The boot flow:
+//   1. ensureCaps() runs all PROBES, collects {caps, indeterminate}.
+//   2. First /api/channels request goes out with `caps` as X-Client-Caps.
+//   3. Server response carries X-Probes-Expected.
+//   4. validateAndPersistCaps() checks every expected tag has TRUE or FALSE
+//      (not INDETERMINATE), AND expected ⊆ probed.
+//   5. Pass → persist to localStorage. Fail → in-memory caps stay; next boot
+//      re-probes from scratch (self-healing).
+//
+// Legacy guard preserved: a probe result with *neither* play-test cap is
+// almost always a transient failure; we surface for this boot but never
+// persist.
+var inMemoryCapsState = null; // { caps: [...], indeterminate: [...] }
+
 export async function ensureCaps() {
   var cached = loadCaps();
   if (cached) return cached;
-  var caps = await probe();
-  var anyPlayProbePassed = caps.indexOf('live_video_hls') >= 0
-    || caps.indexOf('live_audio_only_hls') >= 0;
-  if (anyPlayProbePassed) saveCaps(caps);
-  return caps;
+  if (inMemoryCapsState && inMemoryCapsState.caps) {
+    return inMemoryCapsState.caps;
+  }
+  var result = await probe();
+  inMemoryCapsState = result;
+  return result.caps;
+}
+
+/// Phase 4 save-guard. Called by main.js after a successful
+/// /api/channels response that included `X-Probes-Expected`. Validates:
+///   - every expected tag has TRUE or FALSE (not INDETERMINATE), AND
+///   - expected ⊆ probed (PROBES list covers every tag the server cares about).
+/// Pass → persist to localStorage. Fail → no-op (in-memory caps stay for
+/// the session; next boot re-probes).
+export function validateAndPersistCaps(expectedHeader) {
+  if (!inMemoryCapsState) return false;
+  var expected = (expectedHeader || '')
+    .split(',')
+    .map(function (s) { return s.trim().toLowerCase(); })
+    .filter(function (s) { return !!s; });
+  // Build set of probed tags (caps + indeterminate are all "we asked about").
+  var probedNames = {};
+  for (var i = 0; i < PROBES.length; i++) probedNames[PROBES[i].tag] = true;
+  // expected ⊆ probedNames
+  for (var j = 0; j < expected.length; j++) {
+    if (!probedNames[expected[j]]) return false;
+  }
+  // Every expected tag must not be indeterminate.
+  var indSet = {};
+  for (var k = 0; k < inMemoryCapsState.indeterminate.length; k++) {
+    indSet[inMemoryCapsState.indeterminate[k]] = true;
+  }
+  for (var m = 0; m < expected.length; m++) {
+    if (indSet[expected[m]]) return false;
+  }
+  // Legacy guard: keep the play-probe check.
+  var anyPlayProbePassed = inMemoryCapsState.caps.indexOf('live_video_hls') >= 0
+    || inMemoryCapsState.caps.indexOf('live_audio_only_hls') >= 0;
+  if (!anyPlayProbePassed) return false;
+  saveCaps(inMemoryCapsState.caps);
+  return true;
 }
 
 /// Phase 6: if the server's cap-matrix version has changed since the last
@@ -260,6 +303,25 @@ var PROBES = [
   { tag: 'hevc_main10',       check: function () { return playProbe(BASE + '/api/probe/hevc_main10.m3u8'); } },
   { tag: 'av1_play',          check: function () { return playProbe(BASE + '/api/probe/av1.m3u8'); } },
   { tag: 'dvb_safe',          check: function () { return playProbe(BASE + '/api/probe/dvb_safe.m3u8'); } },
+
+  // Per-variant caps v2: tri-state conditional probe. The JSON endpoint
+  // returns {available, url} where `url` is an absolute probe play link
+  // pinned to a specific variant via `probe_stream_id`. When
+  // `available:false` (no qualifying variant exists right now), this
+  // probe yields 'indeterminate' so the save-guard knows we couldn't
+  // settle the tag yet — vs. 'false' which would falsely advertise the
+  // client as strict-only. The driver promotes 'indeterminate' into a
+  // separate `indeterminate` array (see `probe()` below).
+  { tag: 'h264_excess_refs', check: async function () {
+      var r;
+      try { r = await fetch(BASE + '/api/probe/h264_excess_refs.json'); }
+      catch (e) { return 'indeterminate'; }
+      if (!r.ok) return 'indeterminate';
+      var body;
+      try { body = await r.json(); } catch (e) { return 'indeterminate'; }
+      if (!body || !body.available) return 'indeterminate';
+      return await playProbe(body.url);
+    } },
 ];
 
 function vEl() { return document.createElement('video'); }
@@ -268,6 +330,11 @@ function aEl() { return document.createElement('audio'); }
 // All probes run in parallel — sync ones resolve immediately, the two
 // play-tests overlap so first-boot cost is ~one PROBE_TIMEOUT_MS, not the
 // sum. Order of `caps` follows the PROBES array, not completion order.
+//
+// Phase 3 tri-state: a probe returns true / false / 'indeterminate'.
+// Truthy non-'indeterminate' → push the tag into `caps`. 'indeterminate'
+// → push into `indeterminate` (the save guard uses this to decide
+// whether to persist).
 async function probe() {
   var results = await Promise.all(PROBES.map(function (p) {
     return Promise.resolve()
@@ -275,11 +342,19 @@ async function probe() {
       .catch(function () { return false; });
   }));
   var caps = [];
+  var indeterminate = [];
   for (var i = 0; i < PROBES.length; i++) {
-    if (results[i]) caps.push(PROBES[i].tag);
+    var r = results[i];
+    if (r === true || r === 'true') caps.push(PROBES[i].tag);
+    else if (r === 'indeterminate') indeterminate.push(PROBES[i].tag);
+    // r === false | 'false' → omit; not indeterminate
   }
-  return caps;
+  return { caps: caps, indeterminate: indeterminate };
 }
+
+// Exposed for unit tests / programmatic callers — the same probe driver
+// the boot path uses. Returns `{ caps, indeterminate }`.
+export async function runProbes() { return await probe(); }
 
 // Generic play-probe. Loads `url` (server-side probe redirect to a real
 // channel) in a hidden <video>. Resolves true only when `loadeddata` fires

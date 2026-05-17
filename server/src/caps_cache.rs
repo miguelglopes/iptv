@@ -61,6 +61,77 @@ impl ProbeTarget {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2/3/4: per-variant cap derivation. Active behind
+// `Config::caps_v2_per_variant`. The legacy `caps_required` API below stays
+// unchanged for the default-off case so existing tests don't drift.
+
+/// Cap tags this variant requires on a given host. Pulls the aggregate
+/// `caps_required` straight from the measured store; returns `None` when
+/// no sample exists (caller treats absent host as "unknown — no vote").
+pub fn caps_required_at_host(
+    measured: &crate::measured::MeasuredStore,
+    stream_id: u64,
+    host: &str,
+) -> Option<Vec<String>> {
+    measured
+        .get(stream_id, host)
+        .map(|q| q.caps_required.clone())
+}
+
+/// True iff the (variant, host) pair has had a successful sample within
+/// `stale_secs`. Used by the v2 "stale variant escape": variants
+/// unreachable on every alive host for too long are dropped from
+/// `build_candidates`.
+pub fn host_is_fresh(
+    measured: &crate::measured::MeasuredStore,
+    stream_id: u64,
+    host: &str,
+    stale_secs: u64,
+    now: time::OffsetDateTime,
+) -> bool {
+    let Some(at) = measured.most_recent_at(stream_id, host) else {
+        return false;
+    };
+    if stale_secs == 0 {
+        return true;
+    }
+    (now - at).whole_seconds().max(0) as u64 <= stale_secs
+}
+
+/// Cross-host union of `caps_required` for one variant within the v2
+/// emit scope: `alive ∧ ¬blacklisted ∧ ¬stale`. Returns `None` when
+/// the variant is stale on every alive host (caller drops it).
+pub fn variant_caps_required(
+    measured: &crate::measured::MeasuredStore,
+    blacklist: &crate::blacklist::Blacklist,
+    stream_id: u64,
+    alive_hosts: &[String],
+    stale_secs: u64,
+    now: time::OffsetDateTime,
+) -> Option<Vec<String>> {
+    let mut any_fresh = false;
+    let mut union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for host in alive_hosts {
+        if blacklist.is_host_bad(host) {
+            continue;
+        }
+        if !host_is_fresh(measured, stream_id, host, stale_secs, now) {
+            continue;
+        }
+        any_fresh = true;
+        if let Some(caps) = caps_required_at_host(measured, stream_id, host) {
+            for c in caps {
+                union.insert(c);
+            }
+        }
+    }
+    if !any_fresh {
+        return None;
+    }
+    Some(union.into_iter().collect())
+}
+
 /// Compute the tightened cap list for one channel, given fresh inputs.
 ///
 /// Algorithm (plan §7 lines 297-303):
@@ -220,14 +291,193 @@ pub fn pick_probe_channel<'a>(
         .min_by_key(|c| curation.rank_of(&c.key).unwrap_or(usize::MAX))
 }
 
+/// Phase 3 helper: pick a channel + variant whose `caps_required` carries
+/// `target_cap`, ranked by curation. Used by the JSON probe endpoint to
+/// drive the conditional probe (e.g. `h264_excess_refs`). Returns the
+/// (channel key, upstream stream_id) tuple — the play loop will pin to
+/// that stream_id when the client visits `/play/<key>?probe=1&probe_stream_id=<sid>`.
+pub fn pick_probe_variant(
+    snap: &CatalogSnapshot,
+    curation: &Curation,
+    measured: &MeasuredStore,
+    blacklist: &crate::blacklist::Blacklist,
+    alive_hosts: &[String],
+    stale_secs: u64,
+    target_cap: &str,
+) -> Option<(String, u64)> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut best: Option<(usize, String, u64)> = None;
+    for ch in &snap.channels {
+        if ch.kind == crate::xtream::ChannelKind::Radio {
+            continue;
+        }
+        for src in &ch.sources {
+            if src.direct_source.is_some() {
+                continue;
+            }
+            let Some(caps) = variant_caps_required(
+                measured, blacklist, src.stream_id, alive_hosts, stale_secs, now,
+            ) else {
+                continue;
+            };
+            if !caps.iter().any(|c| c == target_cap) {
+                continue;
+            }
+            let rank = curation.rank_of(&ch.key).unwrap_or(usize::MAX);
+            match &best {
+                Some((r, _, _)) if *r <= rank => {}
+                _ => best = Some((rank, ch.key.clone(), src.stream_id)),
+            }
+        }
+    }
+    best.map(|(_, k, sid)| (k, sid))
+}
+
+/// Phase 2 helper: per-request channel caps under v2 / per-variant.
+///
+/// 1. Filter the channel's variants by `caps_required ⊆ client_caps`
+///    (treat None client_caps as no-filter — admin / older callers).
+/// 2. Skip variants whose v2 scope is empty (stale on every alive host).
+/// 3. Pick the rank-winner among survivors using the same scoring the
+///    play loop already uses (`source_rank_key_tv`), tying back to the
+///    variant's top-ranked host candidate.
+/// 4. Return the rank-winner's `caps_required`, or `None` when no
+///    variant survives — caller drops the channel from the emit.
+pub fn channel_caps_v2(
+    state: &crate::state::AppState,
+    channel: &CanonicalChannel,
+    client_caps: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let alive = state.hosts.alive_hosts_ranked();
+    let stale_secs = state.config.caps_v2_stale_secs;
+    let now = time::OffsetDateTime::now_utc();
+
+    if channel.kind == crate::xtream::ChannelKind::Radio {
+        // Radio: keep the legacy derivation (per-format) so radio doesn't
+        // wait on v2 readiness. `caps_required` (below) handles it.
+        let static_caps: Vec<String> = caps_required(channel, &state.measured, &alive)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        return Some(static_caps);
+    }
+
+    let mut survivors: Vec<(u64, Vec<String>)> = Vec::new();
+    for src in &channel.sources {
+        if src.direct_source.is_some() {
+            continue;
+        }
+        let Some(req) = variant_caps_required(
+            &state.measured,
+            &state.blacklist,
+            src.stream_id,
+            &alive,
+            stale_secs,
+            now,
+        ) else {
+            continue;
+        };
+        if let Some(caps) = client_caps {
+            if !req.iter().all(|c| caps.iter().any(|x| x == c)) {
+                continue;
+            }
+        }
+        survivors.push((src.stream_id, req));
+    }
+    if survivors.is_empty() {
+        return None;
+    }
+    // Pick the rank-winner variant using the same scoring as build_candidates.
+    // We approximate by computing the best per-host rank for the variant's
+    // best alive host and comparing variants by it.
+    let log_snap = state.play_log.snapshot();
+    let rank_for = |sid: u64| -> Option<crate::proxy::TvRankKeyOpaque> {
+        let mut best: Option<crate::proxy::TvRankKeyOpaque> = None;
+        for host in &alive {
+            let url = state.xtream.stream_url(host, sid, "m3u8");
+            let key = crate::proxy::compute_tv_rank_key(
+                &channel.key,
+                sid,
+                &url,
+                host,
+                &state.measured,
+                &state.blacklist,
+                &log_snap,
+            );
+            match &best {
+                Some(b) if b >= &key => {}
+                _ => best = Some(key),
+            }
+        }
+        best
+    };
+    survivors.sort_by(|a, b| {
+        rank_for(b.0)
+            .cmp(&rank_for(a.0))
+    });
+    Some(survivors.into_iter().next().map(|(_, caps)| caps).unwrap_or_default())
+}
+
+/// Phase 4 helper: list every non-universal cap tag that appears in any
+/// variant's `caps_required` under the v2 emit scope. Used to populate
+/// the `X-Probes-Expected` header so the client save-guard knows whether
+/// every expected tag has resolved before persisting to localStorage.
+/// Stale-only tags are excluded — a probe endpoint returning
+/// `available:false` for them would otherwise block the save guard
+/// indefinitely.
+pub fn probes_expected(
+    snap: &CatalogSnapshot,
+    measured: &MeasuredStore,
+    blacklist: &crate::blacklist::Blacklist,
+    alive_hosts: &[String],
+    stale_secs: u64,
+) -> Vec<String> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Universal play probes always advertised.
+    tags.insert("live_video_hls".into());
+    tags.insert("live_audio_only_hls".into());
+    for ch in &snap.channels {
+        if ch.kind == crate::xtream::ChannelKind::Radio {
+            continue;
+        }
+        for src in &ch.sources {
+            if src.direct_source.is_some() {
+                continue;
+            }
+            let Some(caps) = variant_caps_required(
+                measured, blacklist, src.stream_id, alive_hosts, stale_secs, now,
+            ) else {
+                continue;
+            };
+            for c in caps {
+                // Skip the universal codec tags; those come from canPlayType.
+                if matches!(c.as_str(), "hls" | "aac" | "h264" | "live_video_hls" | "live_audio_only_hls") {
+                    continue;
+                }
+                tags.insert(c);
+            }
+        }
+    }
+    tags.into_iter().collect()
+}
+
 /// Stable hex digest of the cap matrix surface (plan §7). Cheap so it can
 /// be recomputed on every `/api/channels` request — it's gated by the cache
 /// rebuild check, not called unconditionally.
+///
+/// Phase 2 input refinement: the digest now also folds the sorted set of
+/// cap tags appearing in any variant's `caps_required` across the catalog
+/// (v2 scope) so a new tag entering / last variant exiting flips the
+/// version; routine measurement updates (a kbps wobble, etc.) don't.
 fn compute_version(
     snap: &CatalogSnapshot,
     measured: &MeasuredStore,
     alive_hosts: &[String],
     curation: &Curation,
+    blacklist: Option<&crate::blacklist::Blacklist>,
+    stale_secs: u64,
+    v2: bool,
 ) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     snap.channels.len().hash(&mut h);
@@ -238,6 +488,15 @@ fn compute_version(
             .unwrap_or("");
         endpoint.hash(&mut h);
         picked.hash(&mut h);
+    }
+    if v2 {
+        if let Some(bl) = blacklist {
+            let tags = probes_expected(snap, measured, bl, alive_hosts, stale_secs);
+            "v2".hash(&mut h);
+            for t in &tags {
+                t.hash(&mut h);
+            }
+        }
     }
     format!("{:016x}", h.finish())
 }
@@ -281,6 +540,22 @@ impl CapsRequiredCache {
         alive_hosts: &[String],
         tv_curation: &Curation,
     ) -> CapsSnapshot {
+        // Legacy 4-arg path: no v2 inputs, used by tests + by older callsites.
+        self.ensure_with_v2(snap, measured, alive_hosts, tv_curation, None, 0, false)
+    }
+
+    /// Like `ensure` but also folds in the v2 scope inputs (blacklist +
+    /// stale_secs + v2 flag) so the matrix-version digest factors them.
+    pub fn ensure_with_v2(
+        &self,
+        snap: &CatalogSnapshot,
+        measured: &MeasuredStore,
+        alive_hosts: &[String],
+        tv_curation: &Curation,
+        blacklist: Option<&crate::blacklist::Blacklist>,
+        stale_secs: u64,
+        v2: bool,
+    ) -> CapsSnapshot {
         let cur_gen = measured.generation();
         let cur_refreshed = snap.last_refreshed;
         let cur_hosts_hash = {
@@ -311,7 +586,15 @@ impl CapsRequiredCache {
         for ch in &snap.channels {
             per_channel.insert(ch.key.clone(), caps_required(ch, measured, alive_hosts));
         }
-        let version = compute_version(snap, measured, alive_hosts, tv_curation);
+        let version = compute_version(
+            snap,
+            measured,
+            alive_hosts,
+            tv_curation,
+            blacklist,
+            stale_secs,
+            v2,
+        );
         let new_state = Arc::new(CacheState {
             per_channel: per_channel.clone(),
             version: version.clone(),
@@ -506,6 +789,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pick.key, "sic");
+    }
+
+    #[test]
+    fn variant_caps_required_unions_across_alive_hosts() {
+        let m = empty_store();
+        // Two hosts: A reports h264 only, B reports h264 + h264_excess_refs.
+        // Union should carry the excess-refs tag (any-host-needs-it).
+        let mut s_a = sample("h264", Some("yuv420p"), Some(false));
+        s_a.h264_excess_refs = Some(false);
+        s_a.h264_excess_refs = Some(false); // two negatives → OFF
+        let mut s_a2 = s_a.clone();
+        s_a2.h264_excess_refs = Some(false);
+        m.push(7, "http://host.a", s_a);
+        m.push(7, "http://host.a", s_a2);
+        let mut s_b = sample("h264", Some("yuv420p"), Some(false));
+        s_b.h264_excess_refs = Some(true);
+        m.push(7, "http://host.b", s_b);
+        let bl = crate::blacklist::Blacklist::load_or_empty(
+            crate::config::BlacklistConfig {
+                host_fail_threshold: 8,
+                host_ttl_secs: 300,
+                cool_off_steps_secs: [60, 300, 1800, 21600],
+                heartbeat_window_secs: 60,
+                clean_play_reset_secs: 300,
+            },
+            std::path::PathBuf::from("/nonexistent-bl-test.json"),
+        );
+        let hosts = vec!["http://host.a".into(), "http://host.b".into()];
+        let caps = variant_caps_required(
+            &m, &bl, 7, &hosts, 0, OffsetDateTime::now_utc(),
+        )
+        .expect("variant has fresh hosts");
+        assert!(caps.iter().any(|c| c == "h264_excess_refs"));
+        assert!(caps.iter().any(|c| c == "h264"));
+    }
+
+    #[test]
+    fn variant_caps_required_returns_none_when_all_hosts_stale() {
+        let m = empty_store();
+        // Push one sample, then ask for fresh-only within a tight TTL.
+        let s = sample("h264", Some("yuv420p"), Some(false));
+        m.push(8, "http://host.a", s);
+        let bl = crate::blacklist::Blacklist::load_or_empty(
+            crate::config::BlacklistConfig {
+                host_fail_threshold: 8,
+                host_ttl_secs: 300,
+                cool_off_steps_secs: [60, 300, 1800, 21600],
+                heartbeat_window_secs: 60,
+                clean_play_reset_secs: 300,
+            },
+            std::path::PathBuf::from("/nonexistent-bl-test.json"),
+        );
+        let hosts = vec!["http://host.a".into()];
+        let now = OffsetDateTime::now_utc() + time::Duration::seconds(3600);
+        // 1-second TTL but 1 hour in the future → stale.
+        let res = variant_caps_required(&m, &bl, 8, &hosts, 1, now);
+        assert!(res.is_none());
     }
 
     #[test]

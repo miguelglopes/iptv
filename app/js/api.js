@@ -4,6 +4,7 @@
 import { PROXY_BASE_URL } from './config.js';
 import {
   ensureCapsForMatrix, saveMatrixVersion, loadMatrixVersion,
+  validateAndPersistCaps,
 } from './caps.js';
 
 var BASE = String(PROXY_BASE_URL || '').replace(/\/$/, '');
@@ -82,6 +83,14 @@ export function listChannels(allowReprobe) {
       });
     }
     if (serverVersion) saveMatrixVersion(serverVersion);
+    // Phase 4 save-guard: when the server advertises X-Probes-Expected,
+    // validate the in-memory caps state against it and persist on pass.
+    // On fail (some expected tag is INDETERMINATE), in-memory caps stay
+    // for the session and next boot re-probes.
+    try {
+      var expectedHeader = r.headers.get('x-probes-expected') || '';
+      if (expectedHeader) validateAndPersistCaps(expectedHeader);
+    } catch (e) {}
     return r.json().then(function (rows) {
       return rows.map(function (c) {
         c.tv_archive = truthy(c.tv_archive);

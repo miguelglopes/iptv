@@ -37,7 +37,26 @@ pub struct Config {
     /// fork.
     #[serde(default)]
     pub radio_curation: CurationConfig,
+    /// Phase 2/3/4 cutover flag for per-variant `caps_required`. When
+    /// `false` (default), the channel-level cap derivation in
+    /// `caps_cache::caps_required` runs unchanged; legacy probe redirects
+    /// stay live. When `true`, `/api/channels` emits per-request
+    /// rank-winner caps, `/play` filters candidates by client-advertised
+    /// caps, the JSON probe endpoint (`/api/probe/h264_excess_refs.json`)
+    /// drives the tri-state probe, and the save guard validates against
+    /// `X-Probes-Expected`. Operator flips after `/admin/caps-readiness`
+    /// reports 100% decisive.
+    #[serde(default)]
+    pub caps_v2_per_variant: bool,
+    /// Staleness threshold for a variant: once every alive host has had
+    /// no successful sample for this many seconds, the variant is dropped
+    /// from `build_candidates` under v2 and treated as N/A for cap
+    /// readiness. Default 24h. `0` disables the stale escape (Plan §6).
+    #[serde(default = "default_caps_v2_stale_secs")]
+    pub caps_v2_stale_secs: u64,
 }
+
+fn default_caps_v2_stale_secs() -> u64 { 24 * 3600 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]

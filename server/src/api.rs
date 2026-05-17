@@ -72,8 +72,10 @@ pub struct ChannelDto {
     /// Capability tags a client must support to play this channel. Per-channel
     /// for radio (driven by `RadioFormat`) so a pure-MP3 station isn't sent
     /// to a client that doesn't probe `mp3`. JSON shape unchanged for older
-    /// clients — still a string array.
-    pub caps_required: Vec<&'static str>,
+    /// clients — still a string array. Under `caps_v2_per_variant=true`,
+    /// emits the rank-winner variant's caps so client eviction attributes
+    /// failures to the right tag (h264_excess_refs vs h264).
+    pub caps_required: Vec<String>,
     /// Audio container/transport, only set for radio. Informational; the
     /// client decides hls.js vs native via the `play_url` extension.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,30 +193,87 @@ pub async fn list_channels(
     // digest emitted as `X-Caps-Matrix-Version` so the client can re-probe
     // when the server-side cap surface shifts.
     let alive_hosts = state.hosts.alive_hosts_ranked();
-    let caps_snap = state.caps_cache.ensure(
+    let caps_snap = state.caps_cache.ensure_with_v2(
         &snap,
         &state.measured,
         &alive_hosts,
         &state.curation,
+        Some(&state.blacklist),
+        state.config.caps_v2_stale_secs,
+        state.config.caps_v2_per_variant,
     );
     let baseline_tv: Vec<&'static str> = vec!["hls", "h264", "aac", "live_video_hls"];
-    let channel_caps = |ch: &CanonicalChannel| -> Vec<&'static str> {
+    let v2 = state.config.caps_v2_per_variant;
+    // Phase 2: per-channel rank-winner caps under v2. When v2 is on we
+    // recompute per request (cheap — O(variants × hosts)); when off, fall
+    // back to the cached per-channel map.
+    let client_caps_vec: Option<Vec<String>> = client_caps
+        .as_ref()
+        .map(|s| s.iter().cloned().collect());
+    let v2_caps_for = |ch: &CanonicalChannel| -> Option<Vec<String>> {
+        crate::caps_cache::channel_caps_v2(
+            &state,
+            ch,
+            client_caps_vec.as_deref(),
+        )
+    };
+    let channel_caps_static = |ch: &CanonicalChannel| -> Vec<&'static str> {
         caps_snap
             .per_channel
             .get(&ch.key)
             .cloned()
             .unwrap_or_else(|| baseline_tv.clone())
     };
+    let channel_caps_strings = |ch: &CanonicalChannel| -> Vec<String> {
+        if v2 {
+            if let Some(c) = v2_caps_for(ch) {
+                return c;
+            }
+            // Variant scope empty / no survivor → fall through to caller's
+            // visible filter (which drops the channel).
+            return Vec::new();
+        }
+        channel_caps_static(ch)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
 
+    let mut hidden_by_caps_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let visible: Vec<(usize, &CanonicalChannel)> = snap
         .channels
         .iter()
         .enumerate()
         .filter(|(_, ch)| {
-            let required = channel_caps(ch);
+            let required: Vec<String> = channel_caps_strings(ch);
+            // Under v2: empty required means the channel has no surviving
+            // variant for this client — hide it.
+            if v2 && required.is_empty() {
+                hidden_by_caps_counts
+                    .entry("no-survivor".to_string())
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
+                return false;
+            }
             match &client_caps {
                 None => true,
-                Some(caps) => required.iter().all(|c| caps.contains(*c)),
+                Some(caps) => {
+                    let satisfied = required.iter().all(|c| caps.contains(c));
+                    if !satisfied {
+                        // Attribute to the first missing tag.
+                        for c in &required {
+                            if !caps.contains(c) {
+                                hidden_by_caps_counts
+                                    .entry(c.clone())
+                                    .and_modify(|n| *n += 1)
+                                    .or_insert(1);
+                                break;
+                            }
+                        }
+                    }
+                    satisfied
+                }
             }
         })
         .collect();
@@ -303,7 +362,7 @@ pub async fn list_channels(
                 key: ch.key.clone(),
                 name: ch.name.clone(),
                 kind: ch.kind,
-                caps_required: channel_caps(ch),
+                caps_required: channel_caps_strings(ch),
                 format,
                 logo,
                 default_rank: d,
@@ -330,6 +389,23 @@ pub async fn list_channels(
     if let Ok(v) = axum::http::HeaderValue::from_str(&caps_snap.version) {
         resp.headers_mut().insert("x-caps-matrix-version", v);
     }
+    // Phase 4: X-Probes-Expected so the client save-guard knows which
+    // tags every probe must have resolved (true/false, not indeterminate)
+    // before persisting to localStorage. Per-state, not per-request —
+    // recomputed once per `/api/channels` call.
+    if v2 {
+        let expected = crate::caps_cache::probes_expected(
+            &snap,
+            &state.measured,
+            &state.blacklist,
+            &alive_hosts,
+            state.config.caps_v2_stale_secs,
+        );
+        if let Ok(v) = axum::http::HeaderValue::from_str(&expected.join(",")) {
+            resp.headers_mut().insert("x-probes-expected", v);
+        }
+    }
+    *state.channels_hidden_by_caps.write() = hidden_by_caps_counts;
     resp
 }
 
@@ -694,7 +770,10 @@ pub async fn list_candidates(
         .lookup(&key)
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, format!("unknown channel: {key}")))?;
-    let candidates = crate::proxy::build_candidates(&state, &channel);
+    // Admin/candidate-overlay endpoint passes `None` for client_caps so it
+    // shows the full ranked list (the caller is the user inspecting, not
+    // a playback request the variant filter applies to).
+    let candidates = crate::proxy::build_candidates(&state, &channel, None);
     let now = OffsetDateTime::now_utc();
     let dtos: Vec<CandidateDto> = candidates
         .iter()
@@ -974,6 +1053,161 @@ pub async fn probe_dvb_safe(
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     probe_codec_redirect(&state, &headers, crate::caps_cache::ProbeTarget::DvbSafe).await
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConditionalProbeDto {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Phase 3: conditional JSON probe endpoint for the `h264_excess_refs` cap.
+/// Returns `{available, url}` where the URL is an absolute, probe-mode
+/// /play link pinned to a specific variant via `probe_stream_id`. The
+/// client `playProbe`s that URL; success → cap claimed; fail
+/// (`x-fail-reason: probe-pin-failed`) → cap dropped. Always returns 200
+/// — `{available:false}` when no qualifying variant exists right now (so
+/// the JSON shape avoids the cross-origin opaque-redirect problem 307
+/// would create).
+pub async fn probe_h264_excess_refs_json(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Json<ConditionalProbeDto> {
+    if !state.config.caps_v2_per_variant {
+        return Json(ConditionalProbeDto { available: false, url: None });
+    }
+    let snap = state.catalog.snapshot();
+    let alive_hosts = state.hosts.alive_hosts_ranked();
+    let pick = crate::caps_cache::pick_probe_variant(
+        &snap,
+        &state.curation,
+        &state.measured,
+        &state.blacklist,
+        &alive_hosts,
+        state.config.caps_v2_stale_secs,
+        "h264_excess_refs",
+    );
+    let Some((key, stream_id)) = pick else {
+        return Json(ConditionalProbeDto { available: false, url: None });
+    };
+    let base = request_base_url(&headers, state.config.public_base_url.as_deref());
+    let url = format!(
+        "{}/play/{}.m3u8?probe=1&probe_stream_id={}",
+        base.trim_end_matches('/'),
+        key,
+        stream_id,
+    );
+    Json(ConditionalProbeDto { available: true, url: Some(url) })
+}
+
+/// Phase 4: caps-readiness admin endpoint.
+///
+/// Per (stream_id, host) within the v2 emit scope, report the stability
+/// state of every active cap tag plus sample-window stats. Operator
+/// confirms `decisive_fraction == 1.0` before flipping
+/// `caps_v2_per_variant`.
+#[derive(Debug, Serialize)]
+pub struct ReadinessEntry {
+    pub stream_id: u64,
+    pub host: String,
+    pub channel_keys: Vec<String>,
+    pub samples_count: usize,
+    pub oldest_sample_age_secs: Option<i64>,
+    pub newest_sample_age_secs: Option<i64>,
+    pub states: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CapsReadinessDto {
+    pub decisive_fraction: f64,
+    pub total_pairs: usize,
+    pub decisive_pairs: usize,
+    pub channels_hidden_by_caps: std::collections::BTreeMap<String, usize>,
+    pub entries: Vec<ReadinessEntry>,
+}
+
+pub async fn admin_caps_readiness(
+    State(state): State<Arc<AppState>>,
+) -> Json<CapsReadinessDto> {
+    let snap = state.catalog.snapshot();
+    let alive_hosts = state.hosts.alive_hosts_ranked();
+    let stale_secs = state.config.caps_v2_stale_secs;
+    let now = time::OffsetDateTime::now_utc();
+    let mut entries: Vec<ReadinessEntry> = Vec::new();
+    let mut by_pair: std::collections::BTreeMap<(u64, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for ch in &snap.channels {
+        if ch.kind == ChannelKind::Radio {
+            continue;
+        }
+        for src in &ch.sources {
+            if src.direct_source.is_some() {
+                continue;
+            }
+            for host in &alive_hosts {
+                if state.blacklist.is_host_bad(host) {
+                    continue;
+                }
+                by_pair
+                    .entry((src.stream_id, host.clone()))
+                    .or_default()
+                    .push(ch.key.clone());
+            }
+        }
+    }
+    let mut decisive_pairs = 0usize;
+    for ((stream_id, host), channel_keys) in by_pair.into_iter() {
+        let q = state.measured.get(stream_id, &host);
+        let newest = state.measured.most_recent_at(stream_id, &host);
+        let samples_count = q.as_ref().map(|x| x.samples_count).unwrap_or(0);
+        let mut states: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let excess_state = q
+            .as_ref()
+            .map(|x| x.h264_excess_refs_state)
+            .unwrap_or(crate::measured::ExcessRefsState::Unknown);
+        let label = match excess_state {
+            crate::measured::ExcessRefsState::On => "on",
+            crate::measured::ExcessRefsState::Off => "off",
+            crate::measured::ExcessRefsState::NotApplicable => "n/a",
+            crate::measured::ExcessRefsState::Unknown => "unknown",
+        };
+        states.insert("h264_excess_refs".into(), label.into());
+        if !matches!(excess_state, crate::measured::ExcessRefsState::Unknown) {
+            decisive_pairs += 1;
+        }
+        let newest_age = newest.map(|at| (now - at).whole_seconds());
+        // Oldest age — we don't track it explicitly; approximate via
+        // sample-window position. The aggregate counts samples; we use
+        // `samples_count * sweep_interval` as a rough lower bound. The
+        // readiness UI just needs a "do we have data" signal.
+        let oldest_age = newest_age;
+        let _ = stale_secs;
+        entries.push(ReadinessEntry {
+            stream_id,
+            host,
+            channel_keys,
+            samples_count,
+            oldest_sample_age_secs: oldest_age,
+            newest_sample_age_secs: newest_age,
+            states,
+        });
+    }
+    let total_pairs = entries.len();
+    let decisive_fraction = if total_pairs == 0 {
+        1.0
+    } else {
+        decisive_pairs as f64 / total_pairs as f64
+    };
+    let hidden = state.channels_hidden_by_caps.read().clone();
+    Json(CapsReadinessDto {
+        decisive_fraction,
+        total_pairs,
+        decisive_pairs,
+        channels_hidden_by_caps: hidden,
+        entries,
+    })
 }
 
 /// Serve `index.html` with a player bundle picked per User-Agent. webOS

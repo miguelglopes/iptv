@@ -66,6 +66,11 @@ pub struct AppState {
     /// digest (X-Caps-Matrix-Version header). Lazy-rebuild on catalog
     /// refresh, measured generation bump, or alive-hosts change.
     pub caps_cache: Arc<CapsRequiredCache>,
+    /// Phase 4 counter: cap tag → channels-hidden-this-request. Updated
+    /// by `/api/channels` per its filter pass; surfaced in
+    /// `/admin/caps-readiness`. Bounded cardinality (cap tag set).
+    pub channels_hidden_by_caps:
+        Arc<parking_lot::RwLock<std::collections::BTreeMap<String, usize>>>,
 }
 
 impl AppState {
@@ -131,6 +136,9 @@ impl AppState {
             index_html,
             playlist_resolver_cache: Arc::new(DashMap::new()),
             caps_cache: Arc::new(CapsRequiredCache::new()),
+            channels_hidden_by_caps: Arc::new(parking_lot::RwLock::new(
+                std::collections::BTreeMap::new(),
+            )),
         }))
     }
 }

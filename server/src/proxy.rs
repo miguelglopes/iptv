@@ -153,6 +153,14 @@ pub struct PlayParams {
     /// Promoted to position 0 for this play only; no state mutation.
     #[serde(default)]
     pub force_url: Option<String>,
+    /// Phase 3 probe pin: when `probe=1` AND `probe_stream_id=<N>` are both
+    /// present, restrict the play-loop candidate list to candidates whose
+    /// upstream stream_id matches N. If every alive host for that variant
+    /// fails, return 502 + `x-fail-reason: probe-pin-failed` so the client
+    /// drops the relevant cap. Ignored on non-probe requests (safety: a
+    /// real play must never accidentally pin to a single variant).
+    #[serde(default)]
+    pub probe_stream_id: Option<u64>,
 }
 
 /// Parse the `caps=` comma-list and return whether `dvb_safe` is present.
@@ -163,6 +171,25 @@ fn client_has_cap(caps: &Option<String>, tag: &str) -> bool {
     raw.split(',')
         .map(|s| s.trim().to_ascii_lowercase())
         .any(|c| c == tag)
+}
+
+/// Parse the `caps=` comma-list into a deduplicated vector of lowercased
+/// tags. None / empty → None (caller treats this as "no filter") so legacy
+/// clients without a `caps=` param keep working under both v1 and v2.
+fn parse_caps_list(caps: &Option<String>) -> Option<Vec<String>> {
+    let raw = caps.as_deref()?;
+    let mut out: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub async fn play_playlist(
@@ -222,10 +249,56 @@ pub async fn play_playlist(
     // by kind. The radio path also needs force_url honoured + the 404
     // semantics on malformed / non-candidate input — handling it here
     // avoids duplicating the validation in `play_audio`.
-    let mut candidates = build_candidates(&state, &channel);
+    //
+    // Phase 3: parse client caps from `?caps=...,...`. Probe requests pass
+    // `None` so the candidate filter doesn't reject the probe target on
+    // grounds of "the client probably doesn't support this cap" — the
+    // probe is the thing finding out whether the client supports it.
+    let client_caps_list: Option<Vec<String>> = if probe_request {
+        None
+    } else {
+        parse_caps_list(&params.caps)
+    };
+    let mut candidates = build_candidates(
+        &state,
+        &channel,
+        client_caps_list.as_deref(),
+    );
     if candidates.is_empty() {
+        if !probe_request && client_caps_list.is_some() {
+            warn!(
+                play = %play_id,
+                channel = %channel.key,
+                "caps-mismatch: no variant satisfies client caps"
+            );
+            let mut resp = Response::new(Body::from("no variant matches client caps"));
+            *resp.status_mut() = StatusCode::BAD_GATEWAY;
+            resp.headers_mut().insert(
+                "x-fail-reason",
+                HeaderValue::from_static("caps-mismatch"),
+            );
+            return Ok(resp);
+        }
         warn!(play = %play_id, channel = %channel.key, "no candidate sources for channel");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
+    }
+    // Phase 3 probe pin: restrict to the targeted variant. Promotion is
+    // not enough — the play loop falls through to position 1 on transient
+    // failures, which on the probe path could be a sibling lacking the
+    // cap → false positive. Restriction makes the probe fail closed.
+    if probe_request {
+        if let Some(sid) = params.probe_stream_id {
+            candidates.retain(|c| c.stream_id == sid);
+            if candidates.is_empty() {
+                let mut resp = Response::new(Body::from("probe pin matched no candidate"));
+                *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                resp.headers_mut().insert(
+                    "x-fail-reason",
+                    HeaderValue::from_static("probe-pin-failed"),
+                );
+                return Ok(resp);
+            }
+        }
     }
     if let Some(encoded) = params.force_url.as_deref() {
         let forced = apply_force_url(&mut candidates, encoded)
@@ -426,11 +499,30 @@ pub async fn play_playlist(
             attempts,
         });
     }
+    // Phase 3: when a probe pinned a specific stream_id and every host
+    // failed, surface that as `probe-pin-failed` so the client drops the
+    // cap. Otherwise return the generic 502.
+    if probe_request && params.probe_stream_id.is_some() {
+        let mut resp = Response::new(Body::from(err_text));
+        *resp.status_mut() = StatusCode::BAD_GATEWAY;
+        resp.headers_mut().insert(
+            "x-fail-reason",
+            HeaderValue::from_static("probe-pin-failed"),
+        );
+        return Ok(resp);
+    }
     Err((StatusCode::BAD_GATEWAY, err_text))
 }
 
-pub(crate) fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candidate> {
+pub(crate) fn build_candidates(
+    state: &AppState,
+    channel: &CanonicalChannel,
+    client_caps: Option<&[String]>,
+) -> Vec<Candidate> {
     let alive = state.hosts.alive_hosts_ranked();
+    let v2 = state.config.caps_v2_per_variant;
+    let stale_secs = state.config.caps_v2_stale_secs;
+    let now = time::OffsetDateTime::now_utc();
     let mut cands: Vec<Candidate> = Vec::new();
 
     // Per-source emission. No more host-bad / url-failed / demoted exclusion
@@ -439,10 +531,51 @@ pub(crate) fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> 
     // channel is enumerated; rank-tuple penalties (cool-off step, host
     // badness) sort the broken ones to the bottom without removing them.
     //
+    // Under v2 (`caps_v2_per_variant=true`), this scope tightens to
+    // `alive ∧ ¬blacklisted ∧ ¬stale` so the rank-winner the emit picks
+    // matches what /play can actually rotate to.
+    //
     // Emission order is preserved so the stable sort keeps primary hosts
     // ahead of speculative ones among rank-equal candidates: a primary that
     // tied with a speculative on rank still goes first.
+    let host_eligible = |host: &str, stream_id: u64| -> bool {
+        if !v2 {
+            return true;
+        }
+        if host.is_empty() {
+            return true;
+        }
+        if !alive.iter().any(|h| h == host) {
+            return false;
+        }
+        if state.blacklist.is_host_bad(host) {
+            return false;
+        }
+        crate::caps_cache::host_is_fresh(&state.measured, stream_id, host, stale_secs, now)
+    };
+
+    let caps_satisfied = |stream_id: u64| -> bool {
+        let Some(caps) = client_caps else { return true; };
+        // Under v2 we require the variant to have at least one alive host
+        // in scope (else `variant_caps_required` returns None and the
+        // variant is dropped entirely).
+        let Some(req) = crate::caps_cache::variant_caps_required(
+            &state.measured,
+            &state.blacklist,
+            stream_id,
+            &alive,
+            stale_secs,
+            now,
+        ) else {
+            return false;
+        };
+        req.iter().all(|c| caps.iter().any(|x| x == c))
+    };
+
     for src in &channel.sources {
+        if v2 && !caps_satisfied(src.stream_id) {
+            continue;
+        }
         if let Some(direct) = &src.direct_source {
             // Radio: URL given verbatim by `direct_source` — one candidate
             // per source, no host fanout.
@@ -457,9 +590,11 @@ pub(crate) fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> 
         // Xtream TV source: primary host first (the one that reported the
         // stream), then speculative fanout to every other alive host.
         let primary_host = src.origin_host.as_str();
-        if !primary_host.is_empty() && alive.iter().any(|h| h == primary_host) {
+        if !primary_host.is_empty() && host_eligible(primary_host, src.stream_id) {
             cands.push(make_xtream_candidate(state, primary_host, src.stream_id));
-        } else if !primary_host.is_empty() {
+        } else if !primary_host.is_empty() && !v2 && alive.iter().any(|h| h == primary_host) {
+            cands.push(make_xtream_candidate(state, primary_host, src.stream_id));
+        } else if !primary_host.is_empty() && !v2 {
             // origin_host known but not currently alive — still keep the
             // candidate so cool-off / host-penalty rank it; we don't
             // hard-exclude based on liveness probes.
@@ -467,6 +602,9 @@ pub(crate) fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> 
         }
         for host in &alive {
             if host == primary_host {
+                continue;
+            }
+            if !host_eligible(host, src.stream_id) {
                 continue;
             }
             cands.push(make_xtream_candidate(state, host, src.stream_id));
@@ -555,7 +693,7 @@ pub(crate) fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> 
 // channels — Phase 8 fills these in from the ADTS extractor; for now they
 // are placeholder zeros.
 
-type TvRankKey = (
+pub(crate) type TvRankKey = (
     i32, // -cool_off_penalty
     i32, // -host_penalty
     i32, // measured? (1/0)
@@ -568,6 +706,25 @@ type TvRankKey = (
     i32, // fps_rank
     i32, // raw_kbps
 );
+
+/// Public opaque alias for caps_cache::channel_caps_v2 to compare
+/// rank keys of candidate variants without leaking the tuple shape.
+pub type TvRankKeyOpaque = TvRankKey;
+
+/// Compute the TV rank key for a (stream_id, host) pair. Public so
+/// `caps_cache::channel_caps_v2` can pick the rank-winner variant the
+/// same way `build_candidates` does.
+pub fn compute_tv_rank_key(
+    channel_key: &str,
+    stream_id: u64,
+    url: &str,
+    host: &str,
+    measured: &MeasuredStore,
+    blacklist: &crate::blacklist::Blacklist,
+    log_snap: &[PlayEvent],
+) -> TvRankKey {
+    source_rank_key_tv(channel_key, stream_id, url, host, measured, blacklist, log_snap)
+}
 
 type RadioRankKey = (
     i32, // -cool_off_penalty
@@ -2302,6 +2459,7 @@ mod tests {
             pid: None,
             caps: None,
             force_url: None,
+            probe_stream_id: None,
         }
     }
 

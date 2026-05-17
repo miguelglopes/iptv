@@ -146,6 +146,17 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/probe/hevc_main10.m3u8", get(api::probe_hevc_main10))
         .route("/api/probe/av1.m3u8", get(api::probe_av1))
         .route("/api/probe/dvb_safe.m3u8", get(api::probe_dvb_safe))
+        // Phase 3 conditional JSON probe — returns {available, url} where
+        // url is an absolute probe-mode play link pinned to a specific
+        // (channel, stream_id). Always 200 to avoid cross-origin
+        // opaque-redirect pain on 307s.
+        .route(
+            "/api/probe/h264_excess_refs.json",
+            get(api::probe_h264_excess_refs_json),
+        )
+        // Phase 4 readiness gate — operator confirms decisive_fraction
+        // == 1.0 before flipping `caps_v2_per_variant`.
+        .route("/admin/caps-readiness", get(api::admin_caps_readiness))
         .route("/play/:name", get(proxy::play_playlist))
         .route("/seg/:token", get(proxy::proxy_segment));
     if test_hooks {
