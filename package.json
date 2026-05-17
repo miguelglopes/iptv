@@ -1,0 +1,11 @@
+{
+  "name": "iptv-proxy-e2e",
+  "private": true,
+  "description": "Playwright e2e tests for the iptv-proxy static frontend. Runtime deps stay zero — the app is plain ES modules served as-is.",
+  "scripts": {
+    "test": "playwright test --config tests/e2e/playwright.config.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

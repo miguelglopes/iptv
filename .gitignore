@@ -10,5 +10,9 @@ server/data/
 server/target/
 .claude/
 .playwright-mcp/
+# Playwright e2e artifacts (created by `npx playwright test`)
+node_modules/
+test-results/
+playwright-report/
 CLAUDE.md
 AGENTS.md
