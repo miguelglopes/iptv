@@ -47,8 +47,7 @@ The product goal that frames everything below: **one logical channel that just w
 
 ## 8. **Don't discard** — overriding principle
 - Every `(source × host)` pair stays in the catalogue.
-- Filters de-prioritise or hide temporarily — never permanently remove.
-- The existing safety valve in `proxy.rs::build_candidates` (fall back to the unfiltered list when all filters wipe everything) is the embodiment of this rule and must stay.
+- All failure signals (upstream 5xx, timeout, placeholder manifest, mid-stream decoder error, user Green press) feed rank-tuple penalties (`-cool_off_penalty`, `-host_penalty`); they never exclude a candidate from `build_candidates`. The only thing that hides a source from a client is `caps_required` set inclusion against the client's probed caps.
 
 ## 9. **Minimal transformation** — overriding principle
 - Default for TS segment bodies is byte-for-byte passthrough. The proxy intercepts decisions and URLs, not bytes.

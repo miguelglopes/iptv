@@ -488,7 +488,7 @@ What Playwright CAN exercise:
 - §9 caps-on-URL: assert play URL contains `&caps=…`; assert resulting `/seg/<token>.ts` tokens decode to `dvb_safe` matching the client's claimed caps.
 - §6 freshness loop (when force-enabled via `freshness_loop_interval_secs = Some(n)` in test config): assert `/admin/measured-quality` shows new `Sample.at` timestamps after one loop interval. The "yields-when-active-play" assertion is server-log-based and is left to `tv-eval.md` (line in the §6 section there) rather than wired through Playwright — keeps the test surface honest.
 - §7 cap-matrix versioning: hit `/api/channels` twice with intentionally-different measured state between the calls; assert `X-Caps-Matrix-Version` header differs; assert the client's cached `xtream.caps.matrix_version` triggers a re-probe before the second `/api/channels` request.
-- §8 client-side cap eviction: post 3× `/api/feedback/<key>` with `phase=post-canplay` for a HEVC channel (or route-handler-fake the segment fetches to error mid-playback). Assert `localStorage['xtream.client.caps.v2']` loses `hevc`. Assert the next `/api/channels` request omits the now-unplayable channel.
+- §8 client-side cap eviction: route-handler-fake the segment fetches for a HEVC channel to error mid-playback (3 plays). This triggers `player.onSourceFailed → caps.markCapFailure` client-side, which is what actually mutates the cap set. Assert `localStorage['xtream.client.caps.v2']` loses `hevc`. Assert the next `/api/channels` request omits the now-unplayable channel. (Direct POSTs to `/api/feedback` don't exercise this — `markCapFailure` lives in JS, server-side feedback handling doesn't fire it.)
 - §9 force_url negative path: request `/play/<key>?force_url=<base64-of-a-URL-NOT-in-the-current-candidate-set>` → assert 404. This is the only thing standing between this endpoint and "open URL proxy".
 - §10 radio ADTS (partial — full coverage on TV): play a radio channel via hls.js; assert `/admin/measured-quality` carries `sample_rate_hz` and `audio_channels` for the radio entry afterwards. Doesn't cover webOS-specific master+chunklist quirks (those land in `tv-eval.md`).
 
@@ -576,6 +576,9 @@ The operator's check + a screenshot/short-clip recorded into a per-ship folder i
 |---|---|---|
 | Signaling (headers, query params, feedback bodies, `/api/*` shapes) | ✓ | redundant |
 | JS state machine (caps cache, heartbeat interval, candidate overlay) | ✓ | redundant |
+| Cap-matrix versioning (`X-Caps-Matrix-Version` re-probe trigger) | ✓ | redundant |
+| Client-side cap eviction (3-fails → cap dropped → channel hidden) | ✓ | partial (cap-set inspection only; webOS can't easily inspect localStorage from outside the app) |
+| `force_url` validation (404 on non-candidate URL) | ✓ | redundant |
 | H.264 / AAC basic playback | ✓ | ✓ |
 | HEVC / HEVC main10 decode | ✗ | ✓ — only place |
 | DVB subs (strip vs verbatim) | ✗ | ✓ — only place |
