@@ -23,7 +23,7 @@ use crate::codec::{classify_aac_chunk, classify_ts_chunk, extract_h264_elementar
 use crate::measured::{MeasuredStore, Sample, SampleSource};
 use crate::pps::find_pps_nals;
 use crate::slice::h264_excess_refs as walk_h264_excess_refs;
-use crate::sps::{find_sps_nal, parse_h264_sps, SpsCodec};
+use crate::sps::find_all_h264_sps;
 use crate::state::AppState;
 use crate::xtream::ChannelKind;
 
@@ -207,20 +207,23 @@ pub async fn measure_once_tv(client: &Client, manifest_url: &str) -> Option<Samp
     })
 }
 
-/// Phase 0 slice-header walker entry point: from raw TS bytes, extract the
-/// H.264 elementary stream, parse SPS + every PPS, then walk slices to
-/// determine whether any slice references more frames than the SPS
-/// declared. `None` means "predicate inapplicable for this chunk" — see
+/// Phase 0 slice-header walker entry point: from raw TS bytes, extract
+/// the H.264 elementary stream, parse every SPS (keyed by
+/// `seq_parameter_set_id`) + every PPS, then walk slices to determine
+/// whether any slice references more frames than the SPS declared.
+/// `None` means "predicate inapplicable for this chunk" — see
 /// `slice::h264_excess_refs`.
 pub fn h264_excess_refs_from_ts(ts_bytes: &[u8]) -> Option<bool> {
     let es = extract_h264_elementary_stream(ts_bytes)?;
-    let sps_rbsp = find_sps_nal(&es, SpsCodec::H264)?;
-    let sps = parse_h264_sps(&sps_rbsp)?;
+    let sps_set = find_all_h264_sps(&es);
+    if sps_set.is_empty() {
+        return None;
+    }
     let pps_set = find_pps_nals(&es);
     if pps_set.is_empty() {
         return None;
     }
-    walk_h264_excess_refs(&es, &sps, &pps_set)
+    walk_h264_excess_refs(&es, &sps_set, &pps_set)
 }
 
 /// Audio (radio) counterpart to `measure_once_tv`. Same shape:

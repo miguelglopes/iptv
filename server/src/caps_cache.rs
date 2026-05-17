@@ -548,6 +548,12 @@ struct CacheState {
     catalog_refreshed_at: Option<OffsetDateTime>,
     measured_generation: u64,
     alive_hosts_hash: u64,
+    /// R2 round-1: v2 scope inputs (flag, stale_secs, blacklist) folded
+    /// into a single hash. Lets `ensure_with_v2` notice when the cap-tag
+    /// surface shifts because the blacklist marked a host bad or the
+    /// operator flipped the flag — without that the version stays frozen
+    /// and clients miss the re-probe trigger.
+    v2_scope_hash: u64,
 }
 
 /// Lazy per-channel cache. Rebuild fires only when one of the underlying
@@ -597,11 +603,29 @@ impl CapsRequiredCache {
             }
             h.finish()
         };
+        let cur_v2_scope_hash = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            v2.hash(&mut h);
+            stale_secs.hash(&mut h);
+            if let Some(bl) = blacklist {
+                // Hash blacklist hosts in sorted order so the digest is
+                // stable across reorderings.
+                let mut hosts: Vec<String> =
+                    bl.snapshot_hosts().into_iter().map(|e| e.host).collect();
+                hosts.sort();
+                hosts.len().hash(&mut h);
+                for hh in &hosts {
+                    hh.hash(&mut h);
+                }
+            }
+            h.finish()
+        };
         {
             let g = self.state.read();
             if g.catalog_refreshed_at == cur_refreshed
                 && g.measured_generation == cur_gen
                 && g.alive_hosts_hash == cur_hosts_hash
+                && g.v2_scope_hash == cur_v2_scope_hash
             {
                 return CapsSnapshot {
                     per_channel: g.per_channel.clone(),
@@ -630,6 +654,7 @@ impl CapsRequiredCache {
             catalog_refreshed_at: cur_refreshed,
             measured_generation: cur_gen,
             alive_hosts_hash: cur_hosts_hash,
+            v2_scope_hash: cur_v2_scope_hash,
         });
         *self.state.write() = new_state;
         CapsSnapshot { per_channel, version }

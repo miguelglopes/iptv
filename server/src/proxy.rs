@@ -576,8 +576,16 @@ pub(crate) fn build_candidates(
         req.iter().all(|c| caps.iter().any(|x| x == c))
     };
 
+    // R2 round-1: radio (kind=Radio) and direct-source variants bypass the
+    // v2 variant filter. Radio's caps come from the per-format static table
+    // in `caps_cache::caps_required`, not from per-(stream_id, host)
+    // measured samples — `variant_caps_required` for a radio stream_id
+    // returns None and `caps_satisfied` would falsely 502 channels that
+    // /api/channels emitted as legitimately radio-cap'd.
+    let is_radio_channel = matches!(channel.kind, crate::xtream::ChannelKind::Radio);
     for src in &channel.sources {
-        if v2 && !caps_satisfied(src.stream_id) {
+        let is_direct = src.direct_source.is_some();
+        if v2 && !is_radio_channel && !is_direct && !caps_satisfied(src.stream_id) {
             continue;
         }
         if let Some(direct) = &src.direct_source {

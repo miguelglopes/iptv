@@ -57,7 +57,10 @@ type AggregateReport = {
 const PROXY_BASE = process.env.IPTV_PROXY_BASE || 'http://127.0.0.1:8081';
 const FLAG_STATE = process.env.IPTV_FLAG_STATE || 'baseline';
 const SEED = parseInt(process.env.IPTV_SEED || '1234', 10);
-const N_RANDOM = parseInt(process.env.IPTV_SWEEP_N || '10', 10);
+// Plan §E2E "sample size and selection": ≥30 channels per run.
+// Override via IPTV_SWEEP_N=<n> for faster CI loops; defaults match
+// the plan's gating value.
+const N_RANDOM = parseInt(process.env.IPTV_SWEEP_N || '30', 10);
 const PLAY_WINDOW_MS = parseInt(process.env.IPTV_PLAY_WINDOW_MS || '6000', 10);
 // R1 round-1: bumped from 3 to 12. Channels like TVI carry ~48 candidates
 // (multi-variant × 8 hosts); capping at 3 means real misses at rank 4+
@@ -311,12 +314,24 @@ test.describe('per-variant caps E2E sweep', () => {
   );
 
   test('Chromium UA sweep', async () => {
-    test.setTimeout(10 * 60 * 1000);
+    // Plan §E2E sample size = 30; with PLAY_WINDOW_MS=6000 + candidate
+    // enumeration on failures the wall clock can stretch.  Allow 20 min.
+    test.setTimeout(20 * 60 * 1000);
     const browser = await chromium.launch();
     try {
       const report = await runForProfile(browser, 'Chromium');
       writeReport(report, 'Chromium');
       expect(report.total_channels_tested).toBeGreaterThan(0);
+      // Plan §E2E "Post-flag-flip: missed_opportunities on Chromium must
+      // be **zero**". The baseline run is allowed misses (that's how we
+      // know the regression exists pre-cutover). Only assert zero on the
+      // post-cutover flag state.
+      if (FLAG_STATE === 'post-cutover') {
+        expect(
+          report.missed_opportunities,
+          'post-cutover Chromium must serve no broken variant when a playable alternative exists',
+        ).toBe(0);
+      }
     } finally {
       await browser.close();
     }

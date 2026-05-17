@@ -228,6 +228,32 @@ pub(crate) fn rbsp_unescape_bytes(escaped: &[u8]) -> Vec<u8> {
     rbsp_unescape(escaped)
 }
 
+/// Walk the Annex-B elementary stream and return every H.264 SPS we
+/// find, keyed by `seq_parameter_set_id`. Counterpart to `find_sps_nal`
+/// (which returns only the first SPS RBSP). Used by the slice-header
+/// walker so chunks that contain multiple SPS (a stream rebasing
+/// mid-segment) are classified against the SPS the PPS references,
+/// not whichever one appeared first.
+pub fn find_all_h264_sps(es_bytes: &[u8]) -> std::collections::HashMap<u64, SpsInfo> {
+    let mut out: std::collections::HashMap<u64, SpsInfo> = std::collections::HashMap::new();
+    for (start, end) in nal_units(es_bytes) {
+        if end <= start + 1 {
+            continue;
+        }
+        let nal_type = es_bytes[start] & 0x1F;
+        if nal_type != 7 {
+            continue;
+        }
+        let rbsp = rbsp_unescape(&es_bytes[start + 1..end]);
+        if let Some(sps) = parse_h264_sps(&rbsp) {
+            if let Some(id) = sps.seq_parameter_set_id {
+                out.insert(id, sps);
+            }
+        }
+    }
+    out
+}
+
 // --- H.264 SPS parser -------------------------------------------------------
 
 /// H.264 profiles where chroma/bit-depth fields are present in the SPS.

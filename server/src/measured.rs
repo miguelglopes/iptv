@@ -237,7 +237,17 @@ pub fn derive_variant_caps(
             _ => {}
         }
     }
-    if matches!(excess_state, ExcessRefsState::On) {
+    // Plan §5: fail-closed under UNKNOWN. The asymmetric stability gate
+    // returns UNKNOWN when there aren't yet two corroborating decisive
+    // samples; in that window we keep the cap so strict clients don't
+    // get served a variant we can't yet vouch for. Only `Off` (≥2
+    // negatives) and `NotApplicable` (variant codec outside the tag's
+    // domain) drop the cap.
+    let needs_excess_cap = matches!(
+        excess_state,
+        ExcessRefsState::On | ExcessRefsState::Unknown,
+    ) && matches!(sample.codec.as_deref(), Some("h264"));
+    if needs_excess_cap {
         caps.push("h264_excess_refs".into());
     }
     if sample.dvb_unsafe == Some(true) {
@@ -833,11 +843,32 @@ mod tests {
     }
 
     #[test]
-    fn stability_gate_unknown_with_one_negative() {
+    fn stability_gate_unknown_with_one_negative_is_fail_closed() {
+        // R2 finding: UNKNOWN should keep the cap (plan §5 "UNKNOWN
+        // handling is fail-closed"). A single-negative window must still
+        // emit `h264_excess_refs` so strict clients don't get the variant
+        // until a second corroborating negative arrives.
         let mut e = MeasuredEntry::default();
         e.push(sample_excess("h264", Some(false)));
         let agg = e.aggregate().unwrap();
         assert_eq!(agg.h264_excess_refs_state, ExcessRefsState::Unknown);
+        assert!(
+            agg.caps_required.iter().any(|c| c == "h264_excess_refs"),
+            "UNKNOWN must fail closed (keep cap); caps_required={:?}",
+            agg.caps_required,
+        );
+    }
+
+    #[test]
+    fn stability_gate_unknown_does_not_add_cap_for_hevc() {
+        // UNKNOWN for HEVC = vacuously decisive (predicate doesn't apply),
+        // so the cap should NOT be emitted even when state is Unknown.
+        let s = sample_excess("hevc", None);
+        let caps = derive_variant_caps(&s, ExcessRefsState::Unknown);
+        assert!(
+            !caps.iter().any(|c| c == "h264_excess_refs"),
+            "non-H.264 codec must never carry h264_excess_refs cap; caps={caps:?}"
+        );
     }
 
     #[test]

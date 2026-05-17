@@ -34,13 +34,18 @@ fn is_slice_nal(nal_type: u8) -> bool {
 /// references more frames than the SPS declared, `Some(false)` if every
 /// slice fits, `None` if there's no SPS or no slice in the chunk (so we
 /// can't make a decision either way).
+///
+/// R2 round-1: takes a map of SPS keyed by `seq_parameter_set_id` instead
+/// of a single SPS. A chunk with multiple SPS (broadcast streams that
+/// rebase mid-stream) was previously classified against whichever SPS the
+/// caller happened to grab first; now the slice header's PPS lookup
+/// chains to the right SPS via `pps.seq_parameter_set_id`.
 pub fn h264_excess_refs(
     es_bytes: &[u8],
-    sps: &SpsInfo,
+    sps_set: &HashMap<u64, SpsInfo>,
     pps_set: &HashMap<u64, PpsInfo>,
 ) -> Option<bool> {
-    let _num_ref_frames = sps.num_ref_frames?;
-    if pps_set.is_empty() {
+    if sps_set.is_empty() || pps_set.is_empty() {
         return None;
     }
     let mut saw_slice = false;
@@ -59,7 +64,7 @@ pub fn h264_excess_refs(
             continue;
         }
         let rbsp = rbsp_unescape_bytes(&es_bytes[start + 1..end]);
-        if let Some(excess) = slice_header_excess(&rbsp, sps, pps_set, nal_type, nal_ref_idc) {
+        if let Some(excess) = slice_header_excess(&rbsp, sps_set, pps_set, nal_type, nal_ref_idc) {
             saw_slice = true;
             if excess {
                 // Short-circuit: once any slice is over the line we can stop.
@@ -76,7 +81,7 @@ pub fn h264_excess_refs(
 
 fn slice_header_excess(
     rbsp: &[u8],
-    sps: &SpsInfo,
+    sps_set: &HashMap<u64, SpsInfo>,
     pps_set: &HashMap<u64, PpsInfo>,
     nal_type: u8,
     _nal_ref_idc: u8,
@@ -86,6 +91,9 @@ fn slice_header_excess(
     let slice_type = r.read_ue()?;
     let pic_parameter_set_id = r.read_ue()?;
     let pps = pps_set.get(&pic_parameter_set_id)?;
+    // Chain to the SPS the PPS references. If the chunk doesn't contain
+    // that SPS we treat this slice as undecidable.
+    let sps = sps_set.get(&pps.seq_parameter_set_id)?;
     let num_ref_frames = sps.num_ref_frames?;
 
     // separate_colour_plane_flag controls an extra 2-bit color_plane_id.
@@ -164,14 +172,14 @@ mod tests {
     use crate::pps::PpsInfo;
     use crate::sps::SpsInfo;
 
-    fn fake_sps_num_refs(n: u64) -> SpsInfo {
+    fn fake_sps_id_num_refs(id: u64, n: u64) -> SpsInfo {
         SpsInfo {
             width: Some(1920),
             height: Some(1080),
             framerate: None,
             pix_fmt: None,
             color_transfer: None,
-            seq_parameter_set_id: Some(0),
+            seq_parameter_set_id: Some(id),
             num_ref_frames: Some(n),
             log2_max_frame_num_minus4: Some(0),
             pic_order_cnt_type: Some(2),
@@ -182,19 +190,26 @@ mod tests {
         }
     }
 
+    fn fake_sps_num_refs(n: u64) -> HashMap<u64, SpsInfo> {
+        let mut m = HashMap::new();
+        m.insert(0, fake_sps_id_num_refs(0, n));
+        m
+    }
+
+    fn fake_pps_with_sps(pps_id: u64, sps_id: u64, l0: u64, l1: u64) -> PpsInfo {
+        PpsInfo {
+            pic_parameter_set_id: pps_id,
+            seq_parameter_set_id: sps_id,
+            num_ref_idx_l0_default_active_minus1: l0,
+            num_ref_idx_l1_default_active_minus1: l1,
+            bottom_field_pic_order_in_frame_present_flag: 0,
+            redundant_pic_cnt_present_flag: 0,
+        }
+    }
+
     fn fake_pps(l0: u64, l1: u64) -> HashMap<u64, PpsInfo> {
         let mut m = HashMap::new();
-        m.insert(
-            0,
-            PpsInfo {
-                pic_parameter_set_id: 0,
-                seq_parameter_set_id: 0,
-                num_ref_idx_l0_default_active_minus1: l0,
-                num_ref_idx_l1_default_active_minus1: l1,
-                bottom_field_pic_order_in_frame_present_flag: 0,
-                redundant_pic_cnt_present_flag: 0,
-            },
-        );
+        m.insert(0, fake_pps_with_sps(0, 0, l0, l1));
         m
     }
 
@@ -314,6 +329,26 @@ mod tests {
         let sps = fake_sps_num_refs(2);
         let pps_set = fake_pps(0, 0);
         assert_eq!(h264_excess_refs(&stream, &sps, &pps_set), Some(false));
+    }
+
+    /// R2 round-1: multi-SPS chunk. Two SPS are present (id 0 and id 1)
+    /// with different `num_ref_frames`; the slice's PPS points at SPS id 1.
+    /// The walker must resolve to SPS id 1 (not id 0) when checking the
+    /// budget; otherwise a stream that rebases mid-chunk gets classified
+    /// against the wrong reference set.
+    #[test]
+    fn multi_sps_chunk_resolves_via_pps_seq_parameter_set_id() {
+        let mut sps_set: HashMap<u64, SpsInfo> = HashMap::new();
+        sps_set.insert(0, fake_sps_id_num_refs(0, 16)); // tolerant SPS
+        sps_set.insert(1, fake_sps_id_num_refs(1, 2));  // strict SPS
+        let mut pps_set: HashMap<u64, PpsInfo> = HashMap::new();
+        // pps id 0 → SPS id 1 (the strict one).
+        pps_set.insert(0, fake_pps_with_sps(0, 1, 4, 0));
+        let stream = build_slice_stream(0 /* P */, 0, 0, 0);
+        // Override off → uses PPS default (5 active) → exceeds strict SPS's 2.
+        // If the walker mistakenly used the tolerant SPS (16) the result
+        // would be Some(false) and this regression would slip through.
+        assert_eq!(h264_excess_refs(&stream, &sps_set, &pps_set), Some(true));
     }
 
     /// Phase 0 boundary test: chunk arrives with a partial NAL at the
