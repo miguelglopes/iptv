@@ -19,6 +19,15 @@ import * as cfg from './config.js';
 if (/Web0S/i.test(navigator.userAgent)) document.documentElement.classList.add('tv');
 
 var player = new Player();
+// Toggle body.playing-loading around every play() so CSS can show the Fourier
+// wait-mark over the (briefly black) <video> element until first canplay. The
+// matching remove() is in player.onPlaying below; failure/retry paths call
+// play() again, which re-arms the class transparently.
+var _playerPlayOrig = player.play.bind(player);
+player.play = function (url) {
+  document.body.classList.add('playing-loading');
+  return _playerPlayOrig(url);
+};
 
 // SVG "replay" glyph. webOS Chromium's default fonts ship without U+21BB, so the
 // literal ↻ character renders as a tofu square on the TV. Inline SVG dodges that
@@ -38,7 +47,7 @@ var state = {
                           // against recents reordering between presses. null = no live session.
   error: null,
   search: null,           // null = closed; string = active filter (may be '')
-  panel: 'list',          // 'list' | 'settings' | 'epg' | 'player'
+  panel: 'list',          // 'list' | 'tabs' | 'settings' | 'epg' | 'player'
   settingsIdx: 0,
   epg: {
     focusKey: null,       // channel key the panel currently belongs to (drives "loading…" flash)
@@ -55,7 +64,18 @@ function updateBodyClass() {
   var c = document.body.classList;
   c.toggle('playing', !!state.playing && !state.mini);
   c.toggle('mini', !!state.playing && !!state.mini);
+  // Drives the Fourier wait-mark for radio playback (no video frames ever
+  // arrive — the <video> stays black). TV playback shows the real frame, so
+  // we deliberately don't show the mark there.
+  c.toggle('playing-radio', !!(state.playing && state.playing.channel && state.playing.channel.kind === 'radio'));
+  // Belt-and-braces: playing-loading is set in the player.play wrapper and
+  // cleared in onPlaying, but the back/stop/error paths null state.playing
+  // without going through onPlaying. Force the class off whenever we're no
+  // longer playing — otherwise the wait-mark would linger in the middle of
+  // an idle viewport.
+  if (!state.playing) c.remove('playing-loading');
   c.toggle('panel-list', state.panel === 'list');
+  c.toggle('panel-tabs', state.panel === 'tabs');
   c.toggle('panel-settings', state.panel === 'settings');
   c.toggle('panel-epg', state.panel === 'epg');
   c.toggle('panel-player', state.panel === 'player');
@@ -126,6 +146,8 @@ function setPanel(newPanel) {
     epgRow.classList.toggle('focused', newPanel === 'epg');
     epgRow.classList.toggle('focused-dim', newPanel !== 'epg' && state.epg.rowIdx >= 0);
   }
+  // Mode tabs: the active tab gets the gold ring while the tabs panel is selected.
+  updateModeTabs();
   if (newPanel === 'list') scheduleEpgFetch();
 }
 
@@ -498,18 +520,14 @@ function listHtml(items) {
     }
     var focus = (listActive && i === state.focusIdx) ? ' focused' : (i === state.focusIdx ? ' focused-dim' : '');
     if (it.kind === 'recent') {
-      html += '<div class="list-item recent' + focus + '" data-i="' + i + '"><span class="ret">↩</span> ' + esc(it.text) + '</div>';
+      html += '<div class="list-item recent' + focus + '" data-i="' + i + '"><span class="ret">↩</span><span class="name">' + esc(it.text) + '</span></div>';
     } else {
       var played = it.played ? ' played' : '';
-      var marker = it.inRecentsSection ? '<span class="recent-dot">●</span> ' : '';
-      // Logo: <img loading="lazy" onerror="this.remove()">. Same template for
-      // TV and radio. TV's ChannelDto.logo was already populated by the server
-      // (from Xtream's stream_icon) and just sat unused — this renders it.
-      // onerror = self-remove so dead URLs degrade to text-only without flicker.
+      var marker = it.inRecentsSection ? '<span class="recent-dot">●</span>' : '';
       var logo = it.channel.logo
         ? '<img class="logo" src="' + esc(it.channel.logo) + '" loading="lazy" onerror="this.remove()">'
         : '';
-      html += '<div class="list-item' + played + focus + '" data-i="' + i + '">' + marker + logo + esc(it.channel.name) + '</div>';
+      html += '<div class="list-item' + played + focus + '" data-i="' + i + '">' + marker + logo + '<span class="name">' + esc(it.channel.name) + '</span></div>';
     }
   }
   return html;
@@ -582,9 +600,12 @@ function setMode(newMode) {
 // with state.channels.
 function updateModeTabs() {
   var tabs = document.querySelectorAll('.mode-tabs .tab');
+  var tabsPanelActive = state.panel === 'tabs';
   for (var t = 0; t < tabs.length; t++) {
     var m = tabs[t].getAttribute('data-mode');
-    tabs[t].classList.toggle('active', m === state.mode);
+    var isActive = m === state.mode;
+    tabs[t].classList.toggle('active', isActive);
+    tabs[t].classList.toggle('focused', tabsPanelActive && isActive);
     var cspan = tabs[t].querySelector('.count');
     if (cspan) cspan.textContent = modeCounts[m] ? '(' + modeCounts[m] + ')' : '';
   }
@@ -757,6 +778,11 @@ function scrollToFocus() {
 
 function moveFocus(delta) {
   if (state.playing && !state.mini) return zap(delta);
+  // Tabs panel: ▽ drops into the list. △ is a no-op (already at the top of the screen).
+  if (state.panel === 'tabs') {
+    if (delta > 0) setPanel('list');
+    return;
+  }
   if (state.panel === 'settings') {
     var next = state.settingsIdx + delta;
     if (next >= SETTINGS_COUNT) {
@@ -809,6 +835,13 @@ function moveFocus(delta) {
   }
   var list = visibleItems();
   if (!list.length) return;
+  // △ at the top of the list rises into the tab row (also a panel). Detects "top"
+  // by checking whether any non-header row exists above the current focus — handles
+  // both "first recents row" and "first all-channels row" without special-casing.
+  if (delta < 0 && findNonHeader(list, state.focusIdx - 1, -1) < 0) {
+    setPanel('tabs');
+    return;
+  }
   // Clamp instead of wrapping — wrapping a 400-item list disorients the user.
   var nextL = state.focusIdx + delta;
   if (nextL < 0) nextL = 0;
@@ -865,6 +898,12 @@ function moveHorizontal(delta) {
       return;
     }
     enterCatchupAtNow(-30);
+    return;
+  }
+  // Tabs panel: ◁ → TV, ▷ → Radio. Doesn't fall off into panel cycling — once you're
+  // up here, ◁▷ is mode-swap only; ▽ is the way out.
+  if (state.panel === 'tabs') {
+    setMode(delta < 0 ? 'tv' : 'radio');
     return;
   }
   // Settings is a 2-column grid: left/right hop columns within the same row before
@@ -1295,6 +1334,13 @@ function switchSource() {
 
 function activate() {
   if (state.playing && !state.mini) return;
+  // OK on the tabs panel just drops into the list — the mode was already swapped
+  // by the time the user got here via ◁▷, so there's nothing more to "activate".
+  // Same UX as pressing ▽.
+  if (state.panel === 'tabs') {
+    setPanel('list');
+    return;
+  }
   if (state.panel === 'settings') {
     var act = SETTINGS_ACTIONS[state.settingsIdx];
     if (act) act();
@@ -1402,6 +1448,12 @@ function back() {
     state.focusIdx = 0;
     updateBodyClass();
     renderList();
+    return;
+  }
+  // Back from tabs → drop into the list, same as ▽. Mirrors how back from settings/EPG
+  // returns to the list rather than dead-ending on a non-default panel.
+  if (state.panel === 'tabs') {
+    setPanel('list');
   }
 }
 
@@ -1469,7 +1521,9 @@ function toggleCatchupMode() {
 }
 
 function unrecent() {
-  if ((state.playing && !state.mini) || state.panel === 'settings') return;
+  // Tabs has no row context — Red would otherwise unrecent the previously-focused
+  // list row, which is invisible from the tabs view and surprising.
+  if ((state.playing && !state.mini) || state.panel === 'settings' || state.panel === 'tabs') return;
   var items = visibleItems();
   var it = items[state.focusIdx];
   if (!it || it.kind !== 'channel' || !it.played) return;
@@ -1546,6 +1600,9 @@ function hideOverlay() {
 }
 
 player.onPlaying = function (url) {
+  // First frame is in — drop the loading mark. Radio keeps body.playing-radio
+  // (a separate class) so the wait-mark stays visible for radio playback.
+  document.body.classList.remove('playing-loading');
   mark('firstPlaying');
   if (state.playing) {
     // Suppress the "live" overlay while the zap banner is up — the banner already
@@ -1594,7 +1651,19 @@ setRemoteHandlers({
   ok: function () { activate(); },
   back: function () { back(); },
   yellow: function () { toggleSearch(); },
-  green: function () { if (state.playing && state.playing.mode === 'live') switchSource(); },
+  // Green has two jobs depending on context:
+  //   - fullscreen live playback → switchSource (the recovery action; you're staring
+  //     at a stuttering stream and want a fresh upstream)
+  //   - everywhere else (idle, catchup, mini live) → swap TV ↔ Radio
+  // Catchup is already a Green-no-op today, and mini live is the "browsing" case
+  // where mode-swap is the natural thing to want.
+  green: function () {
+    if (state.playing && !state.mini && state.playing.mode === 'live') {
+      switchSource();
+      return;
+    }
+    setMode(state.mode === 'tv' ? 'radio' : 'tv');
+  },
   blue: function () { toggleCatchupMode(); },
   red: function () { unrecent(); },
   channelUp: function () { (state.playing && !state.mini) ? zap(-1) : moveFocus(-1); },
@@ -1811,6 +1880,10 @@ if (cachedChannels && cachedChannels.length) {
 updateBodyClass();
 renderList();
 tryAutoResume();
+// First render done — drop the CSS boot splash. The splash element lives in
+// body::before (see app.css) so removing it is a pure class toggle, no DOM
+// work and no JS latency contribution to the boot path.
+document.body.classList.add('booted');
 
 // Step 2: probe client capabilities (cached after first run, so this is
 // instant on every boot after the first), then fetch the fresh catalog

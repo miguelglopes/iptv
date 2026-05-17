@@ -3,28 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Xtream</title>
+  <title>Fourier</title>
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
   <link rel="stylesheet" href="css/app.css">
 </head>
 <body class="panel-list">
   <main id="app">
     <section class="left-col">
       <header>
-        <div class="header-top">
-          <h1>Channels</h1>
-          <div class="mode-tabs">
-            <div class="tab active" data-mode="tv"><span class="icon">📺</span>TV <span class="count"></span></div>
-            <div class="tab" data-mode="radio"><span class="icon">📻</span>RADIO <span class="count"></span></div>
+        <div class="mode-tabs">
+          <div class="tab active" data-mode="tv"><span class="icon">📺</span>TV<span class="count"></span></div>
+          <div class="tab" data-mode="radio"><span class="icon">📻</span>RADIO<span class="count"></span></div>
+        </div>
+        <div class="header-meta">
+          <div class="keymap-inline">
+            <span class="chip" data-action="unrecent"><span class="k k-r">●</span> R Unpin</span>
+            <span class="chip" data-action="mode"><span class="k k-g">●</span> G TV/Radio</span>
+            <span class="chip" data-action="search"><span class="k k-y">●</span> Y Search</span>
           </div>
           <div class="hint"></div>
-        </div>
-        <div class="keymap-inline">
-          <span class="chip" data-action="search"><span class="k k-y">●</span> Y Search</span>
-          <span class="chip" data-action="unrecent"><span class="k k-r">●</span> R Unpin</span>
-          <span class="chip" data-action="ok">OK Play</span>
-          <span>◁▷ Panel</span>
-          <span>△▽ Channel</span>
-          <span class="chip" data-action="mode">1/2 Mode</span>
         </div>
       </header>
       <input id="search" class="search" placeholder="search…" autocomplete="off">

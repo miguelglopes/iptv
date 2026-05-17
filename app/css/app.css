@@ -59,6 +59,7 @@ body:not(.searching) #search { display: none; }
 body:not(.error) #error { display: none; }
 body.error #app { display: none; }
 #error { padding: 32px 48px; }
+#error h1 { font-size: 36px; font-weight: 600; color: #ffcc66; }
 
 /* Mini mode: video lives inside .top-slot. Override the fullscreen defaults so it fills
    its container rather than the viewport. */
@@ -92,21 +93,19 @@ body.mini #player {
 header {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px 22px;
-  border-radius: 6px;
-  background: rgba(10, 10, 20, 0.72);
+  gap: 14px;
+  padding: 0;
   flex-shrink: 0;
 }
 
-/* Top row of the header: title + channel/host status. */
-.header-top {
+/* Meta row: remote key legend on the left, host status on the right. */
+.header-meta {
   display: flex;
   align-items: center;
-  gap: 28px;
+  justify-content: space-between;
+  gap: 14px;
 }
 
-/* Bottom row of the header: remote key legend. */
 .keymap-inline {
   display: flex;
   flex-wrap: wrap;
@@ -120,12 +119,6 @@ header {
 .keymap-inline .k { font-size: 10px; }
 .keymap-inline .chip { cursor: pointer; padding: 2px 6px; border-radius: 3px; }
 .keymap-inline .chip:hover { background: rgba(255, 255, 255, 0.08); color: #e0e0f0; }
-
-h1 {
-  font-size: 36px;
-  font-weight: 600;
-  color: #ffcc66;
-}
 
 .hint {
   font-size: 18px;
@@ -272,47 +265,53 @@ body.mini.panel-player .top-slot {
 .k-y { color: #ffcc66; }
 .k-b { color: #66b3ff; }
 .k-r { color: #ff6666; }
+.k-g { color: #7fdd7f; }
 
-/* Mode tabs (TV / RADIO) — live INSIDE .header-top alongside the h1 and hint
-   so they don't eat a separate row of vertical space. Compact size to match
-   the heading bar height. Same visual language as .list-item: amber "played"
-   tint for the active tab, gold focus ring if the tab row ever gains focus
-   (not wired today; digit shortcuts 1/2 and pointer clicks are sufficient). */
+/* Mode tabs (TV / RADIO) are the page header — no separate <h1>. Two equal
+   buttons side by side, each big enough to read from the couch. The tab row
+   is also a navigable panel (state.panel === 'tabs'): △ from the first list
+   row enters it, ◁▷ swaps mode, ▽ drops back into the list. */
 .mode-tabs {
-  display: inline-flex;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
 }
 .tab {
-  padding: 4px 12px;
-  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 18px 22px;
+  border-radius: 8px;
   background: rgba(20, 20, 31, 0.72);
   border: 2px solid transparent;
   color: #d4d4e0;
-  font-size: 14px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: 1px;
   user-select: none;
   cursor: pointer;
-  line-height: 1.4;
+  transition: background 150ms, border-color 150ms, color 150ms;
 }
-.tab .icon { font-size: 15px; }
+.tab .icon { font-size: 36px; line-height: 1; }
 .tab .count {
   color: #aaaabb;
   font-family: ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 16px;
+  font-weight: 400;
+  margin-left: 4px;
 }
 .tab.active {
-  background: rgba(48, 40, 22, 0.78);
+  background: linear-gradient(135deg, rgba(255, 204, 102, 0.22), rgba(255, 204, 102, 0.10));
   color: #ffcc66;
+  border-color: rgba(255, 204, 102, 0.45);
 }
 .tab.active .count { color: #d8b56b; }
-.tab:hover { border-color: rgba(255, 204, 102, 0.45); }
+.tab:hover { border-color: rgba(255, 204, 102, 0.55); }
+/* Tabs panel focused → brighter gold ring on the active tab. */
 .tab.focused {
   border-color: #ffcc66;
-  background: rgba(40, 34, 58, 0.92);
-  color: #ffffff;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 16px rgba(255, 204, 102, 0.40);
 }
 
 /* Channel-row logo. Lazy-loaded via <img loading="lazy" onerror="this.remove()">
@@ -327,13 +326,9 @@ body.mini.panel-player .top-slot {
 .list-item img.logo {
   display: block;
   height: 32px;
-  /* Fixed width (was `width:auto; max-width:96px`) so each row reserves a
-     consistent 96×32 slot before its lazy-loaded image arrives — eliminates
-     the per-row reflow that used to ripple as logos faded in during scroll.
-     object-fit:contain keeps every logo correctly proportioned inside the box. */
-  width: 96px;
+  width: auto;
+  max-width: 64px;
   object-fit: contain;
-  margin-right: 14px;
   flex-shrink: 0;
   align-self: center;
 }
@@ -370,11 +365,18 @@ body.mini.panel-player .top-slot {
   padding: 10px 12px;
   border-radius: 4px;
   margin-bottom: 4px;
-  background: rgba(40, 34, 58, 0.45);
+  /* Solid bg so EPG rows cover the Fourier engraving in the panel behind.
+     Previously rgba(40, 34, 58, 0.45) — the engraving bled through every row. */
+  background: #1a1a2e;
   position: relative;
 }
 .epg-row.now {
-  background: rgba(255, 204, 102, 0.22);
+  /* Gold tint (0.22 alpha, original look) layered ON TOP of the same solid
+     base — keeps the row opaque to the engraving while preserving the
+     gold "now" wash. */
+  background:
+    linear-gradient(rgba(255, 204, 102, 0.22), rgba(255, 204, 102, 0.22)),
+    #1a1a2e;
   border-left: 4px solid #ffcc66;
   padding-left: 12px;
 }
@@ -446,7 +448,9 @@ body.mini.panel-player .top-slot {
 .epg-replay-badge .replay-icon { width: 18px; height: 18px; }
 
 .epg-row.past-replay {
-  background: rgba(102, 179, 255, 0.10);
+  background:
+    linear-gradient(rgba(102, 179, 255, 0.10), rgba(102, 179, 255, 0.10)),
+    #1a1a2e;
   border-left: 3px solid rgba(102, 179, 255, 0.55);
   padding-left: 13px;
 }
@@ -472,8 +476,10 @@ body.mini.panel-player .top-slot {
 }
 
 .epg-row.past-pending {
-  background: rgba(40, 34, 58, 0.45);
-  opacity: 0.78;
+  /* Darker solid bg + dim text instead of element opacity — opacity would
+     fade the row's children AND let the engraving behind bleed through.
+     Solid bg keeps the row opaque to the engraving. */
+  background: #15131f;
 }
 .epg-row.past-pending .epg-time { color: #9aa0b4; }
 .epg-row.past-pending .epg-prog { color: #cdcdd8; }
@@ -776,7 +782,6 @@ body.playing #zap-banner { display: block; }
 .list-item.recent .ret {
   color: #ffcc66;
   font-style: normal;
-  margin-right: 8px;
 }
 
 /* Section heading inside the channel list. Used to separate "Recently watched" from
@@ -805,7 +810,6 @@ body.playing #zap-banner { display: block; }
    recents" cue. */
 .list-item .recent-dot {
   color: #ffcc66;
-  margin-right: 8px;
   font-size: 14px;
 }
 
@@ -827,7 +831,7 @@ body.playing #zap-banner { display: block; }
   text-overflow: ellipsis;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 14px;
 }
 
 .list-item.played {
@@ -943,13 +947,18 @@ body.playing #zap-banner { display: block; }
     min-height: 0;
   }
 
-  header { padding: 10px 14px; gap: 6px; }
-  .header-top { gap: 12px; }
-  h1 { font-size: 22px; }
+  header { padding: 10px 14px; gap: 8px; }
   .hint { font-size: 13px; }
+
+  /* Shrink the tabs proportionally on phones — no need for couch-distance sizing. */
+  .mode-tabs { gap: 8px; }
+  .tab { padding: 10px 14px; font-size: 16px; letter-spacing: 0.5px; gap: 8px; border-radius: 6px; }
+  .tab .icon { font-size: 22px; }
+  .tab .count { font-size: 12px; }
 
   /* TV-remote legend has no meaning on a touch screen. */
   .keymap-inline { display: none; }
+  .header-meta { justify-content: flex-end; }
 
   .list { max-height: 50vh; gap: 4px; padding: 4px 2px; }
   .list-item { padding: 12px 14px; font-size: 16px; }
@@ -1004,4 +1013,70 @@ body.playing #zap-banner { display: block; }
   .zb-label { font-size: 10px; letter-spacing: 1px; min-width: 38px; }
   .zb-time { font-size: 11px; min-width: 96px; }
   .zb-bar { margin-left: 48px; }
+}
+
+/* ============================================================================
+   Brand watermark / wait-state marks (Fourier wordmark).
+   Three placements, one consistent wordmark composition:
+
+   1. .bottom-slot::after  — permanent engraving behind the EPG/preview panel.
+   2. body::before         — boot splash, visible from the first paint until
+                              main.js signals readiness via body.booted. Pure
+                              CSS so it incurs ZERO JS latency.
+   3. body::after          — playback overlay during channel-load (player
+                              waiting for first frame) and during radio
+                              playback (the <video> never receives frames).
+                              Suppressed in body.mini — the player is then
+                              tiny in a corner and the user is browsing.
+   ============================================================================ */
+
+.bottom-slot { position: relative; }
+.bottom-slot::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  bottom: 6px;
+  width: min(360px, 64%);
+  height: 96px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 460 140'%3E%3Cg fill='none' stroke='%23ffcc66' stroke-linecap='round'%3E%3Cpath d='M26 68 Q36 54 46 68 T66 68 T86 68 T106 68 T126 68' stroke-width='2.2' opacity='.42'/%3E%3Cpath d='M26 68 Q46 28 66 68 T106 68 T146 68' stroke-width='7' stroke-linejoin='round'/%3E%3C/g%3E%3Ctext x='174' y='80' fill='%23ffcc66' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif' font-size='36' font-weight='650' letter-spacing='9'%3EFOURIER%3C/text%3E%3Cpath d='M174 101 C214 92 242 110 282 101 S350 92 390 101' fill='none' stroke='%23ffcc66' stroke-width='1.2' opacity='.35'/%3E%3C/svg%3E") center/contain no-repeat;
+  opacity: 0.14;
+  pointer-events: none;
+  z-index: 0;
+}
+.bottom-slot > * { position: relative; z-index: 1; }
+
+/* Boot splash — covers everything until body.booted is set. Sits above #player
+   (z-index 100). The navy gradient matches body's own bg so the transition out
+   is just a fade, not a layout pop. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 460 220'%3E%3Cg fill='none' stroke='%23ffcc66' stroke-linecap='round'%3E%3Cpath d='M26 92 Q36 78 46 92 T66 92 T86 92 T106 92 T126 92' stroke-width='2.5' opacity='.45'/%3E%3Cpath d='M26 92 Q46 50 66 92 T106 92 T146 92' stroke-width='7.5' stroke-linejoin='round'/%3E%3C/g%3E%3Ctext x='174' y='105' fill='%23ffcc66' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif' font-size='38' font-weight='650' letter-spacing='10'%3EFOURIER%3C/text%3E%3Cpath d='M174 128 C214 119 242 137 282 128 S350 119 390 128' fill='none' stroke='%23ffcc66' stroke-width='1.4' opacity='.4'/%3E%3C/svg%3E") center/min(460px, 38vw) no-repeat,
+    linear-gradient(180deg, #0a0a14 0%, #1a1a2e 100%);
+  z-index: 250;
+  pointer-events: none;
+  transition: opacity 0.35s ease-out, visibility 0s 0.35s linear;
+}
+body.booted::before {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* Playback wait overlay — same wordmark, sized for mid-screen. Sits above
+   #player (100) but below splash (250). Visible during loading or radio play. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 460 140'%3E%3Cg fill='none' stroke='%23ffcc66' stroke-linecap='round'%3E%3Cpath d='M26 68 Q36 54 46 68 T66 68 T86 68 T106 68 T126 68' stroke-width='2.2' opacity='.45'/%3E%3Cpath d='M26 68 Q46 28 66 68 T106 68 T146 68' stroke-width='7' stroke-linejoin='round'/%3E%3C/g%3E%3Ctext x='174' y='80' fill='%23ffcc66' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif' font-size='36' font-weight='650' letter-spacing='9'%3EFOURIER%3C/text%3E%3Cpath d='M174 101 C214 92 242 110 282 101 S350 92 390 101' fill='none' stroke='%23ffcc66' stroke-width='1.2' opacity='.4'/%3E%3C/svg%3E") center/min(420px, 36vw) no-repeat;
+  z-index: 110;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s ease-out;
+}
+body.playing-loading:not(.mini)::after,
+body.playing-radio:not(.mini)::after {
+  opacity: 0.6;
 }
