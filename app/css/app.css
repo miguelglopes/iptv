@@ -917,6 +917,62 @@ body.playing #zap-banner { display: block; }
   letter-spacing: 1px;
 }
 
+/* Candidate-override overlay (Phase 7 Step 9). Sits centred, narrower
+   than the channel list. Opened with OK during fullscreen live play,
+   closed with Back / Escape. left/right navigates rows while open. */
+#candidate-overlay {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  min-width: 520px;
+  max-width: 86%;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 18px 24px;
+  background: rgba(10, 10, 20, 0.88);
+  color: #ffffff;
+  border-left: 4px solid #ffcc66;
+  border-radius: 6px;
+  z-index: 300;
+  font-family: ui-monospace, monospace;
+  font-size: 15px;
+}
+#candidate-overlay .cand-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #ffcc66;
+  margin-bottom: 10px;
+  letter-spacing: 0.4px;
+}
+#candidate-overlay .cand-empty {
+  color: #8a8aaa;
+  padding: 8px 0;
+}
+#candidate-overlay .cand-row {
+  display: grid;
+  grid-template-columns: 32px 1fr auto auto;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 3px;
+  color: #ccccdd;
+}
+#candidate-overlay .cand-row.focused {
+  background: rgba(255, 204, 102, 0.15);
+  color: #ffffff;
+}
+#candidate-overlay .cand-rank {
+  color: #6a6a8a;
+}
+#candidate-overlay .cand-host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#candidate-overlay .cand-cool {
+  color: #cc6666;
+}
+
 #player {
   background: #000;
 }
@@ -1079,4 +1135,17 @@ body::after {
 body.playing-loading:not(.mini)::after,
 body.playing-radio:not(.mini)::after {
   opacity: 0.6;
+}
+
+/* Mini + radio: the fullscreen body::after would cover the list/EPG, so draw the
+   wordmark inside the mini player slot instead. Sits above #player (z-index 1)
+   so the engraving is visible over the black <video>. */
+body.mini.playing-radio .top-slot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 460 140'%3E%3Cg fill='none' stroke='%23ffcc66' stroke-linecap='round'%3E%3Cpath d='M26 68 Q36 54 46 68 T66 68 T86 68 T106 68 T126 68' stroke-width='2.2' opacity='.45'/%3E%3Cpath d='M26 68 Q46 28 66 68 T106 68 T146 68' stroke-width='7' stroke-linejoin='round'/%3E%3C/g%3E%3Ctext x='174' y='80' fill='%23ffcc66' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif' font-size='36' font-weight='650' letter-spacing='9'%3EFOURIER%3C/text%3E%3Cpath d='M174 101 C214 92 242 110 282 101 S350 92 390 101' fill='none' stroke='%23ffcc66' stroke-width='1.2' opacity='.4'/%3E%3C/svg%3E") center/min(280px, 85%) no-repeat;
+  opacity: 0.6;
+  pointer-events: none;
+  z-index: 2;
 }

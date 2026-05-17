@@ -8,8 +8,11 @@ import {
   loadLastPlayTimestamp,
   loadActiveMode, saveActiveMode
 } from './cache.js';
-import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, adminClearBlacklist, adminClearDemoted, adminClearAllSources, setClientCaps } from './api.js';
-import { ensureCaps, clearCaps } from './caps.js';
+import { listChannels, epgFor, reportFailure, demoteSource, getStatus, adminReprobe, setClientCaps, heartbeat, buildPlayUrl, forceCandidate, fetchCandidates } from './api.js';
+import {
+  ensureCaps, clearCaps, loadCaps, ensureCapsForMatrix,
+  markCapFailure, markCapSuccess, saveMatrixVersion, UNIVERSAL_CAPS,
+} from './caps.js';
 // Namespace import so the field stays optional — older config.js files that pre-date
 // PROVIDER_LAG_MS won't crash with a named-import SyntaxError; we just fall back to 0.
 import * as cfg from './config.js';
@@ -53,7 +56,12 @@ var state = {
     focusKey: null,       // channel key the panel currently belongs to (drives "loading…" flash)
     byKey: {},            // EPG per channel key — { programs, fetching }
     rowIdx: -1            // index into visible programs. -1 = auto-pick the "now" row on next render.
-  }
+  },
+  // Phase 7 (Step 9) candidate-override overlay. null = closed. While
+  // open, the OK / left / right / back keys are intercepted to drive the
+  // overlay UI instead of their usual fullscreen-live behaviour. Opened
+  // by pressing OK during fullscreen live (where OK is otherwise a no-op).
+  candidateOverlay: null
 };
 
 // Latest /api/status payload (drives the header status line). null until first poll.
@@ -192,27 +200,6 @@ function notifyCleared(label) {
   setOverlay('Settings', label, 'cleared');
 }
 
-function resetBlockedSourcesAction() {
-  adminClearBlacklist().then(function () {
-    notifyCleared('Blocked sources');
-    pollStatus();
-  }).catch(function () { notifyCleared('Blocked sources (request failed)'); });
-}
-
-function resetSourcePreferencesAction() {
-  adminClearDemoted().then(function () {
-    notifyCleared('Source preferences');
-    pollStatus();
-  }).catch(function () { notifyCleared('Source preferences (request failed)'); });
-}
-
-function resetAllSourceStateAction() {
-  adminClearAllSources().then(function () {
-    notifyCleared('All source state');
-    pollStatus();
-  }).catch(function () { notifyCleared('All source state (request failed)'); });
-}
-
 function reprobeAction() {
   adminReprobe().then(function () {
     notifyCleared('Host reprobe requested');
@@ -253,10 +240,10 @@ function clearAllAction() {
 
 // Action lookup keyed by the `data-i` index in the static settings grid (index.html).
 // Order must match the markup; if you change one, change the other.
+// (Phase 4 removed the three source-reset entries — their admin endpoints
+// went away when cool-off replaced the binary blacklist; data-i indices in
+// index.html were renumbered accordingly.)
 var SETTINGS_ACTIONS = [
-  resetBlockedSourcesAction,
-  resetSourcePreferencesAction,
-  resetAllSourceStateAction,
   reprobeAction,
   clearSearchHistoryAction,
   clearRecentChannelsAction,
@@ -950,8 +937,12 @@ function newPlayId() {
         + Math.random().toString(16).slice(2, 6)).slice(0, 12);
 }
 
+// Adapter: all existing call sites pass (url, pid). buildPlayUrl now owns
+// the canonical query-string shape (pid + caps + future force_url). Pulling
+// caps from loadCaps() at call time means a re-probe (Step 8 client-side
+// eviction) is honoured by the very next play attempt.
 function appendPid(url, pid) {
-  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'pid=' + encodeURIComponent(pid);
+  return buildPlayUrl(url, { pid: pid, caps: loadCaps() });
 }
 
 function play(channel) {
@@ -1333,6 +1324,17 @@ function switchSource() {
 }
 
 function activate() {
+  // Fullscreen live: OK opens / commits the Step 9 candidate-override
+  // overlay. With the overlay closed, OK was a no-op here — same effective
+  // UX for users who never use the override.
+  if (state.playing && !state.mini && state.playing.mode === 'live') {
+    if (state.candidateOverlay) {
+      commitCandidateOverlay();
+    } else {
+      toggleCandidateOverlay();
+    }
+    return;
+  }
   if (state.playing && !state.mini) return;
   // OK on the tabs panel just drops into the list — the mode was already swapped
   // by the time the user got here via ◁▷, so there's nothing more to "activate".
@@ -1408,6 +1410,12 @@ function activate() {
 }
 
 function back() {
+  // Candidate overlay swallows Back before the usual fullscreen → mini → stop
+  // chain. Closing it returns the user to the play they were watching.
+  if (state.candidateOverlay) {
+    closeCandidateOverlay();
+    return;
+  }
   if (state.playing) {
     if (!state.mini) {
       // Abandon any in-progress zap preview — the user is exiting fullscreen, not
@@ -1555,6 +1563,37 @@ function hideLegend() {
   clearTimeout(legendTimer);
 }
 
+// Summon the full fullscreen overlay set: legend (key hints), catch-up badge
+// (when applicable), and the bottom-centre channel banner for the currently-
+// playing channel. Called on click, pointer-move, and remote `any:` keypress
+// so every interaction reveals the same info. Each overlay still owns its
+// fade timer; only the banner gets a fresh `summonBannerTimer` here because
+// it has no independent auto-hide outside the zap path.
+//
+// Skipped during an active △▽ zap (zapState set, or commitHideTimer still
+// pending the post-commit linger) — the zap path owns the banner in those
+// windows and showing the playing channel would clobber the previewed one.
+var summonBannerTimer = null;
+function showOverlays() {
+  if (!state.playing || state.mini) return;
+  showLegend();
+  showCatchupBadge();
+  if (zapState || commitHideTimer) return;
+  var banner = document.getElementById('zap-banner');
+  var ch = state.playing.channel;
+  if (!banner.classList.contains('visible') || banner.getAttribute('data-key') !== ch.key) {
+    showZapBanner(ch);
+    banner.setAttribute('data-key', ch.key);
+    scheduleZapEpgFetch(ch);
+  }
+  clearTimeout(summonBannerTimer);
+  summonBannerTimer = setTimeout(function () {
+    if (zapState || commitHideTimer) return;
+    banner.classList.remove('visible');
+    banner.removeAttribute('data-key');
+  }, 3000);
+}
+
 function legendContent() {
   var mode = state.playing && state.playing.mode;
   var ch = state.playing && state.playing.channel;
@@ -1599,6 +1638,113 @@ function hideOverlay() {
   clearTimeout(overlayTimer);
 }
 
+// --- Candidate-override overlay (Phase 7 / Step 9) -------------------------
+//
+// Open: press OK during fullscreen live (where OK is otherwise a no-op —
+// see activate() top guard). Navigate with left/right; commit with OK;
+// cancel with Back/Escape. The picked candidate's URL is sent back to
+// the server as `?force_url=<b64>` on the next play attempt; if the URL
+// is no longer in the freshly-built candidate set (catalog drifted
+// between fetch and commit), the server 404s and the player's normal
+// retry path picks up.
+
+function toggleCandidateOverlay() {
+  if (!state.playing || state.mini || state.playing.mode !== 'live') return;
+  if (state.candidateOverlay) {
+    closeCandidateOverlay();
+    return;
+  }
+  openCandidateOverlay();
+}
+
+function openCandidateOverlay() {
+  var ch = state.playing.channel;
+  state.candidateOverlay = { list: [], idx: 0, key: ch.key, loading: true, error: null };
+  renderCandidateOverlay();
+  fetchCandidates(ch.key).then(function (list) {
+    if (!state.candidateOverlay || state.candidateOverlay.key !== ch.key) return;
+    state.candidateOverlay.list = Array.isArray(list) ? list : [];
+    state.candidateOverlay.loading = false;
+    state.candidateOverlay.idx = 0;
+    renderCandidateOverlay();
+  }).catch(function () {
+    if (!state.candidateOverlay) return;
+    state.candidateOverlay.loading = false;
+    state.candidateOverlay.error = 'failed to load candidates';
+    renderCandidateOverlay();
+  });
+}
+
+function closeCandidateOverlay() {
+  state.candidateOverlay = null;
+  var el = document.getElementById('candidate-overlay');
+  if (el) el.remove();
+}
+
+function moveCandidateOverlay(delta) {
+  var ov = state.candidateOverlay;
+  if (!ov || !ov.list || !ov.list.length) return;
+  ov.idx = (ov.idx + delta + ov.list.length) % ov.list.length;
+  renderCandidateOverlay();
+}
+
+function commitCandidateOverlay() {
+  var ov = state.candidateOverlay;
+  if (!ov || !ov.list || !ov.list.length) return;
+  var cand = ov.list[ov.idx];
+  var ch = state.playing && state.playing.channel;
+  if (!cand || !ch) { closeCandidateOverlay(); return; }
+  // Fresh pid: a force-pick is a brand-new play attempt for blame /
+  // measurement purposes; we don't want the previous pid's accumulators
+  // to bleed into the new session.
+  var pid = newPlayId();
+  state.playing.playId = pid;
+  closeCandidateOverlay();
+  setOverlay(ch.name, '', 'forced source — retrying…', true);
+  var url = forceCandidate(ch.key, ch.play_url, pid, loadCaps(), cand.url);
+  logEvent('force', ch.name, { url: cand.url, pid: pid });
+  player.play(url);
+}
+
+function renderCandidateOverlay() {
+  var el = document.getElementById('candidate-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'candidate-overlay';
+    document.body.appendChild(el);
+  }
+  var ov = state.candidateOverlay;
+  if (!ov) { el.remove(); return; }
+  if (ov.loading) {
+    el.innerHTML = '<div class="cand-title">Candidates</div><div class="cand-empty">loading…</div>';
+    return;
+  }
+  if (ov.error) {
+    el.innerHTML = '<div class="cand-title">Candidates</div><div class="cand-empty">' + esc(ov.error) + '</div>';
+    return;
+  }
+  if (!ov.list.length) {
+    el.innerHTML = '<div class="cand-title">Candidates</div><div class="cand-empty">no candidates</div>';
+    return;
+  }
+  var rows = ov.list.map(function (c, i) {
+    var cls = 'cand-row' + (i === ov.idx ? ' focused' : '');
+    var meas = c.measured;
+    var qual = meas
+      ? (meas.width + 'x' + meas.height + ' ' + (meas.codec || '?') + ' '
+          + (meas.bitrate_kbps != null ? meas.bitrate_kbps + 'k' : '?'))
+      : 'unmeasured';
+    var cool = c.cool_off_step > 0 ? 'cool=' + c.cool_off_step : '';
+    return '<div class="' + cls + '">' +
+      '<span class="cand-rank">' + (c.rank_pos + 1) + '</span>' +
+      '<span class="cand-host">' + esc(c.host) + '</span>' +
+      '<span class="cand-qual">' + esc(qual) + '</span>' +
+      '<span class="cand-cool">' + esc(cool) + '</span>' +
+      '</div>';
+  }).join('');
+  el.innerHTML = '<div class="cand-title">Pick a source — OK commits, Back cancels</div>' + rows;
+}
+
 player.onPlaying = function (url) {
   // First frame is in — drop the loading mark. Radio keeps body.playing-radio
   // (a separate class) so the wait-mark stays visible for radio playback.
@@ -1613,17 +1759,34 @@ player.onPlaying = function (url) {
       setOverlay(state.playing.channel.name, '', 'live');
     }
     logEvent('canplay', state.playing.channel.name, { url: url });
+    // Phase 6 Step 8: a successful canplay on this channel is positive
+    // evidence for each specific cap it requires. Resets the per-cap
+    // failure counter so a previous near-eviction is lifted.
+    var required = state.playing.channel.caps_required || [];
+    for (var i = 0; i < required.length; i++) {
+      var tag = required[i];
+      if (UNIVERSAL_CAPS.indexOf(tag) >= 0) continue;
+      markCapSuccess(tag);
+    }
   }
   // The player just appended a fresh <video> to document.body. If we're in mini we
   // must re-parent it to track #top-slot in the same synchronous tick — otherwise the
   // default fullscreen CSS paints it edge-to-edge for a frame.
   attachVideoForMode();
 };
-player.onSourceFailed = function (url, reason) {
+// Clean-play heartbeat: player arms the 30 s interval on `canplay` and clears
+// it on stop/teardown/error (see player.js). Each tick reads the current
+// playId from state — replayWithFreshPid swaps pids in-place, so a heartbeat
+// fired after a fresh replay correctly attributes to the new upstream.
+player.onHeartbeat = function () {
+  var pid = state.playing && state.playing.playId;
+  if (pid) heartbeat(pid);
+};
+player.onSourceFailed = function (url, reason, phase) {
   if (!state.playing) return;
   if (state.playing.mode === 'catchup') {
     var ch = state.playing.channel;
-    logEvent('catchup-fail', ch.name, { url: url, reason: reason });
+    logEvent('catchup-fail', ch.name, { url: url, reason: reason, phase: phase });
     setOverlay(ch.name, '', 'catch-up unavailable — try again later');
     player.stop();
     state.playing = null;
@@ -1634,10 +1797,35 @@ player.onSourceFailed = function (url, reason) {
     renderList();
     return;
   }
-  logEvent('fail', state.playing.channel.name, { url: url, reason: reason, pid: state.playing.playId });
+  logEvent('fail', state.playing.channel.name, { url: url, reason: reason, phase: phase, pid: state.playing.playId });
+  // Phase 6 Step 8: a post-canplay failure is evidence that the
+  // channel-specific caps it required may not actually be supported by
+  // this client (canPlayType lies for HEVC on some Chromiums, dvb_safe
+  // can't be tested without a real DVB stream, etc). Bump the per-cap
+  // counter; on threshold we drop the cap from loadCaps() and refresh
+  // the channel list so anything else requiring it disappears too —
+  // "never see it fail twice" for homogeneous-codec channels.
+  if (phase === 'post-canplay') {
+    var required2 = state.playing.channel.caps_required || [];
+    var anyEvicted = false;
+    for (var j = 0; j < required2.length; j++) {
+      var tag2 = required2[j];
+      if (UNIVERSAL_CAPS.indexOf(tag2) >= 0) continue;
+      if (markCapFailure(tag2)) anyEvicted = true;
+    }
+    if (anyEvicted) {
+      setClientCaps(loadCaps());
+      // Refresh in the background so the next channel-list paint hides
+      // anything that now requires an evicted cap.
+      listChannels().then(function (rows) {
+        state.channels = rows;
+        renderList();
+      }).catch(function () {});
+    }
+  }
   setOverlay(state.playing.channel.name, '', 'retrying…', true);
   var oldPid = state.playing.playId || null;
-  reportFailure(state.playing.channel.key, oldPid, reason).then(function () {
+  reportFailure(state.playing.channel.key, oldPid, reason, phase).then(function () {
     replayWithFreshPid();
   });
 };
@@ -1646,8 +1834,18 @@ initRemote();
 setRemoteHandlers({
   arrowUp: function () { moveFocus(-1); },
   arrowDown: function () { moveFocus(1); },
-  arrowLeft: function () { moveHorizontal(-1); },
-  arrowRight: function () { moveHorizontal(1); },
+  // Candidate overlay (Phase 7 Step 9) hijacks left/right while open —
+  // navigation within the overlay's row list. Outside the overlay, the
+  // existing moveHorizontal semantics (catchup-seek, panel-switch, etc.)
+  // are preserved exactly.
+  arrowLeft: function () {
+    if (state.candidateOverlay) { moveCandidateOverlay(-1); return; }
+    moveHorizontal(-1);
+  },
+  arrowRight: function () {
+    if (state.candidateOverlay) { moveCandidateOverlay(1); return; }
+    moveHorizontal(1);
+  },
   ok: function () { activate(); },
   back: function () { back(); },
   yellow: function () { toggleSearch(); },
@@ -1674,14 +1872,7 @@ setRemoteHandlers({
   mode2: function () { setMode('radio'); },
   any: function () {
     userInteracted = true;
-    // Suppress the bottom-right key legend while the zap banner is visible — they
-    // share the bottom edge and would overlap. The user has the banner as their
-    // focal point during zap; the legend reappears on the next key after the
-    // banner fades.
-    var banner = document.getElementById('zap-banner');
-    if (!banner || !banner.classList.contains('visible')) showLegend();
-    else hideLegend();
-    showCatchupBadge();
+    showOverlays();
     // Cursor hide-on-key: keyboard activity hides the cursor; mousemove restores it.
     // Mutually exclusive with .pointer-active so the two handlers don't fight.
     // Guard the toggles so we only invalidate style on actual transitions.
@@ -1726,10 +1917,7 @@ document.addEventListener('click', function (e) {
   // legend (channel name, key hints, catch-up badge) — same overlay the keyboard
   // `any:` handler shows on a remote key. Back-out from fullscreen is keyboard-only.
   if (state.playing && !state.mini) {
-    if (e.target.id === 'player') {
-      showLegend();
-      showCatchupBadge();
-    }
+    if (e.target.id === 'player') showOverlays();
     return;
   }
   // Mode-tabs tap → switch TV/RADIO. Same path the digit keys trigger.
@@ -1806,8 +1994,9 @@ document.addEventListener('mousemove', function (e) {
   var c = document.body.classList;
   if (c.contains('no-cursor')) c.remove('no-cursor');
   if (!c.contains('pointer-active')) c.add('pointer-active');
-  // Fullscreen playback: shell is hidden, nothing to hover.
-  if (state.playing && !state.mini) return;
+  // Fullscreen playback: shell is hidden, no row hit-test. Pointer / Magic-Remote
+  // motion summons the same overlay set as a click or remote keypress.
+  if (state.playing && !state.mini) { showOverlays(); return; }
   var t = e.target.closest('#list .list-item, .settings-grid .settings-item, .epg-row');
   if (t === lastHoverTarget) return;
   lastHoverTarget = t;

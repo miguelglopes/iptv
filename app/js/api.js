@@ -2,6 +2,9 @@
 // host probing, catalog, dedup, EPG aggregation, and source failover; the TV just
 // consumes pre-cooked data.
 import { PROXY_BASE_URL } from './config.js';
+import {
+  ensureCapsForMatrix, saveMatrixVersion, loadMatrixVersion,
+} from './caps.js';
 
 var BASE = String(PROXY_BASE_URL || '').replace(/\/$/, '');
 var TIMEOUT_MS = 8000;
@@ -59,12 +62,32 @@ function intOr(v, fallback) {
   return fallback;
 }
 
-export function listChannels() {
-  return json('/api/channels').then(function (rows) {
-    return rows.map(function (c) {
-      c.tv_archive = truthy(c.tv_archive);
-      c.tv_archive_duration = intOr(c.tv_archive_duration, 0);
-      return c;
+// Fetch the channel list. Honours the `X-Caps-Matrix-Version` header
+// (Phase 6 Step 7): when the server's matrix version differs from the
+// cached one, the client clears its cap cache, re-probes, sends the fresh
+// caps in `X-Client-Caps`, and re-fetches once. `allowReprobe` guards
+// against an infinite loop if the second response somehow reports a
+// different version again (shouldn't happen, but defence in depth).
+export function listChannels(allowReprobe) {
+  if (allowReprobe === undefined) allowReprobe = true;
+  return http('/api/channels').then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' on /api/channels');
+    var serverVersion = '';
+    try { serverVersion = r.headers.get('x-caps-matrix-version') || ''; } catch (e) {}
+    var cachedVersion = loadMatrixVersion();
+    if (serverVersion && cachedVersion && serverVersion !== cachedVersion && allowReprobe) {
+      return ensureCapsForMatrix(serverVersion).then(function (freshCaps) {
+        setClientCaps(freshCaps);
+        return listChannels(false);
+      });
+    }
+    if (serverVersion) saveMatrixVersion(serverVersion);
+    return r.json().then(function (rows) {
+      return rows.map(function (c) {
+        c.tv_archive = truthy(c.tv_archive);
+        c.tv_archive_duration = intOr(c.tv_archive_duration, 0);
+        return c;
+      });
     });
   });
 }
@@ -90,20 +113,32 @@ export function epgFor(key) {
 // not whatever LKG happens to be set when feedback arrives).
 //   fail   → demote + count toward windowed threshold; hard blacklist once it crosses
 //   demote → soft demote (URL goes to the back; cycled back once fresh ones are exhausted)
-export function reportFailure(key, playId, error) {
+export function reportFailure(key, playId, error, phase) {
   return post('/api/feedback/' + encodeURIComponent(key), {
     kind: 'fail',
     play_id: playId || null,
-    error: error || null
+    error: error || null,
+    phase: phase || null
   }).catch(function () {});
 }
 
-export function demoteSource(key, playId, error) {
+export function demoteSource(key, playId, error, phase) {
   return post('/api/feedback/' + encodeURIComponent(key), {
     kind: 'demote',
     play_id: playId || null,
-    error: error || null
+    error: error || null,
+    phase: phase || null
   }).catch(function () {});
+}
+
+// Clean-play heartbeat. Fires every 30 s while playback is healthy so the
+// server can reset the URL's cool-off step once we've been clean long
+// enough (see server's blacklist state machine). Best-effort fire-and-
+// forget — a dropped heartbeat just delays the next reset attempt by one
+// tick.
+export function heartbeat(playId) {
+  if (!playId) return Promise.resolve();
+  return post('/api/heartbeat', { play_id: playId }).catch(function () {});
 }
 
 export function getStatus() {
@@ -114,14 +149,55 @@ export function adminReprobe() {
   return http('/admin/reprobe', { method: 'POST' });
 }
 
-export function adminClearBlacklist() {
-  return http('/admin/clear-blacklist', { method: 'POST' });
+// Build a play URL from the channel's base play_url + per-request bits.
+// Single source of truth so every play path (normal, future force-play,
+// catchup) appends `pid` and `caps` consistently. The server reads `caps`
+// out of the query string because the playback path bypasses our XHR
+// wrapper that sets `X-Client-Caps` — webOS uses `<video src>` directly
+// and hls.js's `loadSource` ships without an `xhrSetup` hook.
+//
+// `opts.force_url` is reserved for Step 9 (user override); not consumed
+// by anything yet, but accepting it here keeps the call sites stable so
+// the override PR doesn't have to re-thread every callsite.
+export function buildPlayUrl(baseUrl, opts) {
+  var url = String(baseUrl || '');
+  var pid = opts && opts.pid;
+  var caps = opts && opts.caps;
+  var force = opts && opts.force_url;
+  var params = [];
+  if (pid) params.push('pid=' + encodeURIComponent(pid));
+  if (caps && caps.length) {
+    var capStr = Array.isArray(caps) ? caps.join(',') : String(caps);
+    if (capStr) params.push('caps=' + encodeURIComponent(capStr));
+  }
+  if (force) params.push('force_url=' + encodeURIComponent(force));
+  if (!params.length) return url;
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + params.join('&');
 }
 
-export function adminClearDemoted() {
-  return http('/admin/clear-demoted', { method: 'POST' });
+// base64-url-no-pad (`-`/`_` alphabet, no `=` padding). Server decodes
+// with the matching base64 engine. Used by `forceCandidate` to encode
+// the upstream URL the user picked from the candidate overlay.
+export function base64UrlNoPad(s) {
+  var b64 = btoa(unescape(encodeURIComponent(String(s))));
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function adminClearAllSources() {
-  return http('/admin/clear-all', { method: 'POST' });
+// Step 9 user override: encode the chosen upstream URL and return the full
+// play URL the player should hit. main.js calls player.play() with the
+// returned URL — server validates against current build_candidates and
+// 404s if the URL is no longer a candidate (catalog refreshed between
+// the user opening the overlay and committing).
+export function forceCandidate(key, baseUrl, pid, caps, upstreamUrl) {
+  return buildPlayUrl(baseUrl, {
+    pid: pid,
+    caps: caps,
+    force_url: base64UrlNoPad(upstreamUrl),
+  });
+}
+
+// Fetch the ranked candidate list for a channel (Phase 7 Step 9).
+// Read-only; populates the candidate-overlay UI.
+export function fetchCandidates(key) {
+  return json('/api/candidates/' + encodeURIComponent(key));
 }

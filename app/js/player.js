@@ -23,14 +23,22 @@
 // accept the first frame after the playlist response arrives.
 var STALL_WATCHDOG_MS = 70000;
 
+// Clean-play heartbeat cadence (ms). Server's heartbeat_window_secs is 60 s,
+// so a 30 s cadence tolerates one missed tick before the previous heartbeat
+// is no longer considered "fresh" for cool-off reset purposes.
+var HEARTBEAT_MS = 30000;
+
 export function Player() {
   this.video = null;
   this.url = null;
   this.onError = null;
   this.onPlaying = null;
-  this.onSourceFailed = null;  // (url, reason) — fired on media error or stall
+  this.onSourceFailed = null;  // (url, reason, phase) — fired on media error or stall; phase is "pre-canplay" or "post-canplay"
+  this.onHeartbeat = null;     // (url) — fired every HEARTBEAT_MS while playback is healthy (between canplay and stop/teardown/error)
   this._watchdogTimer = null;
+  this._heartbeatTimer = null;
   this._hls = null;  // hls.js instance when using the MSE path; null on webOS.
+  this._fragsLoaded = 0;  // Phase 13: incremented per FRAG_LOADED; read by the watchdog to distinguish slow-upstream (0 frags) from silent-decode-stall (frags loaded but buffer empty).
 }
 
 Player.prototype._makeVideo = function () {
@@ -44,14 +52,17 @@ Player.prototype._makeVideo = function () {
   var self = this;
   v.addEventListener('error', function () {
     var reason = 'media error ' + (v.error && v.error.code);
+    var phase = v.readyState >= 2 ? 'post-canplay' : 'pre-canplay';
     self._clearWatchdog();
-    if (self.onSourceFailed) self.onSourceFailed(self.url, reason);
+    self._clearHeartbeat();
+    if (self.onSourceFailed) self.onSourceFailed(self.url, reason, phase);
   });
   // canplay is the single "we're ready to play" signal: fires once the demuxer has
   // buffered enough to start. (Previously both `playing` and `canplay` were wired,
   // which double-fired onPlaying — extra setOverlay/log calls per play.)
   v.addEventListener('canplay', function () {
     self._clearWatchdog();
+    self._armHeartbeat();
     if (self.onPlaying) self.onPlaying(self.url);
   });
   // loadeddata = readyState reached 2 = demuxer accepted at least one frame. Earlier
@@ -75,6 +86,8 @@ Player.prototype._makeVideo = function () {
 
 Player.prototype._tearDown = function () {
   this._clearWatchdog();
+  this._clearHeartbeat();
+  this._fragsLoaded = 0;
   if (this._hls) {
     try { this._hls.destroy(); } catch (e) {}
     this._hls = null;
@@ -98,7 +111,20 @@ Player.prototype._armWatchdog = function () {
     // Belt-and-braces: if the demuxer actually got somewhere we don't fire.
     if (v.readyState >= 2) return;
     var reason = 'stalled: no data after ' + (STALL_WATCHDOG_MS / 1000) + 's (rs=' + v.readyState + ' ns=' + v.networkState + ')';
-    if (self.onSourceFailed) self.onSourceFailed(self.url, reason);
+    // Silent-decode-stall detector (hls.js path only): if hls.js has
+    // loaded at least one fragment AND the video buffer is empty AND
+    // readyState < 3 after the watchdog window, the bytes arrived and
+    // were demuxed but the decoder rejected them. That's a decoder-shape
+    // failure (post-canplay semantically), not a slow upstream. The
+    // webOS native path doesn't go through hls.js — `self._hls` is null
+    // there, so this branch is skipped and the existing pre-canplay
+    // classification stays.
+    var phase = 'pre-canplay';
+    if (self._hls && self._fragsLoaded > 0 && v.buffered.length === 0 && v.readyState < 3) {
+      phase = 'post-canplay';
+      reason = 'decoder rejected: ' + self._fragsLoaded + ' fragments loaded, 0 buffered';
+    }
+    if (self.onSourceFailed) self.onSourceFailed(self.url, reason, phase);
   }, STALL_WATCHDOG_MS);
 };
 
@@ -106,6 +132,28 @@ Player.prototype._clearWatchdog = function () {
   if (this._watchdogTimer) {
     clearTimeout(this._watchdogTimer);
     this._watchdogTimer = null;
+  }
+};
+
+// Heartbeat: armed on canplay, cleared on stop/teardown/error. Idempotent —
+// canplay can re-fire (e.g. after a seek) and must not double-arm. Pauses
+// don't reset the cadence per the plan ("cumulative — only errors clear").
+Player.prototype._armHeartbeat = function () {
+  if (this._heartbeatTimer) return;
+  if (!this.onHeartbeat) return;
+  var self = this;
+  this._heartbeatTimer = setInterval(function () {
+    // Race guard: tear-down may have happened between the tick scheduling
+    // and firing. Don't call back into the caller without a live video.
+    if (!self.video || !self.url) return;
+    try { self.onHeartbeat(self.url); } catch (e) {}
+  }, HEARTBEAT_MS);
+};
+
+Player.prototype._clearHeartbeat = function () {
+  if (this._heartbeatTimer) {
+    clearInterval(this._heartbeatTimer);
+    this._heartbeatTimer = null;
   }
 };
 
@@ -129,10 +177,18 @@ Player.prototype._attachSource = function (url) {
     });
     hls.loadSource(url);
     hls.attachMedia(this.video);
+    // Track fragments-loaded count so the watchdog can distinguish
+    // "slow upstream / no bytes" (pre-canplay) from "bytes arrived but
+    // decoder rejected them" (post-canplay). Our own counter avoids
+    // depending on hls.js internal stats shape across minor versions.
+    hls.on(Hls.Events.FRAG_LOADED, function () { self._fragsLoaded += 1; });
     hls.on(Hls.Events.ERROR, function (_evt, data) {
       if (!data || !data.fatal) return;
       var reason = 'hls.js: ' + (data.details || data.type || 'fatal');
-      if (self.onSourceFailed) self.onSourceFailed(self.url, reason);
+      var v = self.video;
+      var phase = (v && v.readyState >= 2) ? 'post-canplay' : 'pre-canplay';
+      self._clearHeartbeat();
+      if (self.onSourceFailed) self.onSourceFailed(self.url, reason, phase);
     });
     this._hls = hls;
     return;
