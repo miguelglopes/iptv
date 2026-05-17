@@ -545,13 +545,17 @@ pub(crate) fn build_candidates(
         if host.is_empty() {
             return true;
         }
-        if !alive.iter().any(|h| h == host) {
-            return false;
-        }
-        if state.blacklist.is_host_bad(host) {
-            return false;
-        }
-        crate::caps_cache::host_is_fresh(&state.measured, stream_id, host, stale_secs, now)
+        // Shared v2 host-eligibility predicate so `channel_caps_v2`'s
+        // rank-winner computation and this candidate list can't drift.
+        crate::caps_cache::host_eligible_v2(
+            &state.measured,
+            &state.blacklist,
+            &alive,
+            host,
+            stream_id,
+            stale_secs,
+            now,
+        )
     };
 
     let caps_satisfied = |stream_id: u64| -> bool {

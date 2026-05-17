@@ -346,6 +346,16 @@ impl MeasuredStore {
             .and_then(|e| e.samples.back().map(|s| s.at))
     }
 
+    /// Timestamp of the oldest sample still in the rolling window. Used by
+    /// `/admin/caps-readiness` to surface the window's lower bound — a
+    /// distinct signal from `most_recent_at` (the upper bound).
+    pub fn oldest_sample_at(&self, stream_id: u64, host: &str) -> Option<time::OffsetDateTime> {
+        self.inner
+            .read()
+            .get(&(stream_id, host.to_string()))
+            .and_then(|e| e.samples.front().map(|s| s.at))
+    }
+
     pub fn has_samples(&self, stream_id: u64, host: &str) -> bool {
         self.inner
             .read()

@@ -99,6 +99,32 @@ pub fn host_is_fresh(
     (now - at).whole_seconds().max(0) as u64 <= stale_secs
 }
 
+/// v2 host-eligibility predicate, shared between `build_candidates`
+/// (proxy.rs) and `channel_caps_v2`'s rank computation (caps_cache.rs).
+/// Returns true iff `host` is one the v2 scope would emit / serve from
+/// for `stream_id`. The "Same scoring function, same scope" plan
+/// invariant: rank-winner emit and /play candidate set MUST agree.
+pub fn host_eligible_v2(
+    measured: &crate::measured::MeasuredStore,
+    blacklist: &crate::blacklist::Blacklist,
+    alive_hosts: &[String],
+    host: &str,
+    stream_id: u64,
+    stale_secs: u64,
+    now: time::OffsetDateTime,
+) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if !alive_hosts.iter().any(|h| h == host) {
+        return false;
+    }
+    if blacklist.is_host_bad(host) {
+        return false;
+    }
+    host_is_fresh(measured, stream_id, host, stale_secs, now)
+}
+
 /// Cross-host union of `caps_required` for one variant within the v2
 /// emit scope: `alive ∧ ¬blacklisted ∧ ¬stale`. Returns `None` when
 /// the variant is stale on every alive host (caller drops it).
@@ -387,13 +413,27 @@ pub fn channel_caps_v2(
     if survivors.is_empty() {
         return None;
     }
-    // Pick the rank-winner variant using the same scoring as build_candidates.
-    // We approximate by computing the best per-host rank for the variant's
-    // best alive host and comparing variants by it.
+    // Pick the rank-winner variant using the same scoring AND the same
+    // host-eligibility predicate as build_candidates. R1 round-1: skipping
+    // the v2 scope here means rank_for could pick a host build_candidates
+    // wouldn't, making the emit's rank-winner disagree with /play's
+    // rank-winner within one snapshot. Fixed by routing both through
+    // `host_eligible_v2`.
     let log_snap = state.play_log.snapshot();
     let rank_for = |sid: u64| -> Option<crate::proxy::TvRankKeyOpaque> {
         let mut best: Option<crate::proxy::TvRankKeyOpaque> = None;
         for host in &alive {
+            if !host_eligible_v2(
+                &state.measured,
+                &state.blacklist,
+                &alive,
+                host,
+                sid,
+                stale_secs,
+                now,
+            ) {
+                continue;
+            }
             let url = state.xtream.stream_url(host, sid, "m3u8");
             let key = crate::proxy::compute_tv_rank_key(
                 &channel.key,
@@ -812,6 +852,36 @@ mod tests {
         .expect("variant has fresh hosts");
         assert!(caps.iter().any(|c| c == "h264_excess_refs"));
         assert!(caps.iter().any(|c| c == "h264"));
+    }
+
+    #[test]
+    fn host_eligible_v2_matches_build_candidates_scope() {
+        // R1 round-1 invariant: the same scope (alive ∧ ¬blacklisted ∧
+        // ¬stale) the candidate list filters on must be the scope the
+        // rank-winner emit uses. host_eligible_v2 is the shared predicate.
+        let m = empty_store();
+        let s = sample("h264", Some("yuv420p"), Some(false));
+        m.push(42, "http://host.a", s);
+        let bl = crate::blacklist::Blacklist::load_or_empty(
+            crate::config::BlacklistConfig {
+                host_fail_threshold: 8,
+                host_ttl_secs: 300,
+                cool_off_steps_secs: [60, 300, 1800, 21600],
+                heartbeat_window_secs: 60,
+                clean_play_reset_secs: 300,
+            },
+            std::path::PathBuf::from("/nonexistent-bl-test2.json"),
+        );
+        let hosts = vec!["http://host.a".into(), "http://host.b".into()];
+        let now = OffsetDateTime::now_utc();
+        // host.a has fresh samples — eligible.
+        assert!(host_eligible_v2(&m, &bl, &hosts, "http://host.a", 42, 0, now));
+        // host.b has no samples — stale → not eligible.
+        assert!(!host_eligible_v2(&m, &bl, &hosts, "http://host.b", 42, 0, now));
+        // empty host → not eligible.
+        assert!(!host_eligible_v2(&m, &bl, &hosts, "", 42, 0, now));
+        // host not in alive list → not eligible.
+        assert!(!host_eligible_v2(&m, &bl, &hosts, "http://other", 42, 0, now));
     }
 
     #[test]

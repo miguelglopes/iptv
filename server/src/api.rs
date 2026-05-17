@@ -1137,6 +1137,11 @@ pub async fn admin_caps_readiness(
     let mut entries: Vec<ReadinessEntry> = Vec::new();
     let mut by_pair: std::collections::BTreeMap<(u64, String), Vec<String>> =
         std::collections::BTreeMap::new();
+    // R1 round-1: readiness scope must mirror `build_candidates` v2 scope
+    // exactly: alive ∧ ¬blacklisted ∧ ¬stale. Stale pairs are out of scope
+    // (treated N/A across all tags) — including them with `q = None →
+    // Unknown` would falsely depress decisive_fraction on a churning real
+    // catalog and stall the cutover gate.
     for ch in &snap.channels {
         if ch.kind == ChannelKind::Radio {
             continue;
@@ -1146,7 +1151,15 @@ pub async fn admin_caps_readiness(
                 continue;
             }
             for host in &alive_hosts {
-                if state.blacklist.is_host_bad(host) {
+                if !crate::caps_cache::host_eligible_v2(
+                    &state.measured,
+                    &state.blacklist,
+                    &alive_hosts,
+                    host,
+                    src.stream_id,
+                    stale_secs,
+                    now,
+                ) {
                     continue;
                 }
                 by_pair
@@ -1160,6 +1173,7 @@ pub async fn admin_caps_readiness(
     for ((stream_id, host), channel_keys) in by_pair.into_iter() {
         let q = state.measured.get(stream_id, &host);
         let newest = state.measured.most_recent_at(stream_id, &host);
+        let oldest = state.measured.oldest_sample_at(stream_id, &host);
         let samples_count = q.as_ref().map(|x| x.samples_count).unwrap_or(0);
         let mut states: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
@@ -1178,12 +1192,7 @@ pub async fn admin_caps_readiness(
             decisive_pairs += 1;
         }
         let newest_age = newest.map(|at| (now - at).whole_seconds());
-        // Oldest age — we don't track it explicitly; approximate via
-        // sample-window position. The aggregate counts samples; we use
-        // `samples_count * sweep_interval` as a rough lower bound. The
-        // readiness UI just needs a "do we have data" signal.
-        let oldest_age = newest_age;
-        let _ = stale_secs;
+        let oldest_age = oldest.map(|at| (now - at).whole_seconds());
         entries.push(ReadinessEntry {
             stream_id,
             host,

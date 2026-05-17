@@ -59,7 +59,17 @@ const FLAG_STATE = process.env.IPTV_FLAG_STATE || 'baseline';
 const SEED = parseInt(process.env.IPTV_SEED || '1234', 10);
 const N_RANDOM = parseInt(process.env.IPTV_SWEEP_N || '10', 10);
 const PLAY_WINDOW_MS = parseInt(process.env.IPTV_PLAY_WINDOW_MS || '6000', 10);
-const MAX_CANDIDATES = parseInt(process.env.IPTV_MAX_CANDIDATES || '3', 10);
+// R1 round-1: bumped from 3 to 12. Channels like TVI carry ~48 candidates
+// (multi-variant × 8 hosts); capping at 3 means real misses at rank 4+
+// get classified as `failed_with_no_playable_candidate` and never surface
+// as `missed_opportunity`. 12 covers the rank-winner variant across every
+// alive host plus a sibling variant on its top host — enough to catch
+// the rank-winner-vs-floor cap-eviction concern the plan calls out
+// without making the sweep wall-clock unbounded. Override with
+// `IPTV_MAX_CANDIDATES=0` to test every candidate (no cap).
+const _RAW_MAX_CANDIDATES = parseInt(process.env.IPTV_MAX_CANDIDATES || '12', 10);
+const MAX_CANDIDATES =
+  _RAW_MAX_CANDIDATES === 0 ? Number.MAX_SAFE_INTEGER : _RAW_MAX_CANDIDATES;
 const TARGETED_KEYS = (process.env.IPTV_TARGETED || 'rtp1,rtp2,sic,tvi').split(',');
 // Caps the simulated Chromium client advertises. webOS profile adds
 // h264_excess_refs (matching the design's expectation that webOS tolerates
