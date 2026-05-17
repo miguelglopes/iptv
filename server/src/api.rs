@@ -91,43 +91,9 @@ pub struct ChannelDto {
     pub tv_archive_quality: Option<&'static str>,
 }
 
-/// Capability tags a client needs to play this channel. TV is fixed to the
-/// HLS/h264/aac/live_video_hls quartet today. Radio dispatches on the union
-/// of the channel's source formats — an Mp3-only channel returns `["mp3"]`,
-/// an HLS-bearing channel keeps the legacy `["hls","aac","live_audio_only_hls"]`.
-fn caps_required(channel: &CanonicalChannel) -> Vec<&'static str> {
-    match channel.kind {
-        ChannelKind::Tv => vec!["hls", "h264", "aac", "live_video_hls"],
-        ChannelKind::Radio => {
-            let mut fmts: std::collections::HashSet<RadioFormat> = channel
-                .sources
-                .iter()
-                .filter_map(|s| s.radio_format)
-                .collect();
-            if fmts.is_empty() {
-                fmts.insert(RadioFormat::Hls);
-            }
-            radio_caps_for(&fmts)
-        }
-    }
-}
-
-fn radio_caps_for(fmts: &std::collections::HashSet<RadioFormat>) -> Vec<&'static str> {
-    // Any HLS source ⇒ legacy HLS cap set (existing behaviour preserved).
-    if fmts.contains(&RadioFormat::Hls) {
-        return vec!["hls", "aac", "live_audio_only_hls"];
-    }
-    // Non-HLS radio: stream raw bytes via `<audio src>`, native decoder. We
-    // require only `aac` because:
-    //   * canPlayType('audio/mpeg') lies on multiple Chromiums — webOS reports
-    //     mp3=false even though `<audio src>` decodes MP3 fine. Requiring `mp3`
-    //     would hide every Bauer Media station from the TV.
-    //   * Every modern client that decodes AAC also decodes MP3 in practice.
-    //   * The downside is theoretical: an AAC-only client would silently error
-    //     on an MP3 channel. We accept that — the alternative (filtering all
-    //     non-HLS for webOS) is far worse for the user.
-    vec!["aac"]
-}
+// Per-channel caps_required derivation lives in `caps_cache::caps_required`
+// (Phase 6). The cache invalidates on catalog refresh, MeasuredStore generation
+// bump, and alive-hosts change. Listed at the bottom of `list_channels`.
 
 fn radio_format_label(fmt: RadioFormat) -> &'static str {
     match fmt {
@@ -200,9 +166,12 @@ pub struct EpgStatusDto {
 
 #[derive(Debug, Serialize)]
 pub struct BlacklistStatusDto {
-    pub failed_urls: usize,
+    /// Total number of URLs the state machine is tracking — any URL with
+    /// recorded cool-off / failure / heartbeat history. Replaces the old
+    /// `failed_urls + demoted_urls` split now that those two buckets are
+    /// unified into a single per-URL cool-off step (Phase 2).
+    pub url_states_count: usize,
     pub bad_hosts: usize,
-    pub demoted_urls: usize,
 }
 
 pub async fn list_channels(
@@ -217,12 +186,32 @@ pub async fn list_channels(
     // and we should hide anything outside that set.
     let client_caps = parse_client_caps(&headers);
 
+    // Phase 6: per-channel caps_required cache. The lookup map is the
+    // tightened cap list per channel; the version string is the cap-matrix
+    // digest emitted as `X-Caps-Matrix-Version` so the client can re-probe
+    // when the server-side cap surface shifts.
+    let alive_hosts = state.hosts.alive_hosts_ranked();
+    let caps_snap = state.caps_cache.ensure(
+        &snap,
+        &state.measured,
+        &alive_hosts,
+        &state.curation,
+    );
+    let baseline_tv: Vec<&'static str> = vec!["hls", "h264", "aac", "live_video_hls"];
+    let channel_caps = |ch: &CanonicalChannel| -> Vec<&'static str> {
+        caps_snap
+            .per_channel
+            .get(&ch.key)
+            .cloned()
+            .unwrap_or_else(|| baseline_tv.clone())
+    };
+
     let visible: Vec<(usize, &CanonicalChannel)> = snap
         .channels
         .iter()
         .enumerate()
         .filter(|(_, ch)| {
-            let required = caps_required(ch);
+            let required = channel_caps(ch);
             match &client_caps {
                 None => true,
                 Some(caps) => required.iter().all(|c| caps.contains(*c)),
@@ -314,7 +303,7 @@ pub async fn list_channels(
                 key: ch.key.clone(),
                 name: ch.name.clone(),
                 kind: ch.kind,
-                caps_required: caps_required(ch),
+                caps_required: channel_caps(ch),
                 format,
                 logo,
                 default_rank: d,
@@ -332,7 +321,16 @@ pub async fn list_channels(
     out.sort_by(|a, b| a.0.cmp(&b.0));
 
     let dtos: Vec<ChannelDto> = out.into_iter().map(|(_, d)| d).collect();
-    Json(dtos)
+    let mut resp = Json(dtos).into_response();
+    // Phase 6: cap-matrix version header. Clients store this in
+    // localStorage; on mismatch they clear their cached cap set and
+    // re-probe before issuing the next /api/channels request, ensuring
+    // the freshness-loop-driven server-side tightening doesn't silently
+    // hide channels while the client still believes the looser cap set.
+    if let Ok(v) = axum::http::HeaderValue::from_str(&caps_snap.version) {
+        resp.headers_mut().insert("x-caps-matrix-version", v);
+    }
+    resp
 }
 
 pub async fn get_epg(
@@ -435,9 +433,8 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusDto> {
             cached_channels: state.epg.known_keys().len(),
         },
         blacklist: BlacklistStatusDto {
-            failed_urls: state.blacklist.snapshot_urls().len(),
+            url_states_count: state.blacklist.per_url_count(),
             bad_hosts: blacklisted,
-            demoted_urls: state.blacklist.snapshot_demoted().len(),
         },
         classifier: ClassifierStatusDto {
             classified: classifier_entries.len(),
@@ -459,6 +456,15 @@ pub struct FeedbackBody {
     /// compatibility with older clients (those fall back to LKG-based blame).
     #[serde(default)]
     pub play_id: Option<String>,
+    /// Playback phase when the failure happened: `"pre-canplay"` (player
+    /// never reached readyState >= 2 — slow-to-start, watchdog, manifest
+    /// fetch error) or `"post-canplay"` (mid-stream decoder error after
+    /// the first frame). Optional for backwards compatibility with older
+    /// clients that didn't send it. Logged here; the state machine in a
+    /// later step consumes it to distinguish ClientPreCanplay (log-only)
+    /// from ClientPostCanplay (cool-off bump).
+    #[serde(default)]
+    pub phase: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, serde::Deserialize)]
@@ -474,32 +480,24 @@ pub async fn feedback(
     Path(key): Path<String>,
     body: Option<Json<FeedbackBody>>,
 ) -> StatusCode {
+    use crate::blacklist::FailureKind;
+
     let body = body.map(|b| b.0).unwrap_or_default();
     let error = body.error.unwrap_or_default();
+    let phase = body.phase.as_deref().unwrap_or("");
 
-    // Resolve which upstream to blame. Three states:
-    //   - pid sent + session resolved + channel matches → blame that URL.
-    //     LKG is dropped only when it still points at that same URL (so
-    //     another client's LKG doesn't get evicted by accident).
-    //   - pid sent + session not found or channel-mismatched → do NOTHING.
-    //     The client explicitly identified an upstream; we shouldn't
-    //     silently fall back to a different one (would re-introduce the
-    //     race we're trying to fix). The threshold-based blacklist makes
-    //     occasional lost signals harmless.
-    //   - pid absent (legacy client) → drop LKG and blame that. Matches
-    //     the pre-pid behaviour for back-compat with older client builds.
-    let pid_was_supplied = body
-        .play_id
-        .as_deref()
-        .map(|p| !p.trim().is_empty())
-        .unwrap_or(false);
+    // Resolve which upstream to blame via pid. Two states (Step 4 dropped
+    // the LKG-fallback path along with `drop_last_known_good*`):
+    //   - pid resolves + channel matches → blame that URL.
+    //   - pid missing / unresolved / channel-mismatched → log and stop. The
+    //     state machine forgives the lost signal at the next heartbeat
+    //     cycle; this is far safer than blindly bumping an arbitrary URL.
     let pid_for_log = body.play_id.clone();
-    let blamed_via_pid = body.play_id.as_deref().and_then(|pid| {
+    let blamed: Option<String> = body.play_id.as_deref().and_then(|pid| {
         let (url, ch) = state.play_sessions.lookup(pid)?;
         if ch == key {
             Some(url)
         } else {
-            // pid mapped to a different channel — either stale or forged.
             tracing::warn!(
                 channel = %key,
                 pid = %pid,
@@ -510,54 +508,100 @@ pub async fn feedback(
         }
     });
 
-    let blamed: Option<String> = match (pid_was_supplied, blamed_via_pid) {
-        (_, Some(url)) => {
-            state.blacklist.drop_last_known_good_if_matches(&key, &url);
-            Some(url)
-        }
-        (true, None) => {
-            tracing::info!(
-                channel = %key,
-                pid = ?pid_for_log,
-                "feedback pid unknown (session expired or never recorded); not falling back to LKG"
-            );
-            None
-        }
-        (false, None) => state.blacklist.drop_last_known_good(&key),
-    };
-
     match body.kind {
         FeedbackKind::Fail => {
+            // Phase routes to the state-machine variant: post-canplay = real
+            // mid-playback decoder error (cool-off bump, no host blame);
+            // pre-canplay or absent = slow-to-start (architecture.md §4 says
+            // this is NOT an instability signal — log-only, no state mutation).
+            let kind = match phase {
+                "post-canplay" => FailureKind::ClientPostCanplay,
+                _ => FailureKind::ClientPreCanplay,
+            };
             if let Some(url) = blamed.as_deref() {
-                // mark_failed = demote_url + note_url_failed. The demote
-                // happens unconditionally so the next play prefers something
-                // else; the windowed fail count drives hard blacklist after
-                // crossing url_fail_threshold.
-                state.blacklist.mark_failed(url);
+                state.blacklist.note_failure(url, kind);
                 tracing::info!(
                     channel = %key,
                     url = %url,
                     pid = ?pid_for_log,
                     error = %error,
-                    "client-reported failure: demoted + counted"
+                    phase = %phase,
+                    kind = ?kind,
+                    "client-reported failure"
                 );
             } else {
-                tracing::info!(channel = %key, error = %error, "client-reported failure: nothing to blame");
+                tracing::info!(
+                    channel = %key,
+                    error = %error,
+                    phase = %phase,
+                    kind = ?kind,
+                    "client-reported failure: no pid blame"
+                );
             }
         }
         FeedbackKind::Demote => {
+            // User pressed Green to deprioritise. One cool-off step bump,
+            // no host blame (it's a user preference, not an upstream signal).
+            // Modelled as a ClientPostCanplay variant (same semantics: bump
+            // step without blaming the host).
             if let Some(url) = blamed.as_deref() {
-                state.blacklist.demote_url(url);
+                state.blacklist.note_failure(url, FailureKind::ClientPostCanplay);
                 tracing::info!(
                     channel = %key,
                     url = %url,
                     pid = ?pid_for_log,
                     error = %error,
-                    "client-reported demote: deprioritized current pick"
+                    phase = %phase,
+                    "client-reported demote (user Green)"
                 );
             } else {
-                tracing::info!(channel = %key, error = %error, "client-reported demote: nothing to demote");
+                tracing::info!(
+                    channel = %key,
+                    error = %error,
+                    phase = %phase,
+                    "client-reported demote: no pid blame"
+                );
             }
+        }
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// Body for `POST /api/heartbeat` — see `heartbeat` below.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct HeartbeatBody {
+    /// Per-play identifier the client baked into its play URL. Resolved
+    /// here to `(channel, upstream_url)` via `state.play_sessions` so the
+    /// heartbeat is attributed to the exact upstream that was served.
+    #[serde(default)]
+    pub play_id: Option<String>,
+}
+
+/// Clean-play heartbeat from the client. Fires every 30 s while playback is
+/// healthy (player.js arms a setInterval on `canplay` and clears it on
+/// stop/teardown/error). Used by the blacklist state machine (Phase 2's
+/// `note_heartbeat`) to reset the cool-off step once the URL has been clean
+/// for `clean_play_reset_secs` with fresh heartbeats.
+///
+/// Quiet on missing/expired play_id — legacy clients that don't send pid,
+/// or session entries that TTL'd out before the first heartbeat, should
+/// not surface as errors. Returns 204 either way.
+pub async fn heartbeat(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<HeartbeatBody>>,
+) -> StatusCode {
+    let body = body.map(|b| b.0).unwrap_or_default();
+    let Some(pid) = body.play_id.as_deref().filter(|p| !p.trim().is_empty()) else {
+        tracing::trace!("heartbeat without play_id; ignoring");
+        return StatusCode::NO_CONTENT;
+    };
+    match state.play_sessions.lookup(pid) {
+        Some((url, channel)) => {
+            state.blacklist.note_heartbeat(&url);
+            tracing::trace!(channel = %channel, pid = %pid, url = %url, "heartbeat");
+        }
+        None => {
+            tracing::trace!(pid = %pid, "heartbeat for unknown/expired pid; ignoring");
         }
     }
     StatusCode::NO_CONTENT
@@ -569,24 +613,32 @@ pub async fn admin_reprobe(State(state): State<Arc<AppState>>) -> StatusCode {
     StatusCode::ACCEPTED
 }
 
-pub async fn admin_clear_blacklist(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.blacklist.clear_blacklist();
-    StatusCode::NO_CONTENT
-}
-
-pub async fn admin_clear_demoted(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.blacklist.clear_demoted();
-    StatusCode::NO_CONTENT
-}
-
-pub async fn admin_clear_all(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.blacklist.clear_all();
-    state.classifier.clear();
-    StatusCode::NO_CONTENT
-}
-
 pub async fn admin_clear_classifier(State(state): State<Arc<AppState>>) -> StatusCode {
     state.classifier.clear();
+    StatusCode::NO_CONTENT
+}
+
+/// Test-only sample injection. Wired into the router only when the server
+/// is started with `IPTV_TEST_HOOKS=1`. Phase 10 e2e specs use this to
+/// seed a measured-quality entry without driving real upstream traffic —
+/// the alternative is committing AAC/TS fixture binaries and a
+/// docker-compose harness, neither of which the project wants.
+///
+/// Body shape: a serde-deserialisable `Sample` (matches the on-disk
+/// `measured.rs::Sample` schema). The endpoint pushes it into
+/// `state.measured` under the given `(stream_id, host)` key.
+#[derive(serde::Deserialize)]
+pub struct InjectSampleBody {
+    pub stream_id: u64,
+    pub host: String,
+    pub sample: crate::measured::Sample,
+}
+
+pub async fn admin_inject_sample(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<InjectSampleBody>,
+) -> StatusCode {
+    state.measured.push(body.stream_id, &body.host, body.sample);
     StatusCode::NO_CONTENT
 }
 
@@ -620,6 +672,69 @@ pub async fn admin_measured_quality(
         })
         .collect();
     Json(entries)
+}
+
+/// User-override (Step 9): the ranked candidate list `build_candidates` would
+/// produce for this channel right now, enriched with per-row measured-quality,
+/// cool-off step, and LKG age. The candidate-overlay UI consumes this to
+/// show the user the rank order; OK on a row sends the URL back as
+/// `?force_url=…` on a fresh play.
+///
+/// Read-only; no state mutation. Exposes raw upstream URLs — same risk
+/// surface as `/admin/recent-plays` and `/admin/measured-quality`. This
+/// inherits the project's single-tenant assumption (one user, deployed
+/// behind a reverse-proxy on a private LAN). If that ever changes, this
+/// endpoint plus the `/admin/*` endpoints all need an auth gate together.
+pub async fn list_candidates(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Result<Json<Vec<CandidateDto>>, (StatusCode, String)> {
+    let snap = state.catalog.snapshot();
+    let channel = snap
+        .lookup(&key)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, format!("unknown channel: {key}")))?;
+    let candidates = crate::proxy::build_candidates(&state, &channel);
+    let now = OffsetDateTime::now_utc();
+    let dtos: Vec<CandidateDto> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let measured = state.measured.get(c.stream_id, &c.host);
+            let cool_off_step = state.blacklist.cool_off_penalty(&c.url) as u8;
+            let lkg_age_secs = state
+                .blacklist
+                .last_known_good_age(&channel.key, &c.url)
+                .map(|d| d.as_secs());
+            CandidateDto {
+                url: c.url.clone(),
+                host: c.host.clone(),
+                stream_id: c.stream_id,
+                rank_pos: i,
+                cool_off_step,
+                lkg_age_secs,
+                measured,
+            }
+        })
+        .collect();
+    let _ = now; // reserved for future age fields
+    Ok(Json(dtos))
+}
+
+#[derive(Debug, Serialize)]
+pub struct CandidateDto {
+    pub url: String,
+    pub host: String,
+    pub stream_id: u64,
+    pub rank_pos: usize,
+    pub cool_off_step: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lkg_age_secs: Option<u64>,
+    /// Aggregate measured-quality for this `(stream_id, host)` pair. `None`
+    /// when no samples have landed yet (sparse data — the candidate is
+    /// still kept in the list, just unranked on the quality dimensions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured: Option<crate::measured::MeasuredQuality>,
 }
 
 /// Capability probe: redirect to a playable channel of the requested kind so
@@ -765,6 +880,100 @@ pub async fn probe_audio(
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     probe_redirect(&state, &headers, ChannelKind::Radio).await
+}
+
+/// Pick a homogeneous channel matching `target` (every measured source
+/// agrees on the codec / pix_fmt / dvb_unsafe predicate) and 307-redirect
+/// to `/play/<key>?probe=1`. Returns 404 when no matching channel exists —
+/// the client interprets this as "this codec isn't probable here" and
+/// drops the cap from its set.
+///
+/// Shares the cap-derivation predicate (`channel_matches_probe`) with
+/// `caps_required` so the redirect target is consistent with what the
+/// server's per-channel filter is using.
+async fn probe_codec_redirect(
+    state: &AppState,
+    headers: &HeaderMap,
+    target: crate::caps_cache::ProbeTarget,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let snap = state.catalog.snapshot();
+    let alive_hosts = state.hosts.alive_hosts_ranked();
+    let ch = crate::caps_cache::pick_probe_channel(
+        &snap,
+        &state.curation,
+        &state.measured,
+        &alive_hosts,
+        target,
+    )
+    .ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no channel matches probe target {:?}", target),
+    ))?;
+
+    let base = request_base_url(headers, state.config.public_base_url.as_deref());
+    let url = format!(
+        "{}/play/{}.m3u8?probe=1",
+        base.trim_end_matches('/'),
+        ch.key
+    );
+    let mut resp = axum::response::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .body(axum::body::Body::empty())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build redirect: {e}"),
+            )
+        })?;
+    resp.headers_mut().insert(
+        axum::http::header::LOCATION,
+        axum::http::HeaderValue::from_str(&url).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bad redirect url: {e}"),
+            )
+        })?,
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(resp)
+}
+
+pub async fn probe_h264(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    probe_codec_redirect(&state, &headers, crate::caps_cache::ProbeTarget::H264).await
+}
+
+pub async fn probe_hevc(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    probe_codec_redirect(&state, &headers, crate::caps_cache::ProbeTarget::Hevc).await
+}
+
+pub async fn probe_hevc_main10(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    probe_codec_redirect(&state, &headers, crate::caps_cache::ProbeTarget::HevcMain10).await
+}
+
+pub async fn probe_av1(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    probe_codec_redirect(&state, &headers, crate::caps_cache::ProbeTarget::Av1).await
+}
+
+pub async fn probe_dvb_safe(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    probe_codec_redirect(&state, &headers, crate::caps_cache::ProbeTarget::DvbSafe).await
 }
 
 /// Serve `index.html` with a player bundle picked per User-Agent. webOS

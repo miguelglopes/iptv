@@ -19,8 +19,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,21 @@ pub struct Sample {
     pub color_transfer: Option<String>,
     pub framerate: Option<f32>,
     pub bitrate_kbps: Option<u32>,
+    /// True when the TS classifier flagged this source as having DVB
+    /// subtitles riding the PCR PID — the unstrippable case. Step 7's
+    /// `caps_required` derivation aggregates this across a channel's
+    /// sources to decide whether to demand the `dvb_safe` client cap.
+    /// `None` on older samples that pre-date the field.
+    #[serde(default)]
+    pub dvb_unsafe: Option<bool>,
+    /// Radio sample rate from the first ADTS frame (Step 10). `None` for
+    /// TV samples and for radio samples pre-dating Phase 8.
+    #[serde(default)]
+    pub sample_rate_hz: Option<u32>,
+    /// Radio channel count from the first ADTS frame (Step 10). `None`
+    /// for TV samples and for radio samples pre-dating Phase 8.
+    #[serde(default)]
+    pub audio_channels: Option<u8>,
 }
 
 /// What the ranker sees — the aggregate of a buffer's samples.
@@ -65,6 +80,13 @@ pub struct MeasuredQuality {
     pub framerate: Option<f32>,
     /// Median of non-None bitrate samples in the buffer.
     pub bitrate_kbps: Option<u32>,
+    /// Most-recent value (same semantics as the other stable fields).
+    /// Used by Step 7 to gate the `dvb_safe` cap per channel.
+    pub dvb_unsafe: Option<bool>,
+    /// Radio sample rate (Hz) from ADTS — Step 10. `None` for TV.
+    pub sample_rate_hz: Option<u32>,
+    /// Radio channel count from ADTS — Step 10. `None` for TV.
+    pub audio_channels: Option<u8>,
     pub samples_count: usize,
     #[serde(with = "time::serde::rfc3339")]
     pub measured_at: time::OffsetDateTime,
@@ -102,6 +124,9 @@ impl MeasuredEntry {
             color_transfer: last.color_transfer.clone(),
             framerate: last.framerate,
             bitrate_kbps,
+            dvb_unsafe: last.dvb_unsafe,
+            sample_rate_hz: last.sample_rate_hz,
+            audio_channels: last.audio_channels,
             samples_count: self.samples.len(),
             measured_at: last.at,
         })
@@ -131,6 +156,11 @@ pub struct MeasuredStore {
     inner: RwLock<HashMap<Key, MeasuredEntry>>,
     path: PathBuf,
     dirty: AtomicBool,
+    /// Monotonic counter bumped on every `push`. Cache consumers (Phase 6's
+    /// per-channel `caps_required` cache) read this to detect that the
+    /// underlying samples have moved without racing against the disk-flush
+    /// task's consumption of `dirty`.
+    generation: AtomicU64,
 }
 
 impl MeasuredStore {
@@ -161,6 +191,7 @@ impl MeasuredStore {
             inner: RwLock::new(inner),
             path,
             dirty: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -177,6 +208,26 @@ impl MeasuredStore {
         entry.push(sample);
         drop(g);
         self.dirty.store(true, Ordering::Release);
+        // Bump the cache generation counter — independent of `dirty`, which
+        // the disk-flush task swaps to false on consumption.
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Monotonic generation counter. Phase 6's `caps_required` cache reads
+    /// this to decide whether its derived state is stale relative to the
+    /// underlying samples.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Timestamp of the most-recent sample for this key, or `None` if
+    /// none has been recorded yet. Used by Phase 5's freshness loop to
+    /// decide whether a re-probe is due.
+    pub fn most_recent_at(&self, stream_id: u64, host: &str) -> Option<time::OffsetDateTime> {
+        self.inner
+            .read()
+            .get(&(stream_id, host.to_string()))
+            .and_then(|e| e.samples.back().map(|s| s.at))
     }
 
     pub fn has_samples(&self, stream_id: u64, host: &str) -> bool {
@@ -250,6 +301,7 @@ pub async fn run_flush_task(store: std::sync::Arc<MeasuredStore>) {
 /// Fields populated from two sources:
 ///   - classifier (`note_classification`): width/height/codec/pix_fmt/color_transfer/framerate
 ///   - segment hot-path (`note_segment_kbps`): EWMA of per-segment kbps
+///
 /// A background committer drains entries idle for ≥30 s, producing one
 /// complete `Sample` per play session.
 #[derive(Debug, Clone, Default)]
@@ -261,6 +313,11 @@ pub struct InProgress {
     pub color_transfer: Option<String>,
     pub framerate: Option<f32>,
     pub bitrate_ewma_kbps: Option<f32>,
+    pub dvb_unsafe: Option<bool>,
+    /// Step 10 audio fields. Populated by `note_audio_classification` from
+    /// the radio play path; remain `None` for TV plays.
+    pub sample_rate_hz: Option<u32>,
+    pub audio_channels: Option<u8>,
     pub last_activity: Option<Instant>,
 }
 
@@ -273,7 +330,13 @@ impl InProgress {
     /// (otherwise we know nothing about the source's video shape and the
     /// sample is uninformative).
     fn into_sample(self) -> Option<Sample> {
-        let _ = self.width?; // require classification has run
+        // Sample commits when EITHER the video classifier ran (width set)
+        // OR the audio classifier ran (sample_rate_hz set). Radio plays
+        // don't set width/height; without the second arm the audio sample
+        // would be silently dropped at commit time.
+        if self.width.is_none() && self.sample_rate_hz.is_none() {
+            return None;
+        }
         Some(Sample {
             at: time::OffsetDateTime::now_utc(),
             source: SampleSource::PerPlay,
@@ -284,6 +347,9 @@ impl InProgress {
             color_transfer: self.color_transfer,
             framerate: self.framerate,
             bitrate_kbps: self.bitrate_ewma_kbps.map(|v| v.round() as u32),
+            dvb_unsafe: self.dvb_unsafe,
+            sample_rate_hz: self.sample_rate_hz,
+            audio_channels: self.audio_channels,
         })
     }
 }
@@ -303,6 +369,7 @@ impl PerPlayAccumulator {
     /// `Classification`. Static fields are filled the first time; subsequent
     /// calls just refresh `last_activity`. Cheap — classifier itself caches
     /// per stream_id so this fires once per stream per play.
+    #[allow(clippy::too_many_arguments)]
     pub fn note_classification(
         &self,
         stream_id: u64,
@@ -313,6 +380,7 @@ impl PerPlayAccumulator {
         pix_fmt: Option<String>,
         color_transfer: Option<String>,
         framerate: Option<f32>,
+        dvb_unsafe: Option<bool>,
     ) {
         let mut g = self.inner.write();
         let ip = g.entry((stream_id, host.to_string())).or_default();
@@ -333,6 +401,30 @@ impl PerPlayAccumulator {
         }
         if ip.framerate.is_none() {
             ip.framerate = framerate;
+        }
+        if ip.dvb_unsafe.is_none() {
+            ip.dvb_unsafe = dvb_unsafe;
+        }
+        ip.touch();
+    }
+
+    /// Called from the radio per-play path after an `AudioClassification`
+    /// is extracted from an ADTS segment (Step 10). Static fields fill
+    /// once; subsequent calls just refresh `last_activity`.
+    pub fn note_audio_classification(
+        &self,
+        stream_id: u64,
+        host: &str,
+        sample_rate_hz: Option<u32>,
+        audio_channels: Option<u8>,
+    ) {
+        let mut g = self.inner.write();
+        let ip = g.entry((stream_id, host.to_string())).or_default();
+        if ip.sample_rate_hz.is_none() {
+            ip.sample_rate_hz = sample_rate_hz;
+        }
+        if ip.audio_channels.is_none() {
+            ip.audio_channels = audio_channels;
         }
         ip.touch();
     }
@@ -418,6 +510,9 @@ mod tests {
             color_transfer: Some("bt709".into()),
             framerate: Some(50.0),
             bitrate_kbps: kbps,
+            dvb_unsafe: None,
+            sample_rate_hz: None,
+            audio_channels: None,
         }
     }
 
@@ -525,6 +620,9 @@ mod tests {
             color_transfer: Some("bt709".into()),
             framerate: Some(50.0),
             bitrate_ewma_kbps: Some(4523.4),
+            dvb_unsafe: Some(false),
+            sample_rate_hz: None,
+            audio_channels: None,
             last_activity: Some(Instant::now()),
         };
         let s = ip.into_sample().unwrap();
@@ -543,6 +641,7 @@ mod tests {
             Some(1920),
             Some(1080),
             Some("h264".into()),
+            None,
             None,
             None,
             None,

@@ -9,6 +9,7 @@ use reqwest::Client;
 use std::time::Duration;
 
 use crate::blacklist::Blacklist;
+use crate::caps_cache::CapsRequiredCache;
 use crate::catalog::CatalogState;
 use crate::codec::StreamClassifier;
 use crate::config::Config;
@@ -61,6 +62,10 @@ pub struct AppState {
     /// Map `pls_url → (resolved_audio_url, resolved_at)`. TTL enforced at
     /// lookup time (1 h). Memory bounded by entry count (a few dozen).
     pub playlist_resolver_cache: Arc<DashMap<String, (String, Instant)>>,
+    /// Phase 6: per-channel `caps_required` cache + cap-matrix version
+    /// digest (X-Caps-Matrix-Version header). Lazy-rebuild on catalog
+    /// refresh, measured generation bump, or alive-hosts change.
+    pub caps_cache: Arc<CapsRequiredCache>,
 }
 
 impl AppState {
@@ -75,7 +80,14 @@ impl AppState {
         let hosts = Arc::new(HostState::new(&config.xtream.hosts));
         let catalog = Arc::new(CatalogState::new());
         let epg = Arc::new(EpgState::new(config.epg.clone()));
-        let blacklist = Arc::new(Blacklist::new(config.blacklist.clone()));
+        // Blacklist (cool-off state machine) persists to data/blacklist.json
+        // alongside the measured-quality cache. Same atomic-rename flush task
+        // pattern; same docker-compose mount.
+        let blacklist_path = std::path::PathBuf::from("data/blacklist.json");
+        let blacklist = Arc::new(Blacklist::load_or_empty(
+            config.blacklist.clone(),
+            blacklist_path,
+        ));
         let classifier = Arc::new(StreamClassifier::new());
 
         let upstream_http = Client::builder()
@@ -118,6 +130,7 @@ impl AppState {
             max_connections: Arc::new(AtomicU32::new(0)),
             index_html,
             playlist_resolver_cache: Arc::new(DashMap::new()),
+            caps_cache: Arc::new(CapsRequiredCache::new()),
         }))
     }
 }

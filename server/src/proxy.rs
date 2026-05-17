@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
 use crate::api::request_base_url;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -15,12 +15,11 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 use url::Url;
 
+use crate::blacklist::FailureKind;
 use crate::canonical::CanonicalChannel;
-#[cfg(test)]
-use crate::canonical::CanonicalSource;
 use crate::codec::{classify_ts_chunk, strip_subtitle_pids};
-use crate::measured::{MeasuredQuality, MeasuredStore};
-use crate::play_log::{AttemptOutcome, PlayAttempt, PlayEvent, PlayLog};
+use crate::measured::MeasuredStore;
+use crate::play_log::{AttemptOutcome, PlayAttempt, PlayEvent};
 use crate::probe::is_placeholder_manifest;
 use crate::state::AppState;
 
@@ -55,15 +54,15 @@ impl Drop for ActivePlayGuard {
 }
 
 #[derive(Debug, Clone)]
-struct Candidate {
-    url: String,
-    host: String,
+pub(crate) struct Candidate {
+    pub(crate) url: String,
+    pub(crate) host: String,
     /// Upstream stream_id. For Xtream sources, parsed from the URL pattern.
     /// For radio (`direct_source`), copied from `CanonicalSource.stream_id`
     /// (a synthetic high-bit-set value); radio URLs don't carry it in their
     /// path, so propagation through `Candidate` is the only way the
     /// measurement layer can key by `(stream_id, host)`.
-    stream_id: u64,
+    pub(crate) stream_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +85,14 @@ struct SegmentToken {
     /// `rewrite_playlist`, absent on older tokens.
     #[serde(default, rename = "h", skip_serializing_if = "Option::is_none")]
     h: Option<String>,
+    /// True iff the requesting client advertised the `dvb_safe` cap (via
+    /// `&caps=...,dvb_safe,...` on the play URL). When true, the DVB
+    /// subtitle PIDs ride through verbatim — the client demuxer handles
+    /// them. When false (legacy / non-dvb_safe clients), `handle_ts_segment`
+    /// strips the PIDs as before. Defaults to false on legacy tokens so
+    /// existing clients keep getting the stripped stream.
+    #[serde(default, rename = "s", skip_serializing_if = "is_false")]
+    dvb_safe: bool,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -128,6 +135,34 @@ pub struct PlayParams {
     /// to LKG-based blame for feedback (legacy behaviour).
     #[serde(default)]
     pub pid: Option<String>,
+    /// Comma-list of client capability tags (e.g. `hls,h264,aac,dvb_safe`).
+    /// The play-URL is the only place the proxy reliably sees per-request
+    /// caps because the playback path bypasses our XHR wrapper that sets
+    /// `X-Client-Caps` — webOS uses `<video src>` directly and hls.js's
+    /// `loadSource` ships without an `xhrSetup` hook. Parsed once in
+    /// `play_playlist` and baked into each segment's `SegmentToken` so
+    /// the DVB-strip decision (Step 4 §9) is consistent for the play
+    /// session. Absent on legacy clients → strip applies, matching the
+    /// pre-Step-4 default.
+    #[serde(default)]
+    pub caps: Option<String>,
+    /// Step 9 user override: base64-url-no-pad encoded upstream URL the
+    /// client wants tried first. Validated against the current
+    /// `build_candidates` output and rejected with 404 when not present
+    /// (security — don't let a hostile client proxy arbitrary URLs).
+    /// Promoted to position 0 for this play only; no state mutation.
+    #[serde(default)]
+    pub force_url: Option<String>,
+}
+
+/// Parse the `caps=` comma-list and return whether `dvb_safe` is present.
+/// Lowercased for safety; legacy clients with no `caps=` → `false`, which
+/// is the pre-Step-4 strip-by-default behaviour.
+fn client_has_cap(caps: &Option<String>, tag: &str) -> bool {
+    let Some(raw) = caps.as_deref() else { return false };
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .any(|c| c == tag)
 }
 
 pub async fn play_playlist(
@@ -183,6 +218,26 @@ pub async fn play_playlist(
         return catchup_play(state, channel, req, &public_base, &play_id, client_pid.as_deref()).await;
     }
 
+    // Build the candidate list + apply any `?force_url` BEFORE dispatching
+    // by kind. The radio path also needs force_url honoured + the 404
+    // semantics on malformed / non-candidate input — handling it here
+    // avoids duplicating the validation in `play_audio`.
+    let mut candidates = build_candidates(&state, &channel);
+    if candidates.is_empty() {
+        warn!(play = %play_id, channel = %channel.key, "no candidate sources for channel");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
+    }
+    if let Some(encoded) = params.force_url.as_deref() {
+        let forced = apply_force_url(&mut candidates, encoded)
+            .map_err(|_| (StatusCode::NOT_FOUND, "unknown force_url".to_string()))?;
+        info!(
+            play = %play_id,
+            channel = %channel.key,
+            forced = %forced,
+            "force_url honoured (promoted to position 0 for this play)"
+        );
+    }
+
     // Non-HLS radio dispatch. The new `.audio` route also lands here (we
     // accept `.m3u8` for backwards compatibility); we pick the path by the
     // channel's first source format, not by the URL extension, so a stale
@@ -194,15 +249,16 @@ pub async fn play_playlist(
             .find_map(|s| s.radio_format)
             .unwrap_or(crate::radio::RadioFormat::Hls);
         if !matches!(fmt, crate::radio::RadioFormat::Hls) {
-            return play_audio(state, channel, fmt, public_base, play_id, client_pid).await;
+            return play_audio(state, channel, candidates, fmt, public_base, play_id, client_pid).await;
         }
     }
 
-    let candidates = build_candidates(&state, &channel);
-    if candidates.is_empty() {
-        warn!(play = %play_id, channel = %channel.key, "no candidate sources for channel");
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
-    }
+    // Parse the per-request caps once (§4 plumbing). Today only `dvb_safe`
+    // affects proxy behaviour (per-request DVB-strip vs verbatim); the
+    // full cap matrix is still client-side (`X-Client-Caps` on /api/*).
+    // Probe requests don't claim caps — they're testing whether the
+    // client can play, so they ride through with `dvb_safe = false`.
+    let client_has_dvb_safe = !probe_request && client_has_cap(&params.caps, "dvb_safe");
 
     let per_attempt = Duration::from_secs(state.config.proxy.per_attempt_timeout_secs);
     // Probe requests are run from the boot-time capability detector — the
@@ -249,6 +305,7 @@ pub async fn play_playlist(
                 cand,
                 &public_base,
                 !probe_request,
+                client_has_dvb_safe,
             ),
         )
         .await
@@ -313,7 +370,7 @@ pub async fn play_playlist(
                     "playlist fetch failed",
                 );
                 if !probe_request {
-                    state.blacklist.mark_failed(&cand.url);
+                    state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 }
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
@@ -335,7 +392,7 @@ pub async fn play_playlist(
                     "playlist fetch timed out",
                 );
                 if !probe_request {
-                    state.blacklist.mark_failed(&cand.url);
+                    state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 }
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
@@ -372,181 +429,156 @@ pub async fn play_playlist(
     Err((StatusCode::BAD_GATEWAY, err_text))
 }
 
-fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candidate> {
+pub(crate) fn build_candidates(state: &AppState, channel: &CanonicalChannel) -> Vec<Candidate> {
     let alive = state.hosts.alive_hosts_ranked();
-    let mut fresh: Vec<Candidate> = Vec::new();
-    let mut demoted: Vec<Candidate> = Vec::new();
+    let mut cands: Vec<Candidate> = Vec::new();
 
-    // Per-source emission order (within score-desc sources):
-    //   1. Primary candidate: origin_host × stream_id — the host that actually
-    //      reported this stream in the catalog. Tried first because it's the
-    //      one we know has it.
-    //   2. Speculative candidates: other alive hosts × stream_id — only useful
-    //      when the provider replicates stream_ids across hosts. They may 404
-    //      otherwise; that's fine, they get demoted and eventually filtered.
-    // After enumeration, dedupe by URL (different sources can collide on the
-    // same speculative URL) preserving first-seen order so primaries always
-    // win over speculatives.
+    // Per-source emission. No more host-bad / url-failed / demoted exclusion
+    // here (plan §8 strict reading: "no source disappears because we
+    // *suspect* it's broken"). Every (source × host) reachable for the
+    // channel is enumerated; rank-tuple penalties (cool-off step, host
+    // badness) sort the broken ones to the bottom without removing them.
+    //
+    // Emission order is preserved so the stable sort keeps primary hosts
+    // ahead of speculative ones among rank-equal candidates: a primary that
+    // tied with a speculative on rank still goes first.
     for src in &channel.sources {
         if let Some(direct) = &src.direct_source {
             // Radio: URL given verbatim by `direct_source` — one candidate
             // per source, no host fanout.
-            if state.blacklist.is_url_failed(direct) {
-                continue;
-            }
             let host = derive_host(direct).unwrap_or_default();
-            if !host.is_empty() && state.blacklist.is_host_bad(&host) {
-                continue;
-            }
-            let cand = Candidate {
+            cands.push(Candidate {
                 url: direct.clone(),
                 host,
                 stream_id: src.stream_id,
-            };
-            if state.blacklist.is_url_demoted(direct) {
-                demoted.push(cand);
-            } else {
-                fresh.push(cand);
-            }
+            });
             continue;
         }
-        // Xtream TV source. Emit primary first, then speculatives.
+        // Xtream TV source: primary host first (the one that reported the
+        // stream), then speculative fanout to every other alive host.
         let primary_host = src.origin_host.as_str();
-        if !primary_host.is_empty()
-            && alive.iter().any(|h| h == primary_host)
-            && !state.blacklist.is_host_bad(primary_host)
-        {
-            push_xtream_candidate(state, primary_host, src.stream_id, &mut fresh, &mut demoted);
+        if !primary_host.is_empty() && alive.iter().any(|h| h == primary_host) {
+            cands.push(make_xtream_candidate(state, primary_host, src.stream_id));
+        } else if !primary_host.is_empty() {
+            // origin_host known but not currently alive — still keep the
+            // candidate so cool-off / host-penalty rank it; we don't
+            // hard-exclude based on liveness probes.
+            cands.push(make_xtream_candidate(state, primary_host, src.stream_id));
         }
         for host in &alive {
             if host == primary_host {
                 continue;
             }
-            if state.blacklist.is_host_bad(host) {
-                continue;
-            }
-            push_xtream_candidate(state, host, src.stream_id, &mut fresh, &mut demoted);
+            cands.push(make_xtream_candidate(state, host, src.stream_id));
         }
     }
 
-    // Dedupe by URL — preserve order so primaries stay ahead of speculatives.
-    dedup_preserving_order(&mut fresh);
-    dedup_preserving_order(&mut demoted);
-    // Any URL that appears in `fresh` shouldn't *also* live in `demoted` (would
-    // cause us to retry the same URL twice in a single request).
-    {
-        let fresh_urls: std::collections::HashSet<&str> =
-            fresh.iter().map(|c| c.url.as_str()).collect();
-        demoted.retain(|c| !fresh_urls.contains(c.url.as_str()));
-    }
+    dedup_preserving_order(&mut cands);
 
     // Measurement-driven rank. Snapshot the play log once (not per-candidate)
     // so success_score is O(candidates × history) rather than O(candidates²).
-    // Stable sort preserves the existing host-latency tie-break order for
-    // rank-equal candidates.
+    // Stable sort preserves the enumeration order for rank-equal candidates,
+    // so primary-host candidates stay ahead of speculative ones at the same
+    // tier of measurement/cool-off.
     let log_snap = state.play_log.snapshot();
-    fresh.sort_by(|a, b| {
-        let ka = source_rank_key(a.stream_id, &a.host, &state.measured, &log_snap);
-        let kb = source_rank_key(b.stream_id, &b.host, &state.measured, &log_snap);
-        kb.cmp(&ka)
-    });
-
-    // Last-known-good promotion. LKG only wins when its measurement is at
-    // least as good as the current top candidate — otherwise the
-    // measurement-driven ranking is preferred. Without this check, an old
-    // LKG pinned to an unmeasured host (set before the bootstrap sweep
-    // populated samples) would override the new ranking forever; the plan
-    // calls for clear_last_known_good() after sweep completion, but with
-    // max_connections=1 the sweep may not finish cleanly, so we need this
-    // belt-and-braces too.
-    if let Some(lkg) = state.blacklist.last_known_good(&channel.key) {
-        let demoted_lkg = state.blacklist.is_url_demoted(&lkg);
-        if !demoted_lkg && !state.blacklist.is_url_failed(&lkg) {
-            let lkg_host = derive_host(&lkg).unwrap_or_default();
-            let lkg_stream_id = stream_id_from_source_url(&lkg).unwrap_or(0);
-            let lkg_rank =
-                source_rank_key(lkg_stream_id, &lkg_host, &state.measured, &log_snap);
-            let top_rank = fresh.first().map(|c| {
-                source_rank_key(c.stream_id, &c.host, &state.measured, &log_snap)
+    match channel.kind {
+        crate::xtream::ChannelKind::Tv => {
+            cands.sort_by(|a, b| {
+                let ka = source_rank_key_tv(
+                    &channel.key,
+                    a.stream_id,
+                    &a.url,
+                    &a.host,
+                    &state.measured,
+                    &state.blacklist,
+                    &log_snap,
+                );
+                let kb = source_rank_key_tv(
+                    &channel.key,
+                    b.stream_id,
+                    &b.url,
+                    &b.host,
+                    &state.measured,
+                    &state.blacklist,
+                    &log_snap,
+                );
+                kb.cmp(&ka)
             });
-            // LKG promoted if competitive with rank-key top, or if no
-            // candidates exist (then LKG is all we have).
-            let lkg_competitive = match top_rank {
-                Some(top) => lkg_rank >= top,
-                None => true,
-            };
-            if lkg_competitive {
-                if let Some(pos) = fresh.iter().position(|c| c.url == lkg) {
-                    let item = fresh.remove(pos);
-                    fresh.insert(0, item);
-                } else {
-                    fresh.insert(0, Candidate { url: lkg, host: lkg_host, stream_id: lkg_stream_id });
-                }
-            }
+        }
+        crate::xtream::ChannelKind::Radio => {
+            cands.sort_by(|a, b| {
+                let ka = source_rank_key_radio(
+                    &channel.key,
+                    a.stream_id,
+                    &a.url,
+                    &a.host,
+                    &state.measured,
+                    &state.blacklist,
+                    &log_snap,
+                );
+                let kb = source_rank_key_radio(
+                    &channel.key,
+                    b.stream_id,
+                    &b.url,
+                    &b.host,
+                    &state.measured,
+                    &state.blacklist,
+                    &log_snap,
+                );
+                kb.cmp(&ka)
+            });
         }
     }
 
-    fresh.extend(demoted);
-
-    // If the blacklist filtered everything out, fall back to the unfiltered
-    // candidate set. The blacklist is a hint, not a hard rule — failing the
-    // request without trying anything is worse than probing a possibly-stale
-    // entry. If they really are all dead, the attempt loop in `play_playlist`
-    // returns whatever error within its budget.
-    if fresh.is_empty()
-        && (!alive.is_empty() || channel.sources.iter().any(|s| s.direct_source.is_some()))
-    {
-        for src in &channel.sources {
-            if let Some(direct) = &src.direct_source {
-                let host = derive_host(direct).unwrap_or_default();
-                fresh.push(Candidate {
-                    url: direct.clone(),
-                    host,
-                    stream_id: src.stream_id,
-                });
-            } else if !src.origin_host.is_empty() {
-                let url = state.xtream.stream_url(&src.origin_host, src.stream_id, "m3u8");
-                fresh.push(Candidate {
-                    url,
-                    host: src.origin_host.clone(),
-                    stream_id: src.stream_id,
-                });
-            } else {
-                // No origin_host (legacy data) — fall back to fanning across
-                // alive hosts. Should only happen during the cold-start
-                // window between probe and first multi-host catalog refresh.
-                for host in &alive {
-                    let url = state.xtream.stream_url(host, src.stream_id, "m3u8");
-                    fresh.push(Candidate {
-                        url,
-                        host: host.clone(),
-                        stream_id: src.stream_id,
-                    });
-                }
-            }
-        }
-        dedup_preserving_order(&mut fresh);
-    }
-
-    fresh
+    cands
 }
 
 // --- Rank-key helpers ------------------------------------------------------
 //
 // Lexicographic comparison key for sorting candidates. Bigger is better.
-// Slots (descending priority):
-//   0. measured marker (1 if we have a measurement, 0 otherwise)
-//   1. success_bucket  — history-aware reliability for this (stream_id, host)
-//   2. hdr_rank        — HDR ahead of bpp (TV is OLED)
-//   3. bpp_bucket      — bitrate-per-pixel coarse bucket (starved 1080p
-//                        loses to well-fed 720p; same-quality streams tie)
-//   4. pixels          — resolution as in-bucket tiebreaker
-//   5. codec_rank      — av1 > hevc > h264 > mpeg2
-//   6. fps_rank        — 50/60 > 25/30
-//   7. raw_kbps        — fine-grained bitrate tiebreaker so two equally-
-//                        encoded streams on different hosts don't fall back
-//                        to stable-sort / catalog order
-type RankKey = (i32, i32, i32, i32, i64, i32, i32, i32);
+// Per `ChannelKind`: TV and Radio have different quality dimensions, and
+// mixing them in a single tuple compares apples to oranges. `build_candidates`
+// dispatches on `channel.kind` so each sort only sees one kind.
+//
+// Common prefix (both kinds):
+//   0. -cool_off_penalty  — fresh URLs first; URLs in long cool-off sink.
+//                            Plan §4: never excluded, but heavily demoted.
+//   1. -host_penalty      — host-bad URLs get demoted in-tuple (2 = bad).
+//   2. measured?          — measured beats unmeasured.
+//   3. success_bucket     — history-aware reliability for (stream_id, host).
+//   4. lkg_bonus          — Step 5: decayed by age (3/2/1/0 at <1h/<6h/<24h/older).
+//
+// TV-specific tail (slots 5..=10): HDR, bpp_bucket, pixels, codec_rank,
+// fps_rank, raw_kbps — preserves the existing video quality ordering.
+//
+// Radio-specific tail (slots 5..=7): kbps_bucket, sample_rate_bucket,
+// channels — Phase 8 fills these in from the ADTS extractor; for now they
+// are placeholder zeros.
+
+type TvRankKey = (
+    i32, // -cool_off_penalty
+    i32, // -host_penalty
+    i32, // measured? (1/0)
+    i32, // success_bucket
+    i32, // lkg_bonus
+    i32, // hdr_rank
+    i32, // bpp_bucket
+    i64, // pixels
+    i32, // codec_rank
+    i32, // fps_rank
+    i32, // raw_kbps
+);
+
+type RadioRankKey = (
+    i32, // -cool_off_penalty
+    i32, // -host_penalty
+    i32, // measured? (1/0)
+    i32, // success_bucket
+    i32, // lkg_bonus
+    i32, // kbps_bucket — Phase 8 (ADTS)
+    i32, // sample_rate_bucket — Phase 8
+    i32, // channels — Phase 8
+);
 
 fn hdr_rank(pix_fmt: Option<&str>, transfer: Option<&str>) -> i32 {
     let ten_bit = matches!(pix_fmt, Some(p) if p.contains("10"));
@@ -632,13 +664,40 @@ fn success_bucket(score: f32) -> i32 {
     (score * 10.0).round() as i32 // 0..=10
 }
 
-fn source_rank_key(
+/// `0` for healthy hosts, `2` for hosts the blacklist has flagged via
+/// `is_host_bad`. Used by both per-kind rank-key helpers as the second
+/// slot — host-bad URLs get demoted in-tuple instead of removed.
+fn host_penalty(host: &str, bl: &crate::blacklist::Blacklist) -> i32 {
+    if !host.is_empty() && bl.is_host_bad(host) { 2 } else { 0 }
+}
+
+/// LKG decay tiers (Step 5). Returns 3 / 2 / 1 / 0 depending on age. Used
+/// as the fifth slot in the rank tuple — beats quality among rank-equal
+/// siblings, but a measurement-better sibling still wins because the
+/// quality dimensions come *after* lkg_bonus in the tuple.
+fn lkg_bonus(channel_key: &str, url: &str, bl: &crate::blacklist::Blacklist) -> i32 {
+    match bl.last_known_good_age(channel_key, url) {
+        Some(age) if age < Duration::from_secs(3600) => 3,        // < 1 h
+        Some(age) if age < Duration::from_secs(6 * 3600) => 2,    // < 6 h
+        Some(age) if age < Duration::from_secs(24 * 3600) => 1,   // < 24 h
+        _ => 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_rank_key_tv(
+    channel_key: &str,
     stream_id: u64,
+    url: &str,
     host: &str,
     measured: &MeasuredStore,
+    bl: &crate::blacklist::Blacklist,
     log_snap: &[PlayEvent],
-) -> RankKey {
+) -> TvRankKey {
     let success = success_bucket(success_score(stream_id, host, log_snap));
+    let cool_off = -bl.cool_off_penalty(url);
+    let host_pen = -host_penalty(host, bl);
+    let lkg = lkg_bonus(channel_key, url, bl);
     match measured.get(stream_id, host) {
         Some(q) => {
             let pix_fmt_10bit = q.pix_fmt.as_deref().map(|p| p.contains("10")).unwrap_or(false);
@@ -651,8 +710,11 @@ fn source_rank_key(
                 hdr_raw
             };
             (
-                1, // measured > unmeasured
+                cool_off,
+                host_pen,
+                1,
                 success,
+                lkg,
                 hdr,
                 bpp_bucket(q.bitrate_kbps, q.width, q.height),
                 (q.width as u64 * q.height as u64) as i64,
@@ -661,30 +723,92 @@ fn source_rank_key(
                 q.bitrate_kbps.unwrap_or(0) as i32,
             )
         }
-        None => (0, success, 0, 0, 0, 0, 0, 0),
+        None => (cool_off, host_pen, 0, success, lkg, 0, 0, 0, 0, 0, 0),
     }
 }
 
-fn push_xtream_candidate(
-    state: &AppState,
-    host: &str,
+#[allow(clippy::too_many_arguments)]
+fn source_rank_key_radio(
+    channel_key: &str,
     stream_id: u64,
-    fresh: &mut Vec<Candidate>,
-    demoted: &mut Vec<Candidate>,
-) {
-    let url = state.xtream.stream_url(host, stream_id, "m3u8");
-    if state.blacklist.is_url_failed(&url) {
-        return;
+    url: &str,
+    host: &str,
+    measured: &MeasuredStore,
+    bl: &crate::blacklist::Blacklist,
+    log_snap: &[PlayEvent],
+) -> RadioRankKey {
+    let success = success_bucket(success_score(stream_id, host, log_snap));
+    let cool_off = -bl.cool_off_penalty(url);
+    let host_pen = -host_penalty(host, bl);
+    let lkg = lkg_bonus(channel_key, url, bl);
+    match measured.get(stream_id, host) {
+        Some(q) => (
+            cool_off,
+            host_pen,
+            1,
+            success,
+            lkg,
+            audio_kbps_bucket(q.bitrate_kbps),
+            audio_sample_rate_bucket(q.sample_rate_hz),
+            audio_channels_bucket(q.audio_channels),
+        ),
+        None => (cool_off, host_pen, 0, success, lkg, 0, 0, 0),
     }
-    let cand = Candidate {
-        url: url.clone(),
+}
+
+/// Plan §10 radio ADTS rank buckets.
+fn audio_kbps_bucket(kbps: Option<u32>) -> i32 {
+    match kbps {
+        Some(k) if k >= 320 => 4,
+        Some(k) if k >= 192 => 3,
+        Some(k) if k >= 128 => 2,
+        Some(k) if k >= 64 => 1,
+        Some(_) => 0,
+        None => 0,
+    }
+}
+
+fn audio_sample_rate_bucket(hz: Option<u32>) -> i32 {
+    match hz {
+        Some(48000) => 3,
+        Some(44100) => 2,
+        Some(32000) => 1,
+        _ => 0,
+    }
+}
+
+fn audio_channels_bucket(channels: Option<u8>) -> i32 {
+    match channels {
+        Some(2) => 2,
+        Some(1) => 1,
+        _ => 0,
+    }
+}
+
+/// Validate `?force_url=<b64>` and promote the matching candidate to
+/// position 0 in `candidates`. Returns the chosen URL on success, or
+/// `Err(())` on any failure (malformed base64, non-UTF8, URL not in the
+/// current candidate set). The caller maps Err → 404 — security: don't
+/// let a hostile client coax the proxy into fetching arbitrary URLs.
+fn apply_force_url(candidates: &mut Vec<Candidate>, encoded: &str) -> Result<String, ()> {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| ())?;
+    let url = std::str::from_utf8(&raw).map_err(|_| ())?.to_string();
+    let pos = candidates.iter().position(|c| c.url == url).ok_or(())?;
+    if pos != 0 {
+        let cand = candidates.remove(pos);
+        candidates.insert(0, cand);
+    }
+    Ok(url)
+}
+
+fn make_xtream_candidate(state: &AppState, host: &str, stream_id: u64) -> Candidate {
+    let url = state.xtream.stream_url(host, stream_id, "m3u8");
+    Candidate {
+        url,
         host: host.to_string(),
         stream_id,
-    };
-    if state.blacklist.is_url_demoted(&url) {
-        demoted.push(cand);
-    } else {
-        fresh.push(cand);
     }
 }
 
@@ -699,6 +823,7 @@ async fn fetch_and_rewrite_playlist(
     cand: &Candidate,
     public_base: &str,
     track_failures: bool,
+    client_has_dvb_safe: bool,
 ) -> anyhow::Result<Response> {
     debug!("playlist fetch: {} ({})", channel.key, cand.url);
     let resp = state
@@ -742,10 +867,13 @@ async fn fetch_and_rewrite_playlist(
             body,
             &final_url,
             public_base,
-            &channel.key,
-            &cand.url,
-            track_failures,
-            Some(&cand.host),
+            RewriteCtx {
+                channel_key: &channel.key,
+                source_url: &cand.url,
+                track_failures,
+                upstream_host: Some(&cand.host),
+                client_has_dvb_safe,
+            },
         )?;
         let mut response = Response::new(Body::from(rewritten));
         response.headers_mut().insert(
@@ -777,13 +905,16 @@ async fn fetch_and_rewrite_playlist(
 async fn play_audio(
     state: Arc<AppState>,
     channel: CanonicalChannel,
+    // Pre-built candidate list (with any `?force_url` already applied by
+    // `play_playlist`). Hoisted out of here so the force_url validation
+    // path covers radio too — see Phase 9 R2 issue 2.
+    candidates: Vec<Candidate>,
     fmt: crate::radio::RadioFormat,
     _public_base: String,
     play_id: String,
     client_pid: Option<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let _active_play_guard = ActivePlayGuard::new(&state.active_plays);
-    let candidates = build_candidates(&state, &channel);
     if candidates.is_empty() {
         warn!(play = %play_id, channel = %channel.key, "no candidate sources for radio");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no candidate sources for channel".into()));
@@ -866,7 +997,7 @@ async fn play_audio(
                     error = %reason,
                     "audio upstream failed",
                 );
-                state.blacklist.mark_failed(&cand.url);
+                state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -886,7 +1017,7 @@ async fn play_audio(
                     elapsed_ms,
                     "audio upstream timed out",
                 );
-                state.blacklist.mark_failed(&cand.url);
+                state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -1038,14 +1169,27 @@ fn stream_audio_response(resp: reqwest::Response, upstream_url: &str) -> Respons
     response
 }
 
+/// Caps + bookkeeping flags carried through the playlist-rewrite pipeline
+/// into each segment's `SegmentToken`. Bundles the per-request-flags fields
+/// so we don't have to thread N extra bool params through `rewrite_playlist`
+/// / `rewrite_tag_with_uri` / `proxy_url`.
+#[derive(Debug, Clone, Copy)]
+struct RewriteCtx<'a> {
+    channel_key: &'a str,
+    source_url: &'a str,
+    track_failures: bool,
+    upstream_host: Option<&'a str>,
+    /// Plumbing for §9: did the client request `caps=...,dvb_safe,...` on
+    /// the play URL? If so, segments ride through verbatim; otherwise
+    /// `handle_ts_segment` strips DVB-subtitle PIDs as before.
+    client_has_dvb_safe: bool,
+}
+
 fn rewrite_playlist(
     body: &str,
     playlist_url: &Url,
     public_base: &str,
-    channel_key: &str,
-    source_url: &str,
-    track_failures: bool,
-    upstream_host: Option<&str>,
+    ctx: RewriteCtx<'_>,
 ) -> anyhow::Result<String> {
     let base = playlist_url.clone();
     let public_base = public_base.trim_end_matches('/');
@@ -1071,15 +1215,7 @@ fn rewrite_playlist(
                     }
                 }
             }
-            if let Some(rewritten) = rewrite_tag_with_uri(
-                trimmed,
-                &base,
-                public_base,
-                channel_key,
-                source_url,
-                track_failures,
-                upstream_host,
-            ) {
+            if let Some(rewritten) = rewrite_tag_with_uri(trimmed, &base, public_base, &ctx) {
                 out.push_str(&rewritten);
                 out.push('\n');
             } else {
@@ -1089,15 +1225,7 @@ fn rewrite_playlist(
             continue;
         }
         if let Ok(resolved) = base.join(trimmed) {
-            out.push_str(&proxy_url(
-                public_base,
-                resolved.as_str(),
-                channel_key,
-                source_url,
-                track_failures,
-                pending_duration,
-                upstream_host,
-            ));
+            out.push_str(&proxy_url(public_base, resolved.as_str(), pending_duration, &ctx));
             out.push('\n');
             pending_duration = None;
         } else {
@@ -1112,10 +1240,7 @@ fn rewrite_tag_with_uri(
     line: &str,
     base: &Url,
     public_base: &str,
-    channel_key: &str,
-    source_url: &str,
-    track_failures: bool,
-    upstream_host: Option<&str>,
+    ctx: &RewriteCtx<'_>,
 ) -> Option<String> {
     let uri_marker = "URI=\"";
     let idx = line.find(uri_marker)?;
@@ -1126,15 +1251,7 @@ fn rewrite_tag_with_uri(
     // No duration to attach for URI=-tag references — these are usually init
     // segments, subtitle tracks, etc. Bitrate measurement only applies to
     // media segments (the lines after #EXTINF).
-    let new_uri = proxy_url(
-        public_base,
-        resolved.as_str(),
-        channel_key,
-        source_url,
-        track_failures,
-        None,
-        upstream_host,
-    );
+    let new_uri = proxy_url(public_base, resolved.as_str(), None, ctx);
     let mut s = String::with_capacity(line.len() + new_uri.len());
     s.push_str(&line[..start]);
     s.push_str(&new_uri);
@@ -1145,19 +1262,17 @@ fn rewrite_tag_with_uri(
 fn proxy_url(
     public_base: &str,
     absolute_upstream: &str,
-    channel_key: &str,
-    source_url: &str,
-    track_failures: bool,
     duration: Option<f32>,
-    host: Option<&str>,
+    ctx: &RewriteCtx<'_>,
 ) -> String {
     let payload = SegmentToken {
         u: absolute_upstream.to_string(),
-        p: Some(source_url.to_string()),
-        c: Some(channel_key.to_string()),
-        probe: !track_failures,
+        p: Some(ctx.source_url.to_string()),
+        c: Some(ctx.channel_key.to_string()),
+        probe: !ctx.track_failures,
         d: duration,
-        h: host.map(|s| s.to_string()),
+        h: ctx.upstream_host.map(|s| s.to_string()),
+        dvb_safe: ctx.client_has_dvb_safe,
     };
     let json = serde_json::to_string(&payload).unwrap_or_else(|_| absolute_upstream.to_string());
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -1255,6 +1370,7 @@ fn decode_segment_token(token: &str) -> Result<SegmentToken, (StatusCode, String
         probe: false,
         d: None,
         h: None,
+        dvb_safe: false,
     })
 }
 
@@ -1336,10 +1452,16 @@ pub async fn proxy_segment(
             body,
             &final_url,
             &public_base,
-            &channel_key,
-            &source_url,
-            !segment.probe,
-            segment.h.as_deref(),
+            RewriteCtx {
+                channel_key: &channel_key,
+                source_url: &source_url,
+                track_failures: !segment.probe,
+                upstream_host: segment.h.as_deref(),
+                // Nested playlist inherits the outer segment's caps decision —
+                // the master-level rewrite already baked dvb_safe in based on
+                // the original play URL, so nested children get the same.
+                client_has_dvb_safe: segment.dvb_safe,
+            },
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1361,7 +1483,7 @@ pub async fn proxy_segment(
     // (a) classify the codec / detect DVB subtitle PIDs and (b) optionally
     // strip those PIDs before forwarding. Other content types (m4s, init
     // segments) pass straight through.
-    if is_ts && stream_id.is_some() {
+    if let (true, Some(sid)) = (is_ts, stream_id) {
         let upstream_headers = resp.headers().clone();
         let bytes = match resp.bytes().await {
             Ok(b) => b,
@@ -1376,19 +1498,19 @@ pub async fn proxy_segment(
         // observed kbps for the per-(stream_id, host) EWMA. Skip probe-mode
         // segments so the client capability probe never shapes measurements.
         if !segment.probe {
-            if let (Some(sid), Some(d), Some(h)) = (stream_id, segment.d, segment.h.as_deref()) {
-                if d > 0.0 && bytes.len() > 0 {
+            if let (Some(d), Some(h)) = (segment.d, segment.h.as_deref()) {
+                if d > 0.0 && !bytes.is_empty() {
                     let kbps = bytes.len() as f64 * 8.0 / 1000.0 / d as f64;
                     state.per_play.note_segment_kbps(sid, h, kbps as f32);
                 }
             }
         }
-        let processed = handle_ts_segment(&state, stream_id.unwrap(), &bytes, &segment);
+        let processed = handle_ts_segment(&state, sid, &bytes, &segment);
         // After handle_ts_segment has run (and possibly cached the
         // classification), push per-play metadata into the accumulator.
         // Idempotent — subsequent calls just refresh last_activity.
         if !segment.probe {
-            if let (Some(sid), Some(h)) = (stream_id, segment.h.as_deref()) {
+            if let Some(h) = segment.h.as_deref() {
                 if let Some(c) = state.classifier.get(sid) {
                     state.per_play.note_classification(
                         sid,
@@ -1399,6 +1521,7 @@ pub async fn proxy_segment(
                         c.pix_fmt.clone(),
                         c.color_transfer.clone(),
                         c.framerate,
+                        Some(c.dvb_unsafe),
                     );
                 }
             }
@@ -1420,6 +1543,45 @@ pub async fn proxy_segment(
         return builder
             .body(Body::from(processed))
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("body build error: {e}")));
+    }
+
+    // Phase 8 (Step 10) audio branch: AAC radio segments. Classify the
+    // ADTS header for sample_rate/channels, compute kbps from the byte
+    // count + EXTINF duration, and feed both into the per-play accumulator.
+    // We use the segment_id from the token (radio sources synth a
+    // high-bit-set stream_id at canonical-build time).
+    let is_aac = content_type.contains("aac")
+        || upstream_path.ends_with(".aac")
+        || upstream_path.ends_with(".m4a");
+    if let (true, Some(sid)) = (is_aac, segment.p.as_deref().and_then(stream_id_from_source_url).or(stream_id)) {
+        let upstream_headers = resp.headers().clone();
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("audio segment body read failed: {} → {}", upstream, e);
+                mark_segment_failure(&state, &segment);
+                return Err((StatusCode::BAD_GATEWAY, format!("body read: {e}")));
+            }
+        };
+        if !segment.probe {
+            if let Some(h) = segment.h.as_deref() {
+                let duration = segment.d.unwrap_or(0.0) as f64;
+                if let Some(audio_cls) = crate::codec::classify_aac_chunk(&bytes, duration) {
+                    state.per_play.note_audio_classification(
+                        sid,
+                        h,
+                        audio_cls.sample_rate_hz,
+                        audio_cls.audio_channels,
+                    );
+                    // Feed kbps via the EWMA so multi-segment averaging happens
+                    // the same way as for TV bitrate.
+                    if let Some(k) = audio_cls.kbps {
+                        state.per_play.note_segment_kbps(sid, h, k as f32);
+                    }
+                }
+            }
+        }
+        return passthrough_response(status, &upstream_headers, bytes);
     }
 
     let mut builder = Response::builder().status(status);
@@ -1515,32 +1677,28 @@ fn handle_ts_segment(
             None => return bytes.to_vec(),
         },
     };
+    // Per-request DVB-strip decision (Step 4 + architecture.md §9).
+    //   - Client claimed `dvb_safe` cap on the play URL → verbatim
+    //     passthrough; the client demuxer can handle the subs.
+    //   - Client didn't claim it (legacy default) → strip the subtitle
+    //     PIDs that are strippable; pass through verbatim if the PCR
+    //     collision case (`dvb_unsafe`) makes stripping impossible.
+    //
+    // The per-source demote that lived here before is gone: Step 7's
+    // `caps_required` derivation (which uses Sample.dvb_unsafe across all
+    // a channel's sources) is the right place to add the `dvb_safe` cap
+    // requirement, instead of demoting individual sources at segment time.
+    if segment.dvb_safe {
+        return bytes.to_vec();
+    }
     let pids = classification.strippable_subtitle_pids();
     let Some(pmt_pid) = classification.pmt_pid else {
         return bytes.to_vec();
     };
     if pids.is_empty() {
-        // No strippable subs. But if the classifier found subtitle PIDs we
-        // *can't* strip (because PCR rides on the same PID), demote the source
-        // — the webOS demuxer freezes on DVB subs and we have no way to fix
-        // it in flight. Better to send the next candidate next time. The
-        // demote also affects LKG handling so this same URL won't be the
-        // preferred pick on the next play.
-        if !classification.subtitle_pids.is_empty() && !segment.probe {
-            if let Some(source_url) = segment.p.as_deref() {
-                if !state.blacklist.is_url_demoted(source_url) {
-                    warn!(
-                        stream_id = stream_id,
-                        url = %source_url,
-                        "DVB subs collide with PCR PID; demoting source — webOS demuxer would stall"
-                    );
-                    state.blacklist.demote_url(source_url);
-                    if let Some(channel_key) = segment.c.as_deref() {
-                        state.blacklist.drop_last_known_good_if_matches(channel_key, source_url);
-                    }
-                }
-            }
-        }
+        // Either no subs at all, or PCR-colliding subs (unstrippable). Pass
+        // through verbatim — Step 7's caps_required is what gates the
+        // unstrippable case at the channel-list level.
         return bytes.to_vec();
     }
     strip_subtitle_pids(bytes, pmt_pid, &pids)
@@ -1574,16 +1732,14 @@ fn mark_segment_failure(state: &AppState, segment: &SegmentToken) {
     if segment.probe {
         return;
     }
-    state.blacklist.mark_failed(&segment.u);
+    // Both the segment URL itself and its parent playlist URL get a
+    // ServerSide bump (upstream produced an error / abuse redirect / etc.).
+    // No more `drop_last_known_good` — Step 5 turned LKG into a decayed
+    // rank-tuple bonus that naturally fades when the URL stops getting
+    // marked good, so a manual drop isn't needed.
+    state.blacklist.note_failure(&segment.u, FailureKind::ServerSide);
     if let Some(source_url) = segment.p.as_deref() {
-        state.blacklist.mark_failed(source_url);
-        if let Some(channel_key) = segment.c.as_deref() {
-            if let Some(lkg) = state.blacklist.last_known_good(channel_key) {
-                if lkg == source_url {
-                    state.blacklist.drop_last_known_good(channel_key);
-                }
-            }
-        }
+        state.blacklist.note_failure(source_url, FailureKind::ServerSide);
     }
 }
 
@@ -1681,6 +1837,25 @@ fn pick_first_uri_in_playlist(body: &str) -> Option<String> {
     None
 }
 
+/// Pick up to `count` siblings (excluding the one at `served_idx`) for
+/// background validation. R2 issue 4: cool-off / blacklist state is
+/// **not** consulted here — validating cooled URLs is the only way they
+/// can recover via `note_url_succeeded`. Filtering them out would lock
+/// them in cool-off forever.
+fn pick_validation_candidates(
+    candidates: &[Candidate],
+    served_idx: usize,
+    count: usize,
+) -> Vec<Candidate> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != served_idx)
+        .map(|(_, c)| c.clone())
+        .take(count)
+        .collect()
+}
+
 fn schedule_opportunistic_validation(
     state: Arc<AppState>,
     channel_key: String,
@@ -1691,22 +1866,18 @@ fn schedule_opportunistic_validation(
     if count == 0 || candidates.len() <= served_idx + 1 {
         return;
     }
-    let to_validate: Vec<Candidate> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != served_idx)
-        .map(|(_, c)| c.clone())
-        .take(count)
-        .collect();
+    let to_validate = pick_validation_candidates(candidates, served_idx, count);
     if to_validate.is_empty() {
         return;
     }
     let timeout = Duration::from_secs(state.config.proxy.opportunistic_validate_timeout_secs);
     tokio::spawn(async move {
+        // R2 issue 4 / plan §4 line 134: opportunistic validation is NOT on
+        // the carve-out list (only EPG, probe redirect, catchup keep their
+        // is_url_failed exclusion). Validating cooled URLs lets a recovered
+        // host walk back out of cool-off via `note_url_succeeded` here;
+        // skipping them would leave them stuck cooling indefinitely.
         for cand in to_validate {
-            if state.blacklist.is_url_failed(&cand.url) {
-                continue;
-            }
             let fut = state
                 .upstream_http
                 .get(&cand.url)
@@ -1722,7 +1893,7 @@ fn schedule_opportunistic_validation(
                             status = %status,
                             "opportunistic validation: bad status"
                         );
-                        state.blacklist.mark_failed(&cand.url);
+                        state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                         continue;
                     }
                     if is_abuse_url(&final_url) {
@@ -1731,7 +1902,7 @@ fn schedule_opportunistic_validation(
                             url = %cand.url,
                             "opportunistic validation: abuse redirect"
                         );
-                        state.blacklist.mark_failed(&cand.url);
+                        state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                         continue;
                     }
                     match resp.bytes().await {
@@ -1746,7 +1917,7 @@ fn schedule_opportunistic_validation(
                                     url = %cand.url,
                                     "opportunistic validation: placeholder playlist"
                                 );
-                                state.blacklist.mark_failed(&cand.url);
+                                state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                             } else if head.starts_with("#EXTM3U") {
                                 // Master playlist is OK; now verify segments are
                                 // actually fetchable. A surprisingly common
@@ -1768,7 +1939,7 @@ fn schedule_opportunistic_validation(
                                             reason = %reason,
                                             "opportunistic validation: playlist ok but segment failed"
                                         );
-                                        state.blacklist.mark_failed(&cand.url);
+                                        state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                                     }
                                 }
                             } else {
@@ -1777,7 +1948,7 @@ fn schedule_opportunistic_validation(
                                     url = %cand.url,
                                     "opportunistic validation: not a playlist"
                                 );
-                                state.blacklist.mark_failed(&cand.url);
+                                state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                             }
                         }
                         Err(e) => {
@@ -1787,7 +1958,7 @@ fn schedule_opportunistic_validation(
                                 err = %e,
                                 "opportunistic validation: body read failed"
                             );
-                            state.blacklist.mark_failed(&cand.url);
+                            state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                         }
                     }
                 }
@@ -1798,7 +1969,7 @@ fn schedule_opportunistic_validation(
                         err = %e,
                         "opportunistic validation: request error"
                     );
-                    state.blacklist.mark_failed(&cand.url);
+                    state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 }
                 Err(_) => {
                     warn!(
@@ -1806,15 +1977,11 @@ fn schedule_opportunistic_validation(
                         url = %cand.url,
                         "opportunistic validation: timeout"
                     );
-                    state.blacklist.mark_failed(&cand.url);
+                    state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 }
             }
         }
     });
-}
-
-pub async fn play_legacy() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, "use /play/<channel-key>.m3u8")
 }
 
 // ---- catch-up ---------------------------------------------------------------
@@ -1964,7 +2131,12 @@ async fn catchup_play(
         let attempt_start = Instant::now();
         match tokio::time::timeout(
             attempt_timeout,
-            fetch_and_rewrite_playlist(&state, &channel, &cand, public_base, true),
+            // Catchup doesn't honour client caps for now — the archive
+            // pipeline pre-dates the per-request dvb_safe plumbing and the
+            // catchup catalog is narrow enough that always-strip is safe.
+            // If a catchup channel turns out to need verbatim DVB later,
+            // thread caps through `catchup_play` then.
+            fetch_and_rewrite_playlist(&state, &channel, &cand, public_base, true, false),
         )
         .await
         {
@@ -2008,7 +2180,7 @@ async fn catchup_play(
                 // Catchup is a single-source path; URL-level failure tracking still
                 // applies so a permanently-bad host's URLs get demoted/blacklisted
                 // like live URLs do.
-                state.blacklist.mark_failed(&cand.url);
+                state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -2028,7 +2200,7 @@ async fn catchup_play(
                     elapsed_ms,
                     "catch-up upstream timed out",
                 );
-                state.blacklist.mark_failed(&cand.url);
+                state.blacklist.note_failure(&cand.url, FailureKind::ServerSide);
                 attempts.push(PlayAttempt {
                     host: cand.host.clone(),
                     url: cand.url.clone(),
@@ -2128,6 +2300,8 @@ mod tests {
             duration: dur.map(str::to_string),
             probe: false,
             pid: None,
+            caps: None,
+            force_url: None,
         }
     }
 
@@ -2357,16 +2531,29 @@ mod tests {
         assert!(ch.pick_archive_source().is_none());
     }
 
+    fn ctx<'a>(
+        ch: &'a str,
+        src: &'a str,
+        host: Option<&'a str>,
+        track: bool,
+        dvb_safe: bool,
+    ) -> RewriteCtx<'a> {
+        RewriteCtx {
+            channel_key: ch,
+            source_url: src,
+            track_failures: track,
+            upstream_host: host,
+            client_has_dvb_safe: dvb_safe,
+        }
+    }
+
     #[test]
     fn segment_token_marks_probe_requests_non_mutating() {
         let url = proxy_url(
             "https://iptv.example.test",
             "https://upstream.example/chunklist.m3u8",
-            "antena1",
-            "https://upstream.example/master.m3u8",
-            false,
             None,
-            None,
+            &ctx("antena1", "https://upstream.example/master.m3u8", None, false, false),
         );
         let token = url.rsplit('/').next().unwrap();
         let decoded = decode_segment_token(token).unwrap();
@@ -2377,6 +2564,7 @@ mod tests {
             Some("https://upstream.example/master.m3u8")
         );
         assert_eq!(decoded.c.as_deref(), Some("antena1"));
+        assert!(!decoded.dvb_safe, "probes don't claim dvb_safe");
     }
 
     #[test]
@@ -2384,11 +2572,8 @@ mod tests {
         let url = proxy_url(
             "https://iptv.example.test",
             "https://upstream.example/seg.ts",
-            "rtp1",
-            "https://upstream.example/live.m3u8",
-            true,
             Some(5.0),
-            Some("http://cf.example"),
+            &ctx("rtp1", "https://upstream.example/live.m3u8", Some("http://cf.example"), true, false),
         );
         let token = url.rsplit('/').next().unwrap();
         let decoded = decode_segment_token(token).unwrap();
@@ -2396,5 +2581,267 @@ mod tests {
         assert_eq!(decoded.u, "https://upstream.example/seg.ts");
         assert_eq!(decoded.d, Some(5.0));
         assert_eq!(decoded.h.as_deref(), Some("http://cf.example"));
+        assert!(!decoded.dvb_safe);
+    }
+
+    #[test]
+    fn segment_token_round_trip_includes_dvb_safe() {
+        // dvb_safe = true → token carries the bit and the segment handler
+        // will pass bytes verbatim instead of stripping DVB-subtitle PIDs.
+        let url = proxy_url(
+            "https://iptv.example.test",
+            "https://upstream.example/seg.ts",
+            Some(5.0),
+            &ctx("rtp1", "https://upstream.example/live.m3u8", Some("http://cf.example"), true, true),
+        );
+        let token = url.rsplit('/').next().unwrap();
+        let decoded = decode_segment_token(token).unwrap();
+        assert!(decoded.dvb_safe);
+    }
+
+    #[test]
+    fn legacy_segment_token_decodes_to_dvb_safe_false() {
+        // Pre-Phase-4 tokens were a bare upstream URL (not JSON). The
+        // decode fallback synthesises an empty SegmentToken — `dvb_safe`
+        // must default to `false` so legacy URLs still get the PID-strip
+        // applied (matches the pre-Phase-4 behaviour).
+        let legacy = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(b"https://upstream.example/seg.ts");
+        let decoded = decode_segment_token(&legacy).unwrap();
+        assert_eq!(decoded.u, "https://upstream.example/seg.ts");
+        assert!(!decoded.dvb_safe);
+        assert!(!decoded.probe);
+    }
+
+    fn empty_play_log() -> Vec<PlayEvent> {
+        Vec::new()
+    }
+
+    fn fresh_blacklist() -> crate::blacklist::Blacklist {
+        crate::blacklist::Blacklist::new(crate::config::BlacklistConfig {
+            host_fail_threshold: 4,
+            host_ttl_secs: 3600,
+            cool_off_steps_secs: [60, 300, 1800, 21600],
+            heartbeat_window_secs: 60,
+            clean_play_reset_secs: 300,
+        })
+    }
+
+    fn empty_measured() -> MeasuredStore {
+        MeasuredStore::load_or_empty(std::path::PathBuf::from("/nonexistent-for-test.json"))
+    }
+
+    #[test]
+    fn tv_rank_key_cool_off_dominates_quality() {
+        // Two candidates: A is unmeasured but fresh (no cool-off); B is
+        // measured-1080p but in cool-off step 3. Plan §4: cool-off
+        // dominates — A wins.
+        let bl = fresh_blacklist();
+        let m = empty_measured();
+        let log: Vec<PlayEvent> = empty_play_log();
+        // Inject a cool-off step 3 on B's URL.
+        for _ in 0..3 {
+            bl.note_failure("http://cool/live/u/p/2.m3u8", crate::blacklist::FailureKind::ServerSide);
+        }
+        let key_a = source_rank_key_tv("rtp1", 1, "http://fresh/live/u/p/1.m3u8", "http://fresh", &m, &bl, &log);
+        let key_b = source_rank_key_tv("rtp1", 2, "http://cool/live/u/p/2.m3u8", "http://cool", &m, &bl, &log);
+        assert!(key_a > key_b, "fresh unmeasured beats cool-off-3 measured");
+    }
+
+    #[test]
+    fn tv_rank_key_lkg_bonus_breaks_quality_tie() {
+        // Two unmeasured candidates with the same cool-off. The LKG one
+        // wins via the lkg_bonus slot.
+        let bl = fresh_blacklist();
+        bl.note_url_succeeded("rtp1", "http://lkg/live/u/p/1.m3u8");
+        let m = empty_measured();
+        let log: Vec<PlayEvent> = empty_play_log();
+        let lkg_key = source_rank_key_tv("rtp1", 1, "http://lkg/live/u/p/1.m3u8", "http://lkg", &m, &bl, &log);
+        let other_key = source_rank_key_tv("rtp1", 2, "http://other/live/u/p/2.m3u8", "http://other", &m, &bl, &log);
+        assert!(lkg_key > other_key);
+    }
+
+    #[test]
+    fn lkg_bonus_decays_with_age() {
+        // < 1h → 3, < 6h → 2, < 24h → 1, older → 0. Test the boundaries
+        // via direct call (function takes the blacklist, not a clock).
+        let bl = fresh_blacklist();
+        bl.note_url_succeeded("rtp1", "http://a");
+        let now_bonus = lkg_bonus("rtp1", "http://a", &bl);
+        assert_eq!(now_bonus, 3, "fresh LKG → tier 3");
+        // Different URL → no bonus (we don't promote arbitrary siblings).
+        assert_eq!(lkg_bonus("rtp1", "http://b", &bl), 0);
+        // Unknown channel → no bonus.
+        assert_eq!(lkg_bonus("missing", "http://a", &bl), 0);
+    }
+
+    fn mock_candidates() -> Vec<Candidate> {
+        vec![
+            Candidate { url: "http://a/live/u/p/1.m3u8".into(), host: "http://a".into(), stream_id: 1 },
+            Candidate { url: "http://b/live/u/p/1.m3u8".into(), host: "http://b".into(), stream_id: 1 },
+            Candidate { url: "http://c/live/u/p/1.m3u8".into(), host: "http://c".into(), stream_id: 1 },
+        ]
+    }
+
+    fn b64url(s: &str) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn force_url_promotes_matching_candidate_to_pos0() {
+        let mut cands = mock_candidates();
+        let url = "http://c/live/u/p/1.m3u8";
+        let chosen = apply_force_url(&mut cands, &b64url(url)).expect("promote ok");
+        assert_eq!(chosen, url);
+        assert_eq!(cands[0].url, url);
+        // Order otherwise preserved (a stays ahead of b after c moves up).
+        assert_eq!(cands[1].url, "http://a/live/u/p/1.m3u8");
+        assert_eq!(cands[2].url, "http://b/live/u/p/1.m3u8");
+    }
+
+    #[test]
+    fn force_url_keeps_pos0_when_already_first() {
+        let mut cands = mock_candidates();
+        let url = cands[0].url.clone();
+        apply_force_url(&mut cands, &b64url(&url)).expect("ok");
+        assert_eq!(cands[0].url, url);
+    }
+
+    #[test]
+    fn force_url_rejects_when_url_not_in_set() {
+        let mut cands = mock_candidates();
+        let err = apply_force_url(&mut cands, &b64url("http://intruder/live/u/p/99.m3u8"));
+        assert!(err.is_err(), "URL not in current set must be rejected (404)");
+        // Order untouched.
+        assert_eq!(cands[0].url, "http://a/live/u/p/1.m3u8");
+    }
+
+    #[test]
+    fn force_url_rejects_malformed_base64() {
+        let mut cands = mock_candidates();
+        assert!(apply_force_url(&mut cands, "@@@not-base64@@@").is_err());
+    }
+
+    #[test]
+    fn force_url_rejects_non_utf8_payload() {
+        let mut cands = mock_candidates();
+        let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xff, 0xfe, 0xfd]);
+        assert!(apply_force_url(&mut cands, &bad).is_err());
+    }
+
+    #[test]
+    fn opportunistic_validation_picks_siblings_without_consulting_cool_off() {
+        // R2 issue 4: cool-off-aware filtering is removed inside the
+        // schedule_opportunistic_validation pipeline. The pure selector
+        // just walks index-by-index, skipping `served_idx`. A cooled
+        // URL at the bottom of the rank ends up in the validation set
+        // exactly because the filter is gone.
+        let cands = vec![
+            Candidate { url: "http://fresh-served/a.m3u8".into(), host: "http://fresh-served".into(), stream_id: 1 },
+            Candidate { url: "http://fresh-sib/a.m3u8".into(), host: "http://fresh-sib".into(), stream_id: 1 },
+            Candidate { url: "http://cool-sib/a.m3u8".into(), host: "http://cool-sib".into(), stream_id: 1 },
+        ];
+        let picked = pick_validation_candidates(&cands, 0, 2);
+        assert_eq!(picked.len(), 2);
+        // Order preserved; served_idx 0 skipped.
+        assert_eq!(picked[0].url, "http://fresh-sib/a.m3u8");
+        assert_eq!(picked[1].url, "http://cool-sib/a.m3u8");
+    }
+
+    #[test]
+    fn opportunistic_validation_take_cap_respected() {
+        let cands: Vec<Candidate> = (0..5)
+            .map(|i| Candidate {
+                url: format!("http://h{i}/a.m3u8"),
+                host: format!("http://h{i}"),
+                stream_id: 1,
+            })
+            .collect();
+        let picked = pick_validation_candidates(&cands, 2, 2);
+        assert_eq!(picked.len(), 2);
+        assert!(!picked.iter().any(|c| c.host == "http://h2"));
+    }
+
+    #[test]
+    fn force_url_works_against_radio_direct_source_candidates() {
+        // R2 issue 2: `apply_force_url` is now called BEFORE the radio
+        // dispatch in `play_playlist`, so direct_source radio URLs are
+        // also subject to the 404 + promote semantics. Validate by feeding
+        // a candidate list that mirrors what `build_candidates` produces
+        // for radio (each direct_source becomes one Candidate, no host
+        // fanout).
+        let mut cands = vec![
+            Candidate { url: "http://radio-a/aac".into(), host: "http://radio-a".into(), stream_id: 100 },
+            Candidate { url: "http://radio-b/aac".into(), host: "http://radio-b".into(), stream_id: 101 },
+        ];
+        let chosen = apply_force_url(&mut cands, &b64url("http://radio-b/aac")).expect("promote ok");
+        assert_eq!(chosen, "http://radio-b/aac");
+        assert_eq!(cands[0].url, "http://radio-b/aac");
+        // Non-candidate radio URL → still rejected.
+        assert!(apply_force_url(&mut cands, &b64url("http://other-radio/aac")).is_err());
+    }
+
+    #[test]
+    fn radio_rank_key_shape_matches_plan() {
+        let bl = fresh_blacklist();
+        let m = empty_measured();
+        let log: Vec<PlayEvent> = empty_play_log();
+        let k = source_rank_key_radio("antena1", 1, "http://r/a.m3u8", "http://r", &m, &bl, &log);
+        // Unmeasured: cool=0, host=0, measured=0, success=5, lkg=0, audio 0/0/0
+        assert_eq!(k.0, 0);
+        assert_eq!(k.1, 0);
+        assert_eq!(k.2, 0);
+        assert_eq!(k.5, 0);
+        assert_eq!(k.6, 0);
+        assert_eq!(k.7, 0);
+    }
+
+    #[test]
+    fn radio_rank_higher_kbps_wins_when_other_dims_equal() {
+        // Phase 8: kbps_bucket beats lower bitrates among rank-equal
+        // candidates that share success / LKG / etc.
+        use crate::measured::{Sample, SampleSource};
+        let bl = fresh_blacklist();
+        let m = empty_measured();
+        let log: Vec<PlayEvent> = empty_play_log();
+        let mk = |kbps: u32| Sample {
+            at: time::OffsetDateTime::now_utc(),
+            source: SampleSource::Sweep,
+            width: 0,
+            height: 0,
+            codec: Some("aac".into()),
+            pix_fmt: None,
+            color_transfer: None,
+            framerate: None,
+            bitrate_kbps: Some(kbps),
+            dvb_unsafe: None,
+            sample_rate_hz: Some(44100),
+            audio_channels: Some(2),
+        };
+        m.push(1, "http://lo", mk(96));
+        m.push(2, "http://mid", mk(192));
+        m.push(3, "http://hi", mk(320));
+        let lo = source_rank_key_radio("ch", 1, "http://lo/a.m3u8", "http://lo", &m, &bl, &log);
+        let mid = source_rank_key_radio("ch", 2, "http://mid/a.m3u8", "http://mid", &m, &bl, &log);
+        let hi = source_rank_key_radio("ch", 3, "http://hi/a.m3u8", "http://hi", &m, &bl, &log);
+        assert!(hi > mid && mid > lo, "kbps bucket dominates within radio sort");
+    }
+
+    #[test]
+    fn audio_bucket_helpers_table() {
+        assert_eq!(audio_kbps_bucket(Some(320)), 4);
+        assert_eq!(audio_kbps_bucket(Some(192)), 3);
+        assert_eq!(audio_kbps_bucket(Some(128)), 2);
+        assert_eq!(audio_kbps_bucket(Some(64)), 1);
+        assert_eq!(audio_kbps_bucket(Some(48)), 0);
+        assert_eq!(audio_kbps_bucket(None), 0);
+        assert_eq!(audio_sample_rate_bucket(Some(48000)), 3);
+        assert_eq!(audio_sample_rate_bucket(Some(44100)), 2);
+        assert_eq!(audio_sample_rate_bucket(Some(32000)), 1);
+        assert_eq!(audio_sample_rate_bucket(Some(22050)), 0);
+        assert_eq!(audio_channels_bucket(Some(2)), 2);
+        assert_eq!(audio_channels_bucket(Some(1)), 1);
+        assert_eq!(audio_channels_bucket(Some(0)), 0);
+        assert_eq!(audio_channels_bucket(None), 0);
     }
 }

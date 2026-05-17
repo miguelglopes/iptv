@@ -363,6 +363,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+            logo_overrides: Default::default(),
             provider_boosts: vec![
                 ProviderBoost { pattern: "(?i)VODAFONE".into(), score: 3 },
                 ProviderBoost { pattern: "(?i)MEO".into(), score: 2 },
@@ -694,6 +695,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             display_overrides: HashMap::new(),
+            logo_overrides: HashMap::new(),
             provider_boosts: Vec::new(),
         };
         let c = Curation::from_config(&cfg).unwrap();

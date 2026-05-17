@@ -91,9 +91,27 @@ pub struct ProbeConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_parallelism")]
     pub parallelism: usize,
+    /// Freshness loop (Step 6): runs in the background after the bootstrap
+    /// sweep and keeps the measured-quality cache warm by re-probing keys
+    /// older than `freshness_ttl_secs`.
+    ///
+    /// - `None` (default) — auto-gated by `max_connections`: OFF when
+    ///   `max_cons ≤ 2`, ON at 900 s (15 min) when `max_cons ≥ 3`.
+    /// - `Some(0)` — force-disable (incident-response escape hatch).
+    /// - `Some(n>0)` — force-enable at `n` seconds regardless of `max_cons`.
+    ///
+    /// `Option` shape avoids the magic-u32-sentinel footgun where 0 means
+    /// disabled / -1 means "auto" / etc.
+    #[serde(default)]
+    pub freshness_loop_interval_secs: Option<u64>,
+    /// Re-probe threshold (seconds). Samples older than this are eligible
+    /// for re-probe in the freshness loop. Default 3600 (1 h).
+    #[serde(default = "default_freshness_ttl")]
+    pub freshness_ttl_secs: u64,
 }
 
 fn default_parallelism() -> usize { 4 }
+fn default_freshness_ttl() -> u64 { 3600 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CatalogConfig {
@@ -109,30 +127,40 @@ pub struct EpgConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlacklistConfig {
     pub host_fail_threshold: usize,
-    pub url_ttl_secs: u64,
     pub host_ttl_secs: u64,
-    #[serde(default = "default_demote_ttl")]
-    pub demote_ttl_secs: u64,
-    /// Number of distinct failures (within `url_fail_window_secs`) before a
-    /// URL is hard-blacklisted. The first failure just demotes it (sent to
-    /// the back of the candidate queue, still retried). Default 3 — absorbs
-    /// network blips, slow Wi-Fi moments and one-off cross-client misblame.
-    #[serde(default = "default_url_fail_threshold")]
-    pub url_fail_threshold: u32,
-    /// Sliding window for the threshold above. Failures outside the window
-    /// reset the counter to 1. Default 300 s (5 min).
-    #[serde(default = "default_url_fail_window")]
-    pub url_fail_window_secs: u64,
+    /// Cool-off durations per step (seconds). Step 0 = no cool-off; steps
+    /// 1..=4 map to entries 0..=3 of this array. Defaults to
+    /// `[60, 300, 1800, 21600]` → 1 min / 5 min / 30 min / 6 h. Each
+    /// failure bumps the step by one; clean-play heartbeats reset to 0.
+    /// Currently only documented (the rank-tuple uses the step number,
+    /// not the duration); Phase 6's freshness loop will consume these
+    /// values to schedule re-probes against URLs in cool-off.
+    #[serde(default = "default_cool_off_steps")]
+    #[allow(dead_code)]
+    pub cool_off_steps_secs: [u64; 4],
+    /// Window during which the previous heartbeat is still considered
+    /// "fresh" — tolerates one missed tick at the 30 s client cadence.
+    /// Default 60 s.
+    #[serde(default = "default_heartbeat_window")]
+    pub heartbeat_window_secs: u64,
+    /// Minimum time since the URL's last error before a heartbeat-driven
+    /// cool-off reset can fire. Default 300 s (5 min).
+    #[serde(default = "default_clean_play_reset")]
+    pub clean_play_reset_secs: u64,
 }
 
-fn default_demote_ttl() -> u64 { 10800 }
-fn default_url_fail_threshold() -> u32 { 3 }
-fn default_url_fail_window() -> u64 { 300 }
+fn default_cool_off_steps() -> [u64; 4] { [60, 300, 1800, 21600] }
+fn default_heartbeat_window() -> u64 { 60 }
+fn default_clean_play_reset() -> u64 { 300 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
     pub upstream_timeout_secs: u64,
+    /// Reserved for a future per-segment buffer-tuning consumer. Kept in
+    /// the config so on-disk TOML stays stable while we decide whether to
+    /// wire it up. Annotated `dead_code` so the clippy gate stays green.
     #[serde(default = "default_segment_buffer")]
+    #[allow(dead_code)]
     pub segment_buffer_bytes: usize,
     #[serde(default = "default_play_budget")]
     pub play_budget_secs: u64,

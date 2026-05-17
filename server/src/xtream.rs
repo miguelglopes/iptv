@@ -130,13 +130,19 @@ struct AuthResponse {
 pub struct UserInfo {
     #[serde(default)]
     pub auth: Value,
+    // Carried for diagnostics / future use even though nothing reads them
+    // today. Removing the fields would silently break `Deserialize` if the
+    // provider ever stops emitting them with `default`.
     #[serde(default)]
+    #[allow(dead_code)]
     pub status: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub active_cons: Option<Value>,
     #[serde(default)]
     pub max_connections: Option<Value>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub exp_date: Option<Value>,
 }
 
@@ -184,13 +190,21 @@ pub struct LiveStream {
     pub name: String,
     #[serde(default)]
     pub stream_icon: String,
+    // Provider response fields kept for round-trip fidelity; nothing
+    // consumes them today but stripping them would break Deserialize if
+    // the provider's shape drifts. `#[allow(dead_code)]` keeps the
+    // clippy gate green without hiding *new* dead code in the same struct.
     #[serde(default, deserialize_with = "de_string_lenient")]
+    #[allow(dead_code)]
     pub category_id: String,
     #[serde(default, deserialize_with = "de_opt_u64_lenient")]
+    #[allow(dead_code)]
     pub epg_channel_id: Option<u64>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub added: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub custom_sid: Option<String>,
     #[serde(default)]
     pub tv_archive: Option<Value>,

@@ -5,6 +5,13 @@ use serde::Serialize;
 
 use crate::sps::{find_sps_nal, parse_h264_sps, parse_hevc_sps, SpsCodec, SpsInfo};
 
+// Re-export the ADTS audio classifier so call sites only need
+// `crate::codec::*` for both video and audio — mirrors `classify_ts_chunk`.
+// `AudioClassification` lives in `crate::adts` and callers reference it
+// there; re-exporting it here would warn dead in the absence of a
+// `crate::codec::AudioClassification` callsite.
+pub use crate::adts::classify_aac_chunk;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
@@ -20,6 +27,13 @@ pub struct Classification {
     pub pmt_pid: Option<u16>,
     pub pcr_pid: Option<u16>,
     pub subtitle_pids: Vec<u16>,
+    /// True iff the stream carries DVB subtitles AND those subtitles ride
+    /// the PCR PID — i.e., `strippable_subtitle_pids()` is empty even
+    /// though subtitles are present. Stripping is impossible in that case
+    /// (would break timing); the only fix is to require a `dvb_safe` cap
+    /// from the client and let the bytes through verbatim.
+    #[serde(default)]
+    pub dvb_unsafe: bool,
     /// Populated when an SPS NAL is found in the video PID's PES payload.
     /// Width/height are post-crop (e.g. 1920x1080 not 1920x1088).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,7 +377,7 @@ fn collect_video_es(bytes: &[u8], start: usize, video_pid: u16) -> Option<Vec<u8
 /// return the offset where the elementary stream payload starts (past the
 /// PES header). Returns `None` for malformed inputs.
 fn pes_payload_offset(payload: &[u8]) -> Option<usize> {
-    if payload.len() < 9 || &payload[..3] != [0, 0, 1] {
+    if payload.len() < 9 || payload[..3] != [0, 0, 1] {
         return None;
     }
     // Optional flags byte at offset 6 (the "10" prefix marker), then
@@ -413,12 +427,17 @@ fn summarize(pmt_pid: u16, s: PmtSummary) -> Classification {
             _ => {}
         }
     }
+    // dvb_unsafe = the PCR collision case where strippable_subtitle_pids
+    // would return empty even though subs are present. Mirrors the
+    // existing predicate so the field is a derived fact, not a new judgement.
+    let dvb_unsafe = !subtitle_pids.is_empty() && subtitle_pids.contains(&s.pcr_pid);
     Classification {
         video_codec,
         video_pid,
         pmt_pid: Some(pmt_pid),
         pcr_pid: Some(s.pcr_pid),
         subtitle_pids,
+        dvb_unsafe,
         width: None,
         height: None,
         framerate: None,
@@ -588,21 +607,22 @@ mod tests {
         // Payload: pointer_field + PAT section
         p.push(0x00); // pointer_field
         // section: collect, then prepend table_id + length, then append CRC
-        let mut sec = Vec::new();
-        sec.push(0x00); // table_id
-        // section_length placeholder (2 bytes)
-        sec.push(0xB0);
-        sec.push(0x00);
-        sec.push(0x00); // transport_stream_id hi
-        sec.push(0x01); // ts_id lo
-        sec.push(0xC1); // version=0, current_next=1
-        sec.push(0x00); // section_number
-        sec.push(0x00); // last_section_number
-        // program loop
-        sec.push(0x00); // program_number hi (1)
-        sec.push(0x01);
-        sec.push(0xE0 | ((pmt_pid >> 8) as u8 & 0x1F));
-        sec.push((pmt_pid & 0xFF) as u8);
+        let mut sec = vec![
+            0x00, // table_id
+            // section_length placeholder (2 bytes)
+            0xB0,
+            0x00,
+            0x00, // transport_stream_id hi
+            0x01, // ts_id lo
+            0xC1, // version=0, current_next=1
+            0x00, // section_number
+            0x00, // last_section_number
+            // program loop
+            0x00, // program_number hi (1)
+            0x01,
+            0xE0 | ((pmt_pid >> 8) as u8 & 0x1F),
+            (pmt_pid & 0xFF) as u8,
+        ];
         // CRC placeholder (4 bytes)
         let crc_pos = sec.len();
         sec.extend_from_slice(&[0; 4]);
@@ -628,19 +648,20 @@ mod tests {
             0x10,
             0x00, // pointer_field
         ];
-        let mut sec = Vec::new();
-        sec.push(0x02); // table_id PMT
-        sec.push(0xB0);
-        sec.push(0x00);
-        sec.push(0x00); // program_number hi
-        sec.push(0x01); // program_number lo
-        sec.push(0xC1);
-        sec.push(0x00);
-        sec.push(0x00);
-        sec.push(0xE0 | ((pcr_pid >> 8) as u8 & 0x1F));
-        sec.push((pcr_pid & 0xFF) as u8);
-        sec.push(0xF0); // reserved + program_info_length hi
-        sec.push(0x00); // program_info_length lo (no program descriptors)
+        let mut sec = vec![
+            0x02, // table_id PMT
+            0xB0,
+            0x00,
+            0x00, // program_number hi
+            0x01, // program_number lo
+            0xC1,
+            0x00,
+            0x00,
+            0xE0 | ((pcr_pid >> 8) as u8 & 0x1F),
+            (pcr_pid & 0xFF) as u8,
+            0xF0, // reserved + program_info_length hi
+            0x00, // program_info_length lo (no program descriptors)
+        ];
         for (stype, pid, desc) in entries {
             sec.push(*stype);
             sec.push(0xE0 | ((pid >> 8) as u8 & 0x1F));
@@ -664,7 +685,7 @@ mod tests {
     }
 
     fn dummy_packet(pid: u16) -> Vec<u8> {
-        let mut p = vec![
+        let p = vec![
             SYNC,
             0x40 | ((pid >> 8) as u8 & 0x1F),
             (pid & 0xFF) as u8,
@@ -701,6 +722,48 @@ mod tests {
         assert_eq!(c.pcr_pid, Some(0x0021));
         assert_eq!(c.subtitle_pids, vec![0x0023]);
         assert_eq!(c.strippable_subtitle_pids(), vec![0x0023]);
+        // Strippable case → dvb_unsafe = false. A client without the
+        // dvb_safe cap will still play this fine because the proxy will
+        // strip the subtitle PID before forwarding.
+        assert!(!c.dvb_unsafe);
+    }
+
+    #[test]
+    fn classify_dvb_unsafe_when_pcr_rides_subtitle_pid() {
+        // Pathological broadcast shape: the PCR PID is reused for DVB
+        // subtitles, so stripping the subtitle PID would also strip the
+        // clock reference (breaking timing). The classifier flags this as
+        // dvb_unsafe so the caps gating in Step 7 can require dvb_safe
+        // from clients before offering the channel.
+        let pat = build_pat(0x0020);
+        let subtitling_desc = vec![0x59, 0x03, b'p', b'o', b'r'];
+        let pmt = build_pmt(
+            0x0020,
+            0x0023, // PCR rides the same PID as subs below
+            &[
+                (0x1B, 0x0021, vec![]),
+                (0x0F, 0x0022, vec![]),
+                (0x06, 0x0023, subtitling_desc),
+            ],
+        );
+        let mut bytes = pat;
+        bytes.extend(pmt);
+        let c = classify_ts_chunk(&bytes).expect("classify");
+        assert_eq!(c.subtitle_pids, vec![0x0023]);
+        assert_eq!(c.pcr_pid, Some(0x0023));
+        assert!(c.strippable_subtitle_pids().is_empty());
+        assert!(c.dvb_unsafe, "PCR-colliding subs are dvb_unsafe");
+    }
+
+    #[test]
+    fn classify_no_subs_is_not_dvb_unsafe() {
+        let pat = build_pat(0x0020);
+        let pmt = build_pmt(0x0020, 0x0021, &[(0x1B, 0x0021, vec![]), (0x0F, 0x0022, vec![])]);
+        let mut bytes = pat;
+        bytes.extend(pmt);
+        let c = classify_ts_chunk(&bytes).expect("classify");
+        assert!(c.subtitle_pids.is_empty());
+        assert!(!c.dvb_unsafe);
     }
 
     #[test]
@@ -868,6 +931,7 @@ mod tests {
                 pmt_pid: Some(0x0020),
                 pcr_pid: Some(0x0100),
                 subtitle_pids: vec![],
+                dvb_unsafe: false,
                 width: None,
                 height: None,
                 framerate: None,

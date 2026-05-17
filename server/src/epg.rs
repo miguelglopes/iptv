@@ -27,6 +27,7 @@ pub struct EpgMeta {
 pub struct CachedEpg {
     pub programs: Vec<EpgProgram>,
     pub fetched_at: Instant,
+    #[allow(dead_code)]
     pub meta: EpgMeta,
 }
 
@@ -55,6 +56,7 @@ impl EpgState {
         Some(entry.clone())
     }
 
+    #[allow(dead_code)]
     pub fn invalidate(&self, key: &str) {
         self.cache.remove(key);
     }
@@ -90,7 +92,7 @@ pub async fn fetch_epg_for_channel(
         notify.notified().await;
         return epg
             .get_fresh(channel_key)
-            .unwrap_or_else(|| empty_cached());
+            .unwrap_or_else(empty_cached);
     }
 
     let timeout = Duration::from_secs(epg.config.fetch_timeout_secs);
@@ -215,7 +217,7 @@ async fn walk_all_in_parallel(
     // Walk high-priority candidates first so their response is one of the first
     // few to arrive — important for catch-up channels where only the archive
     // source's response carries `has_archive` flags.
-    candidates.sort_by(|a, b| b.priority().cmp(&a.priority()));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.priority()));
     let priority_total = candidates.iter().filter(|c| c.priority() > 0).count();
 
     let mut tasks = FuturesUnordered::new();
@@ -411,8 +413,7 @@ fn parse_rtp_date_str(s: Option<&str>) -> Option<OffsetDateTime> {
 /// For now we just decode common HTML entities; the strings we've seen are
 /// plain text otherwise.
 fn rtp_decode(s: &str) -> String {
-    let s = s
-        .replace("&ccedil;", "ç")
+    s.replace("&ccedil;", "ç")
         .replace("&Ccedil;", "Ç")
         .replace("&atilde;", "ã")
         .replace("&Atilde;", "Ã")
@@ -428,8 +429,7 @@ fn rtp_decode(s: &str) -> String {
         .replace("&Iacute;", "Í")
         .replace("&Oacute;", "Ó")
         .replace("&Uacute;", "Ú")
-        .replace("&amp;", "&");
-    s
+        .replace("&amp;", "&")
 }
 
 fn score_epg(programs: &[EpgProgram]) -> (i64, i64, usize) {

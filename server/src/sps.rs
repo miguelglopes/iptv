@@ -807,7 +807,7 @@ mod tests {
             Self { bytes: Vec::new(), bit_pos: 0 }
         }
         fn write_bit(&mut self, b: u8) {
-            if self.bit_pos % 8 == 0 {
+            if self.bit_pos.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             let byte = self.bit_pos / 8;
@@ -837,7 +837,7 @@ mod tests {
         fn finish(mut self) -> Vec<u8> {
             // Pad with a trailing 1 bit + zero bits to byte-align (RBSP trailing).
             self.write_bit(1);
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bit(0);
             }
             self.bytes

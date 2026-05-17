@@ -39,6 +39,12 @@ hosts = [
 interval_secs = 60
 timeout_ms = 1500
 parallelism = 8
+# Freshness loop (Step 6) — keeps the measured-quality cache warm by
+# re-probing keys older than `freshness_ttl_secs`. Default: auto-gated by
+# the provider's `max_connections` (off when ≤ 2, on at 15 min when ≥ 3).
+# Uncomment to override: 0 = force-off, n > 0 = force-on at n seconds.
+# freshness_loop_interval_secs = 0
+freshness_ttl_secs = 3600
 
 [catalog]
 refresh_interval_secs = 3600
@@ -49,15 +55,14 @@ fetch_timeout_secs = 10
 
 [blacklist]
 host_fail_threshold = 4
-url_ttl_secs = 3600
 host_ttl_secs = 3600
-demote_ttl_secs = 10800
-# Number of URL-level failures within `url_fail_window_secs` before a URL is
-# hard-blacklisted (build_candidates skips it entirely). First N-1 failures
-# still demote the URL — it sinks to the back of the candidate queue but stays
-# tried. Threshold absorbs network blips and occasional cross-client misblame.
-url_fail_threshold = 3
-url_fail_window_secs = 300
+# State-machine cool-off: each failure bumps a step (0→1→2→3→4, capped).
+# Step durations in seconds — 1 min / 5 min / 30 min / 6 h. After
+# `clean_play_reset_secs` of clean play with fresh heartbeats, the step
+# resets to 0.
+cool_off_steps_secs = [60, 300, 1800, 21600]
+heartbeat_window_secs = 60
+clean_play_reset_secs = 300
 
 [proxy]
 upstream_timeout_secs = 15
