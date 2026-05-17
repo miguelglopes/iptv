@@ -7,9 +7,10 @@ use axum::Json;
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use crate::canonical::quality_tier;
+use crate::canonical::{quality_tier, CanonicalChannel};
 use crate::codec::Classification;
 use crate::epg::{fetch_epg_for_channel, format_rtp_date, EpgCandidate};
+use crate::radio::RadioFormat;
 use crate::state::AppState;
 use crate::xtream::{ChannelKind, EpgProgram};
 
@@ -68,10 +69,15 @@ pub struct ChannelDto {
     pub key: String,
     pub name: String,
     pub kind: ChannelKind,
-    /// Capability tags a client must support to play this channel.
-    /// Generic string set; the server filter just checks set inclusion
-    /// against `X-Client-Caps`. No special-casing per kind in the filter.
-    pub caps_required: &'static [&'static str],
+    /// Capability tags a client must support to play this channel. Per-channel
+    /// for radio (driven by `RadioFormat`) so a pure-MP3 station isn't sent
+    /// to a client that doesn't probe `mp3`. JSON shape unchanged for older
+    /// clients — still a string array.
+    pub caps_required: Vec<&'static str>,
+    /// Audio container/transport, only set for radio. Informational; the
+    /// client decides hls.js vs native via the `play_url` extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,24 +91,51 @@ pub struct ChannelDto {
     pub tv_archive_quality: Option<&'static str>,
 }
 
-/// Map a channel kind to the capability tags a client needs to play it.
-/// This is the *only* place kind influences the capability check — everything
-/// else is generic set-inclusion logic. Adding a new stream type (DASH,
-/// fMP4, …) means adding tags here and to the client's probe, nothing else.
-///
-/// Today every channel in the catalog is HLS / MPEG-TS / H.264 video + AAC
-/// audio. If we ever surface HEVC or VP9 channels, declare them here:
-/// e.g. `Tv4k => &["hls", "hevc", "aac"]`.
-fn caps_required(kind: ChannelKind) -> &'static [&'static str] {
-    match kind {
-        // TV streams: HLS playlist with H.264/AAC MPEG-TS segments. Clients
-        // need each codec; `live_video_hls` is the actual play-test cap
-        // (proved by playing /api/probe/video.m3u8 against a real TV channel).
-        ChannelKind::Tv => &["hls", "h264", "aac", "live_video_hls"],
-        // Radio: HLS playlist (nested master→chunklist) with raw AAC segments.
-        // No video. `live_audio_only_hls` is the play-test cap — Chrome's
-        // native demuxer fails this shape; hls.js handles it.
-        ChannelKind::Radio => &["hls", "aac", "live_audio_only_hls"],
+/// Capability tags a client needs to play this channel. TV is fixed to the
+/// HLS/h264/aac/live_video_hls quartet today. Radio dispatches on the union
+/// of the channel's source formats — an Mp3-only channel returns `["mp3"]`,
+/// an HLS-bearing channel keeps the legacy `["hls","aac","live_audio_only_hls"]`.
+fn caps_required(channel: &CanonicalChannel) -> Vec<&'static str> {
+    match channel.kind {
+        ChannelKind::Tv => vec!["hls", "h264", "aac", "live_video_hls"],
+        ChannelKind::Radio => {
+            let mut fmts: std::collections::HashSet<RadioFormat> = channel
+                .sources
+                .iter()
+                .filter_map(|s| s.radio_format)
+                .collect();
+            if fmts.is_empty() {
+                fmts.insert(RadioFormat::Hls);
+            }
+            radio_caps_for(&fmts)
+        }
+    }
+}
+
+fn radio_caps_for(fmts: &std::collections::HashSet<RadioFormat>) -> Vec<&'static str> {
+    // Any HLS source ⇒ legacy HLS cap set (existing behaviour preserved).
+    if fmts.contains(&RadioFormat::Hls) {
+        return vec!["hls", "aac", "live_audio_only_hls"];
+    }
+    // Non-HLS radio: stream raw bytes via `<audio src>`, native decoder. We
+    // require only `aac` because:
+    //   * canPlayType('audio/mpeg') lies on multiple Chromiums — webOS reports
+    //     mp3=false even though `<audio src>` decodes MP3 fine. Requiring `mp3`
+    //     would hide every Bauer Media station from the TV.
+    //   * Every modern client that decodes AAC also decodes MP3 in practice.
+    //   * The downside is theoretical: an AAC-only client would silently error
+    //     on an MP3 channel. We accept that — the alternative (filtering all
+    //     non-HLS for webOS) is far worse for the user.
+    vec!["aac"]
+}
+
+fn radio_format_label(fmt: RadioFormat) -> &'static str {
+    match fmt {
+        RadioFormat::Hls => "hls",
+        RadioFormat::Mp3 => "mp3",
+        RadioFormat::Aac => "aac",
+        RadioFormat::Icecast => "icecast",
+        RadioFormat::Playlist => "playlist",
     }
 }
 
@@ -183,30 +216,73 @@ pub async fn list_channels(
     // started probing. `Some(set)` means the client explicitly listed its caps
     // and we should hide anything outside that set.
     let client_caps = parse_client_caps(&headers);
-    type SortKey = (u8, usize, String, usize);
-    let mut out: Vec<(SortKey, ChannelDto)> = snap
+
+    let visible: Vec<(usize, &CanonicalChannel)> = snap
         .channels
         .iter()
         .enumerate()
         .filter(|(_, ch)| {
-            // Generic set-inclusion: a channel's required caps must be a
-            // subset of the client's reported caps. No special-case per kind.
-            let required = caps_required(ch.kind);
+            let required = caps_required(ch);
             match &client_caps {
                 None => true,
                 Some(caps) => required.iter().all(|c| caps.contains(*c)),
             }
         })
+        .collect();
+
+    // Cross-channel uniqueness map: how many distinct channels reference each
+    // logo URL. Upstreams sometimes return a generic operator placeholder
+    // (e.g. the MEO "M" circle) as `stream_icon` for channels they don't have
+    // a proper icon for, leaving many unrelated channels sharing one URL.
+    // Counting per-channel (HashSet dedup within a channel's own sources)
+    // lets us prefer a unique-to-this-channel logo over a shared placeholder
+    // and outright drop heavily-shared URLs as placeholders.
+    let mut logo_url_freq: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (_, ch) in &visible {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for s in &ch.sources {
+            if let Some(url) = s.logo.as_deref() {
+                if seen.insert(url) {
+                    *logo_url_freq.entry(url).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    // Above this many distinct channels referencing the same URL = placeholder.
+    // Empirical: catalog shows clusters of 33/99/144 channels sharing one
+    // operator placeholder while legitimate channel-family logos (DAZN, etc.)
+    // top out at ~6. 10 splits cleanly.
+    const PLACEHOLDER_THRESHOLD: usize = 10;
+
+    type SortKey = (u8, usize, String, usize);
+    let mut out: Vec<(SortKey, ChannelDto)> = visible
+        .into_iter()
         .map(|(orig_i, ch)| {
-            let logo = ch.sources.iter().find_map(|s| s.logo.clone());
-            // Pick the right curation per kind. Radio names live in their own
-            // namespace (see [radio_curation] in config) so an "Antena 3" radio
-            // doesn't borrow rank from a "Antena 3" TV channel that happened to
-            // share the same canonical_key.
             let curation = match ch.kind {
                 ChannelKind::Radio => &state.radio_curation,
                 ChannelKind::Tv => &state.curation,
             };
+            // curation.logo_overrides wins absolutely — for channels whose
+            // upstream stream_icon is just wrong (e.g. CM TV → MCM TOP image)
+            // and uniqueness filtering can't help (the wrong URL is unique
+            // to this channel). Falls back to: pick the source whose logo
+            // URL is referenced by the fewest other channels (ties broken by
+            // source order = score). If even the minimum is above the
+            // placeholder threshold, drop the logo entirely — showing the
+            // channel name alone beats showing the wrong logo.
+            let logo = curation.logo_overrides.get(&ch.key).cloned().or_else(|| {
+                ch.sources
+                    .iter()
+                    .filter_map(|s| {
+                        s.logo
+                            .as_ref()
+                            .map(|u| (logo_url_freq.get(u.as_str()).copied().unwrap_or(0), u))
+                    })
+                    .min_by_key(|(count, _)| *count)
+                    .filter(|(count, _)| *count <= PLACEHOLDER_THRESHOLD)
+                    .map(|(_, u)| u.clone())
+            });
             let d = curation.rank_of(&ch.key);
             let bucket: u8 = if d.is_some() { 0 } else { 1 };
             let sub = d.unwrap_or(usize::MAX);
@@ -214,15 +290,36 @@ pub async fn list_channels(
             let tv_archive = archive_src.is_some();
             let tv_archive_duration = archive_src.and_then(|s| s.tv_archive_duration);
             let tv_archive_quality = archive_src.and_then(|s| quality_tier(&s.name));
+            // Pick the URL extension per channel kind/format. HLS radios stay
+            // on `.m3u8` so the existing manifest-rewriting pipeline handles
+            // them; non-HLS radio uses `.audio` so the client's hls.js gate
+            // (`/\.m3u8(\?|$)/` in app/js/player.js) falls through to native
+            // `<video src>` (which on webOS decodes raw MP3/AAC over HTTP).
+            let (play_ext, format) = match ch.kind {
+                ChannelKind::Tv => (".m3u8", None),
+                ChannelKind::Radio => {
+                    let fmt = ch
+                        .sources
+                        .iter()
+                        .find_map(|s| s.radio_format)
+                        .unwrap_or(RadioFormat::Hls);
+                    let ext = match fmt {
+                        RadioFormat::Hls => ".m3u8",
+                        _ => ".audio",
+                    };
+                    (ext, Some(radio_format_label(fmt)))
+                }
+            };
             let dto = ChannelDto {
                 key: ch.key.clone(),
                 name: ch.name.clone(),
                 kind: ch.kind,
-                caps_required: caps_required(ch.kind),
+                caps_required: caps_required(ch),
+                format,
                 logo,
                 default_rank: d,
                 source_count: ch.sources.len(),
-                play_url: format!("{}/play/{}.m3u8", base.trim_end_matches('/'), ch.key),
+                play_url: format!("{}/play/{}{}", base.trim_end_matches('/'), ch.key, play_ext),
                 tv_archive,
                 tv_archive_duration,
                 tv_archive_quality,
@@ -536,12 +633,55 @@ pub async fn admin_measured_quality(
 /// non-blacklisted direct_source URL). Falls back to the top channel by raw
 /// curation rank when nothing passes — better to probe a possibly-stale
 /// channel than to fail the boot's capability detection entirely.
+///
+/// Also waits briefly for the catalog to populate on cold-start so a probe
+/// that races ahead of the first refresh doesn't 503 (which would cause the
+/// client to drop the play-test cap and filter every channel of this kind
+/// out of /api/channels for the session).
 async fn probe_redirect(
     state: &AppState,
     headers: &HeaderMap,
     kind: ChannelKind,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let snap = state.catalog.snapshot();
+    // Closure used both as the wait predicate and the rank filter so they
+    // can't drift. Mirrors the "probe target must be HLS" rule for radio.
+    let probe_match = |c: &crate::canonical::CanonicalChannel| -> bool {
+        c.kind == kind
+            && match kind {
+                // `live_audio_only_hls` is a play-test of HLS, so the
+                // probe target must be a radio whose primary source is
+                // HLS — not a raw MP3/AAC/Icecast (those play fine for
+                // the user, but hls.js can't decode them and the probe
+                // would report no audio-HLS capability).
+                ChannelKind::Radio => matches!(
+                    c.sources.iter().find_map(|s| s.radio_format),
+                    Some(RadioFormat::Hls) | None,
+                ),
+                ChannelKind::Tv => true,
+            }
+    };
+
+    // Boot race: on a cold start the client's cap probe can arrive before
+    // the catalog loop's first refresh installs anything. 503ing immediately
+    // makes the client drop `live_video_hls` (or `live_audio_only_hls`)
+    // from X-Client-Caps for the session, which strips every channel of
+    // that kind from /api/channels — the user sees an empty list with no
+    // retry. Wait briefly for the catalog to populate; the client allows
+    // ~12 s for this whole probe, so 8 s here leaves margin for the
+    // downstream play attempt the redirect kicks off.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let snap = loop {
+        let snap = state.catalog.snapshot();
+        if snap.channels.iter().any(&probe_match) {
+            break snap;
+        }
+        if std::time::Instant::now() >= deadline {
+            break snap;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+
     let curation = match kind {
         ChannelKind::Tv => &state.curation,
         ChannelKind::Radio => &state.radio_curation,
@@ -551,7 +691,7 @@ async fn probe_redirect(
     let mut ranked: Vec<&crate::canonical::CanonicalChannel> = snap
         .channels
         .iter()
-        .filter(|c| c.kind == kind)
+        .filter(|c| probe_match(c))
         .collect();
     ranked.sort_by_key(|c| curation.rank_of(&c.key).unwrap_or(usize::MAX));
     if ranked.is_empty() {
