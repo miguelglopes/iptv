@@ -60,6 +60,12 @@ pub struct CurationConfig {
     pub aliases: HashMap<String, String>,
     #[serde(default)]
     pub display_overrides: HashMap<String, String>,
+    /// Per-channel-key logo URL override. Wins over any source-derived logo,
+    /// for cases where upstream stream_icon is wrong (e.g. one channel's logo
+    /// is mistakenly another channel's image) and uniqueness filtering can't
+    /// help (the wrong URL is unique to this channel).
+    #[serde(default)]
+    pub logo_overrides: HashMap<String, String>,
     #[serde(default)]
     pub provider_boosts: Vec<ProviderBoost>,
 }
